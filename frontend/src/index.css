@@ -1,0 +1,39 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  font-family: "Inter", sans-serif;
+  background-color: #f7f4ec;
+  color: #0f1b2d;
+}
+
+/* Visible keyboard focus everywhere - accessibility floor */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid #e8a33d;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+.font-display {
+  font-family: "Fraunces", serif;
+}
+
+.font-mono-tag {
+  font-family: "IBM Plex Mono", monospace;
+}
