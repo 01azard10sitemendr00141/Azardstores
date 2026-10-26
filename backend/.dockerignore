@@ -1,0 +1,8 @@
+node_modules
+.env
+.env.*
+*.log
+test
+test-*.js
+test_*.js
+.git

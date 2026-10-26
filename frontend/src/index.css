@@ -1,25 +1,30 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@config "../tailwind.config.js";
 
 :root {
-  color-scheme: light;
+  color-scheme: dark;
 }
 
 body {
   font-family: "Inter", sans-serif;
-  background-color: #f7f4ec;
-  color: #0f1b2d;
+  background-color: #0f1b2d;
+  color: #f7f4ec;
 }
 
 /* Visible keyboard focus everywhere - accessibility floor */
 a:focus-visible,
 button:focus-visible,
-input:focus-visible,
 select:focus-visible,
 textarea:focus-visible {
-  outline: 2px solid #e8a33d;
+  outline: 2px solid #1683FF;
   outline-offset: 2px;
+}
+
+/* Keep keyboard focus visible even on auth inputs that suppress their own ring. */
+input:focus-visible {
+  outline: 2px solid #1683FF !important;
+  outline-offset: 2px !important;
+  border-radius: 3px;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -36,4 +41,13 @@ textarea:focus-visible {
 
 .font-mono-tag {
   font-family: "IBM Plex Mono", monospace;
+}
+
+@keyframes hero-copy-enter {
+  from { opacity: 0; transform: translateY(0.5rem); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.hero-copy-enter {
+  animation: hero-copy-enter 360ms ease-out both;
 }

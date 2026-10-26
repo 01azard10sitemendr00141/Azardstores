@@ -1,49 +1,118 @@
 const mongoose = require("mongoose");
-const slugify = require("slugify");
+const { makeSlug } = require("../utils/slug");
+const { Schema } = mongoose;
 
-const productSchema = new mongoose.Schema(
+const productSchema = new Schema(
   {
     name: { type: String, required: true, trim: true },
-    slug: { type: String, unique: true },
+    // SKU belongs to the sellable parent for simple products. Variable
+    // products use their variant SKUs instead; the parent SKU is optional.
+    sku: { type: String, default: "", trim: true, uppercase: true },
+    slug: { type: String, unique: true, sparse: true },
     description: { type: String, default: "" },
-    price: { type: Number, required: true, min: 0 },
-    compareAtPrice: { type: Number, default: null }, // "was" price, for showing discount
-    images: [{ type: String }], // paths under /uploads
-    shop: { type: mongoose.Schema.Types.ObjectId, ref: "Shop", required: true }, // Floor is reached via shop.floor
-    brand: { type: String, default: "" },
-    stock: { type: Number, default: 0, min: 0 },
-    sku: { type: String, default: "" },
-
-    // Merchandising flags - drives homepage sections without hardcoding HTML
-    badge: {
-      type: String,
-      enum: ["", "best-seller", "hot-deal", "new-arrival", "exclusive", "trending", "limited-stock"],
-      default: "",
+    longDescription: { type: String, default: "" },
+    // Drafts may be incomplete. Publishing validation requires a positive
+    // price before the product is exposed or can be ordered.
+    price: { type: Number, min: 0 },
+    compareAtPrice: { type: Number, min: 0 },
+    images: {
+      type: [String],
+      default: [],
+      validate: { validator: (images) => Array.isArray(images) && images.length <= 12, message: "A product can have up to 12 gallery images." },
     },
+    shop: { type: Schema.Types.ObjectId, ref: "Shop", required: true, index: true },
+    category: { type: String, default: "" },
+    subcategory: { type: String, default: "" },
+    brand: { type: String, default: "" },
+    returnEligibility: { type: String, enum: ["standard", "final_sale", "perishable", "digital_product"], default: "standard" },
+    // Undefined means inventory has not yet been confirmed. A deliberate
+    // zero is valid and remains distinguishable for draft publish checks.
+    stock: { type: Number, min: 0, validate: { validator: Number.isInteger, message: "Stock must be a whole number." } },
+    stockReservations: [{ orderId: { type: Schema.Types.ObjectId, required: true }, itemIndex: { type: Number, required: true }, quantity: { type: Number, required: true, min: 1 } }],
+    badge: { type: String, default: "" },
     isFlashSale: { type: Boolean, default: false },
-    flashSaleEndsAt: { type: Date, default: null },
-    purposeTags: [{ type: String }], // e.g. "work", "gaming", "travel", "home", "fitness"
-
-    isActive: { type: Boolean, default: true },
-    ratingAverage: { type: Number, default: 0 },
-    ratingCount: { type: Number, default: 0 },
+    // Optional simple variants (e.g. "Red / Large") — each is independently
+    // priced and stocked. Fully wired end-to-end: the Product page lets a
+    // shopper pick one, the cart keeps different variants as separate line
+    // items, and checkout decrements the specific variant's stock (not the
+    // base product's). A product with no variants behaves exactly as
+    // before, using its own top-level price/stock.
+    variants: [
+      {
+        // Drafts may preserve an unfinished option so it is not silently
+        // discarded; validatePublishable requires a customer-facing name.
+        name: { type: String, default: "", trim: true },
+        sku: { type: String, default: "" },
+        price: { type: Number },
+        compareAtPrice: { type: Number },
+        stock: { type: Number, min: 0, validate: { validator: Number.isInteger, message: "Stock must be a whole number." } },
+        stockReservations: [{ orderId: { type: Schema.Types.ObjectId, required: true }, itemIndex: { type: Number, required: true }, quantity: { type: Number, required: true, min: 1 } }],
+        image: { type: String, default: "" },
+      },
+    ],
+    flashSaleEndsAt: { type: Date },
+    purposeTags: { type: [String], default: [] },
+    isActive: { type: Boolean, default: true, index: true },
+    status: { type: String, enum: ["draft", "published", "archived"], default: undefined, index: true },
+    archivedAt: { type: Date, default: null },
+    // Denormalized set used for globally unique SKU enforcement, spanning
+    // both simple product SKUs and variant SKUs.
+    skuCodes: { type: [String], default: undefined, select: false },
   },
   { timestamps: true }
 );
 
-productSchema.index({ name: "text", description: "text", brand: "text" });
-
 productSchema.pre("save", function (next) {
-  if (!this.slug || this.isModified("name")) {
-    this.slug = slugify(this.name, { lower: true }) + "-" + this._id.toString().slice(-6);
+  if (this.isModified("name") && !this.slug) {
+    this.slug = makeSlug(this.name, Date.now().toString().slice(-6));
   }
+  if (this.status) this.isActive = this.status === "published";
+  else this.status = this.isActive === false ? "draft" : "published";
+  const codes = [this.sku, ...(this.variants || []).map((variant) => variant.sku)]
+    .map((code) => String(code || "").trim().toUpperCase())
+    .filter(Boolean);
+  if (new Set(codes).size !== codes.length) return next(new Error("SKU codes must be unique across this product and its variants"));
+  this.sku = String(this.sku || "").trim().toUpperCase();
+  (this.variants || []).forEach((variant) => { variant.sku = String(variant.sku || "").trim().toUpperCase(); });
+  this.skuCodes = codes.length ? [...new Set(codes)] : undefined;
   next();
 });
+
+// insertMany() skips pre('save') hooks, so we need this separately.
+// Random suffix avoids collisions when multiple products are inserted in the same millisecond.
+productSchema.pre("insertMany", function (next, docs) {
+  docs.forEach((doc) => {
+    if (!doc.slug) {
+      doc.slug = makeSlug(doc.name, Date.now().toString().slice(-6) + Math.floor(Math.random() * 1000));
+    }
+    doc.status = doc.status || (doc.isActive === false ? "draft" : "published");
+    doc.isActive = doc.status === "published";
+    doc.sku = String(doc.sku || "").trim().toUpperCase();
+    (doc.variants || []).forEach((variant) => { variant.sku = String(variant.sku || "").trim().toUpperCase(); });
+    const codes = [doc.sku, ...(doc.variants || []).map((variant) => variant.sku)]
+      .map((code) => String(code || "").trim().toUpperCase()).filter(Boolean);
+    doc.skuCodes = codes.length ? codes : undefined;
+  });
+  if (docs.some((doc) => new Set(doc.skuCodes).size !== doc.skuCodes.length)) return next(new Error("SKU codes must be unique across each product and its variants"));
+  next();
+});
+
+productSchema.index({ skuCodes: 1 }, { unique: true, sparse: true });
 
 productSchema.virtual("inStock").get(function () {
   return this.stock > 0;
 });
+productSchema.set("toJSON", {
+  virtuals: true,
+  transform(_doc, value) {
+    delete value.stockReservations;
+    delete value.skuCodes;
+    for (const variant of value.variants || []) delete variant.stockReservations;
+    return value;
+  },
+});
 
-productSchema.set("toJSON", { virtuals: true });
+// Enables $text search across name, description and brand — powers product search in directory
+productSchema.index({ name: "text", description: "text", brand: "text" });
 
 module.exports = mongoose.model("Product", productSchema);

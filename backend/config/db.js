@@ -1,12 +1,15 @@
-const mongoose = require("mongoose");
+﻿const mongoose = require("mongoose");
+
+if (!process.env.MONGO_URI) {
+  console.error("❌ MONGO_URI is not set in .env");
+  process.exit(1);
+}
+
+mongoose.set("strictQuery", false);
 
 async function connectDB() {
   try {
-    const uri = process.env.MONGO_URI;
-    if (!uri) {
-      throw new Error("MONGO_URI is not set in .env");
-    }
-    await mongoose.connect(uri);
+    await mongoose.connect(process.env.MONGO_URI);
     console.log("✅ MongoDB connected");
   } catch (err) {
     console.error("❌ MongoDB connection error:", err.message);
@@ -14,4 +17,4 @@ async function connectDB() {
   }
 }
 
-module.exports = connectDB;
+module.exports = { connectDB };
