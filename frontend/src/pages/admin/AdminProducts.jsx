@@ -1,8 +1,9 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Plus, Pencil, Trash2, X, Check, Package, Upload, CheckCircle2, AlertCircle, FileSpreadsheet, Download, Archive, ArchiveRestore, Eye, ArrowUp, ArrowDown } from "lucide-react";
 import api from "../../api/client";
 import AdminPagination from "../../components/AdminPagination";
 import AdminConfirmDialog from "../../components/admin/AdminConfirmDialog";
+import ProductImportPanel from "../../components/admin/ProductImportPanel";
 import AdminLoadError from "../../components/AdminLoadError";
 import { downloadCsv } from "../../utils/downloadCsv";
 import { useBadges } from "../../context/BadgesContext";
@@ -12,6 +13,14 @@ import { productImageUrl } from "../../utils/productImageUrl";
 
 const PURPOSES = ["work", "gaming", "travel", "home", "fitness"];
 const EMPTY = { name: "", sku: "", description: "", longDescription: "", price: "", compareAtPrice: "", images: "", shop: "", category: "", subcategory: "", brand: "", stock: "", badge: "", returnEligibility: "standard", isFlashSale: false, purposeTags: [], variants: [], status: "draft" };
+
+function getStockLabel(product) {
+  if (product.variants?.length) {
+    if (!product.variants.every((variant) => Number.isInteger(variant.stock))) return "Not fully confirmed across options";
+    return `${product.variants.reduce((total, variant) => total + variant.stock, 0).toLocaleString()} across options`;
+  }
+  return Number.isInteger(product.stock) ? product.stock.toLocaleString() : "Not confirmed";
+}
 
 function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
   const { badges } = useBadges();
@@ -24,8 +33,64 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
   const [error, setError] = useState("");
   const [publishIssues, setPublishIssues] = useState(initial?.publishIssues || []);
   const [imageUrlInput, setImageUrlInput] = useState("");
+  const [skuGenerating, setSkuGenerating] = useState("");
+  const skuRequests = useRef(new Map());
 
   function set(k, v) { setForm((f) => ({ ...f, [k]: v })); }
+  function generateSku(name, apply, key = "product", reservedSkusOverride) {
+    if (!String(name || "").trim()) {
+      setError("Add a product or option name before generating an SKU.");
+      return Promise.resolve("");
+    }
+    const existingRequest = skuRequests.current.get(key);
+    if (existingRequest) {
+      if (existingRequest.name === name) return existingRequest.promise;
+      return existingRequest.promise.then(() => generateSku(name, apply, key, reservedSkusOverride));
+    }
+    setSkuGenerating(key);
+    setError("");
+    const request = (async () => {
+      try {
+        const reservedSkus = reservedSkusOverride || [form.sku, ...form.variants.map((variant) => variant.sku)].filter(Boolean);
+        const { data } = await api.post("/products/admin/sku-suggestion", { name, reservedSkus });
+        apply(data.sku);
+        return data.sku;
+      } catch (err) {
+        setError(err.response?.data?.message || "Could not generate an available SKU.");
+        return "";
+      } finally {
+        setSkuGenerating("");
+        if (skuRequests.current.get(key)?.promise === request) skuRequests.current.delete(key);
+      }
+    })();
+    skuRequests.current.set(key, { name, promise: request });
+    return request;
+  }
+  function autoSuggestProductSku() {
+    if (!initial && form.name.trim() && !form.variants.length && !form.sku?.trim()) {
+      const requestedName = form.name;
+      generateSku(requestedName, (sku) => setForm((current) => (
+        current.name === requestedName && !current.sku?.trim() ? { ...current, sku } : current
+      )));
+    }
+  }
+  function autoSuggestVariantSku(index) {
+    const variant = form.variants[index];
+    if (!variant?.sku?.trim() && form.name.trim()) {
+      const requestedName = `${form.name} ${variant?.name || ""}`;
+      const requestedVariantName = variant?.name || "";
+      generateSku(requestedName, (sku) => setForm((current) => (
+        current.name === form.name && current.variants[index]?.name === requestedVariantName && !current.variants[index]?.sku?.trim()
+          ? {
+            ...current,
+            variants: current.variants.map((entry, variantIndex) => (
+              variantIndex === index ? { ...entry, sku } : entry
+            )),
+          }
+          : current
+      )), `variant-${index}`);
+    }
+  }
   function togglePurpose(tag) {
     setForm((f) => ({
       ...f,
@@ -77,41 +142,57 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
   async function handleSave(e, requestedStatus = "draft") {
     e?.preventDefault();
     setError("");
-    const variants = form.variants;
-    const issues = [];
-    if (!form.name.trim()) issues.push("Add a product name.");
-    if (!form.shop?._id && !form.shop) issues.push("Choose a shop.");
-    if (!selectedCategory) issues.push("Choose a category from the managed category list.");
-    if (!selectedSubcategory) issues.push("Choose a subcategory from the selected category.");
-    if (!form.images.split(",").map((s) => s.trim()).filter(Boolean).length) issues.push("Add at least one product image URL.");
-    if (variants.length) variants.forEach((v, index) => {
-      const label = v.name?.trim() || `Option ${index + 1}`;
-      if (!v.name?.trim()) issues.push(`${label}: add a customer-facing option name.`);
-      if (!v.sku?.trim()) issues.push(`${label}: add a unique SKU.`);
-      const effectivePrice = v.price === "" || v.price === undefined || v.price === null ? form.price : v.price;
-      if (!Number.isFinite(Number(effectivePrice)) || Number(effectivePrice) <= 0) issues.push(`${label}: add a price greater than zero.`);
-      if (v.stock === "" || v.stock === undefined || v.stock === null || !Number.isInteger(Number(v.stock)) || Number(v.stock) < 0) issues.push(`${label}: confirm a whole-number stock quantity (zero is allowed).`);
-      const effectiveCompareAt = v.compareAtPrice === "" || v.compareAtPrice === undefined || v.compareAtPrice === null ? form.compareAtPrice : v.compareAtPrice;
-      if (effectiveCompareAt && Number(effectiveCompareAt) > 0 && Number(effectiveCompareAt) <= Number(effectivePrice)) issues.push(`${label}: compare-at price must be higher than its selling price.`);
-    });
-    else {
-      if (!form.sku?.trim()) issues.push("Add a unique product SKU.");
-      if (!(Number(form.price) > 0)) issues.push("Add a price greater than zero.");
-      if (form.stock === "" || form.stock === undefined || !Number.isInteger(Number(form.stock)) || Number(form.stock) < 0) issues.push("Confirm a whole-number stock quantity (zero is allowed).");
-    }
-    setPublishIssues(issues);
-    if (requestedStatus === "published" && issues.length) return;
     setSaving(true);
     try {
+      let saveForm = { ...form, variants: [...form.variants] };
+      if (!initial && saveForm.name.trim() && saveForm.variants.length) {
+        const reservedSkus = [saveForm.sku, ...saveForm.variants.map((variant) => variant.sku)].filter(Boolean);
+        for (let index = 0; index < saveForm.variants.length; index += 1) {
+          if (saveForm.variants[index].sku?.trim()) continue;
+          const sku = await generateSku(`${saveForm.name} ${saveForm.variants[index].name || ""}`, () => {}, `variant-${index}`, reservedSkus);
+          if (!sku) return;
+          saveForm.variants[index] = { ...saveForm.variants[index], sku };
+          reservedSkus.push(sku);
+        }
+      } else if (!initial && saveForm.name.trim() && !saveForm.variants.length && !saveForm.sku?.trim()) {
+        const sku = await generateSku(saveForm.name, () => {}, "product");
+        if (!sku) return;
+        saveForm.sku = sku;
+      }
+      setForm(saveForm);
+      const variants = saveForm.variants;
+      const issues = [];
+      if (!saveForm.name.trim()) issues.push("Add a product name.");
+      if (!saveForm.shop?._id && !saveForm.shop) issues.push("Choose a shop.");
+      if (!selectedCategory) issues.push("Choose a category from the managed category list.");
+      if (!selectedSubcategory) issues.push("Choose a subcategory from the selected category.");
+      if (!saveForm.images.split(",").map((s) => s.trim()).filter(Boolean).length) issues.push("Add at least one product image URL.");
+      if (variants.length) variants.forEach((v, index) => {
+        const label = v.name?.trim() || `Option ${index + 1}`;
+        if (!v.name?.trim()) issues.push(`${label}: add a customer-facing option name.`);
+        if (!v.sku?.trim()) issues.push(`${label}: add a unique SKU.`);
+        const effectivePrice = v.price === "" || v.price === undefined || v.price === null ? saveForm.price : v.price;
+        if (!Number.isFinite(Number(effectivePrice)) || Number(effectivePrice) <= 0) issues.push(`${label}: add a price greater than zero.`);
+        if (v.stock === "" || v.stock === undefined || v.stock === null || !Number.isInteger(Number(v.stock)) || Number(v.stock) < 0) issues.push(`${label}: confirm a whole-number stock quantity (zero is allowed).`);
+        const effectiveCompareAt = v.compareAtPrice === "" || v.compareAtPrice === undefined || v.compareAtPrice === null ? saveForm.compareAtPrice : v.compareAtPrice;
+        if (effectiveCompareAt && Number(effectiveCompareAt) > 0 && Number(effectiveCompareAt) <= Number(effectivePrice)) issues.push(`${label}: compare-at price must be higher than its selling price.`);
+      });
+      else {
+        if (!saveForm.sku?.trim()) issues.push("Add a unique product SKU.");
+        if (!(Number(saveForm.price) > 0)) issues.push("Add a price greater than zero.");
+        if (saveForm.stock === "" || saveForm.stock === undefined || !Number.isInteger(Number(saveForm.stock)) || Number(saveForm.stock) < 0) issues.push("Confirm a whole-number stock quantity (zero is allowed).");
+      }
+      setPublishIssues(issues);
+      if (requestedStatus === "published" && issues.length) return;
       const payload = {
-        ...form,
+        ...saveForm,
         status: requestedStatus,
-        shop: form.shop?._id || form.shop,
-        images: form.images ? form.images.split(",").map((s) => s.trim()).filter(Boolean) : [],
-        price: form.price === "" || form.price === undefined ? null : Number(form.price),
-        compareAtPrice: form.compareAtPrice ? Number(form.compareAtPrice) : null,
-        stock: form.stock === "" || form.stock === undefined ? null : Number(form.stock),
-        variants: form.variants
+        shop: saveForm.shop?._id || saveForm.shop,
+        images: saveForm.images ? saveForm.images.split(",").map((s) => s.trim()).filter(Boolean) : [],
+        price: saveForm.price === "" || saveForm.price === undefined ? null : Number(saveForm.price),
+        compareAtPrice: saveForm.compareAtPrice ? Number(saveForm.compareAtPrice) : null,
+        stock: saveForm.stock === "" || saveForm.stock === undefined ? null : Number(saveForm.stock),
+        variants: saveForm.variants
           .map((v) => ({
             ...(v._id ? { _id: v._id } : {}),
             name: v.name.trim(),
@@ -131,37 +212,72 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
     }
   }
 
-  const inputClass = "w-full min-h-11 sm:min-h-0 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm placeholder-cream/20 outline-none focus:border-mall-accent transition";
+  const inputClass = "w-full min-h-11 sm:min-h-0 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm placeholder-cream/40 outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition";
 
   return (
-    <form onSubmit={handleSave} className="border border-cream/10 rounded-2xl p-3 sm:p-5 bg-mall-800/50 mb-4">
-      <div className="grid sm:grid-cols-2 gap-3 mb-3">
+    <form onSubmit={handleSave} className="mb-4 rounded-2xl border border-cream/10 bg-mall-800/50 p-3 shadow-lg shadow-black/10 sm:p-5">
+      <div className="mb-5 border-b border-cream/10 pb-4">
+        <p className="font-mono-tag text-[10px] uppercase tracking-[0.18em] text-mall-accent">{initial ? "Product editor" : "New catalog entry"}</p>
+        <h2 className="mt-1 font-display text-xl text-cream">{initial ? "Edit product" : "Add product"}</h2>
+      </div>
+      <section className="mb-4" aria-labelledby={fieldId("identity-heading")}>
+        <div className="mb-4 border-l-2 border-mall-accent/70 pl-3">
+          <h2 id={fieldId("identity-heading")} className="text-[15px] font-semibold text-cream">Product identity</h2>
+          <p className="mt-0.5 text-xs text-cream/60">Name and customer-facing copy</p>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
         <div className="sm:col-span-2">
-          <label htmlFor={fieldId("name")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Product Name</label>
-          <input id={fieldId("name")} value={form.name} onChange={(e) => set("name", e.target.value)} placeholder="e.g. Oraimo AirBuds Pro" className={inputClass} />
+          <label htmlFor={fieldId("name")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Product Name</label>
+          <input id={fieldId("name")} value={form.name} onChange={(e) => set("name", e.target.value)} onBlur={autoSuggestProductSku} placeholder="e.g. Oraimo AirBuds Pro" className={inputClass} />
         </div>
         <div className="sm:col-span-2">
-          <label htmlFor={fieldId("description")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Short Description</label>
+          <label htmlFor={fieldId("description")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Short Description</label>
           <textarea id={fieldId("description")} value={form.description} onChange={(e) => set("description", e.target.value)} rows={2} className={`${inputClass} resize-none`} />
         </div>
         <div className="sm:col-span-2">
-          <label htmlFor={fieldId("long-description")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Long Description</label>
+          <label htmlFor={fieldId("long-description")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Long Description</label>
           <textarea id={fieldId("long-description")} value={form.longDescription || ""} onChange={(e) => set("longDescription", e.target.value)} rows={5} className={`${inputClass} resize-y`} />
         </div>
+        </div>
+      </section>
+
+      <section className="mb-4 border-t border-cream/10 pt-4" aria-labelledby={fieldId("pricing-heading")}>
+        <div className="mb-4 border-l-2 border-mall-accent/70 pl-3">
+          <h2 id={fieldId("pricing-heading")} className="text-[15px] font-semibold text-cream">SKU, pricing & inventory</h2>
+          <p className="mt-0.5 text-xs text-cream/60">Set the product identifier, price and confirmed stock</p>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
         <div>
-          <label htmlFor={fieldId("sku")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">SKU {form.variants.length ? "(optional group code)" : ""}</label>
-          <input id={fieldId("sku")} value={form.sku || ""} onChange={(e) => set("sku", e.target.value.toUpperCase())} placeholder={form.variants.length ? "Optional parent code" : "e.g. JBL-CLIP4-BLK"} className={inputClass} />
+          <label htmlFor={fieldId("sku")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">SKU {form.variants.length ? "(optional group code)" : ""}</label>
+          <div className="flex gap-2">
+            <input id={fieldId("sku")} value={form.sku || ""} onChange={(e) => set("sku", e.target.value.toUpperCase())} placeholder={form.variants.length ? "Optional parent code" : "Generated from product name"} className={inputClass} />
+            <button type="button" disabled={Boolean(skuGenerating)} onClick={() => generateSku(form.name, (sku) => set("sku", sku))} className="min-h-11 shrink-0 rounded-xl border border-cream/15 px-3 text-xs text-cream/70 hover:text-cream disabled:opacity-50">{skuGenerating === "product" ? "Generating…" : form.sku ? "New SKU" : "Generate"}</button>
+          </div>
+          <p className="mt-1 text-[11px] leading-relaxed text-cream/60">Suggested from the product name, editable, and checked for availability before saving.</p>
         </div>
         <div>
-          <label htmlFor={fieldId("price")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Price (KSh)</label>
+          <label htmlFor={fieldId("price")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Price (KSh)</label>
           <input id={fieldId("price")} type="number" value={form.price} onChange={(e) => set("price", e.target.value)} placeholder="3499" className={inputClass} />
         </div>
         <div>
-          <label htmlFor={fieldId("compare-price")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Compare At Price</label>
+          <label htmlFor={fieldId("compare-price")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Compare At Price</label>
           <input id={fieldId("compare-price")} type="number" value={form.compareAtPrice} onChange={(e) => set("compareAtPrice", e.target.value)} placeholder="4500" className={inputClass} />
         </div>
         <div>
-          <label htmlFor={fieldId("shop")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Shop</label>
+          <label htmlFor={fieldId("stock")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Stock</label>
+          <input id={fieldId("stock")} type="number" min="0" step="1" value={form.stock ?? ""} onChange={(e) => set("stock", e.target.value)} placeholder="Enter confirmed whole-number stock" className={inputClass} />
+        </div>
+        </div>
+      </section>
+
+      <section className="mb-4 border-t border-cream/10 pt-4" aria-labelledby={fieldId("placement-heading")}>
+        <div className="mb-4 border-l-2 border-mall-accent/70 pl-3">
+          <h2 id={fieldId("placement-heading")} className="text-[15px] font-semibold text-cream">Placement & merchandising</h2>
+          <p className="mt-0.5 text-xs text-cream/60">Choose where the product appears and how it is presented</p>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+        <div>
+          <label htmlFor={fieldId("shop")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Shop</label>
           <select id={fieldId("shop")} value={form.shop?._id || form.shop} onChange={(e) => set("shop", e.target.value)} className={inputClass}>
             <option value="">Select shop</option>
             {form.shop?._id && !shops.some((shop) => shop._id === form.shop._id) && <option value={form.shop._id} disabled>#{form.shop.shopNumber} {form.shop.name} (inactive)</option>}
@@ -170,18 +286,14 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
           {form.shop?.isActive === false && <p className="mt-1 text-[10px] text-amber-200/80">This shop is inactive, so the product is hidden from shoppers. Move it to an active shop before publishing.</p>}
         </div>
         <div>
-          <label htmlFor={fieldId("brand")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Brand</label>
+          <label htmlFor={fieldId("brand")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Brand</label>
           <select id={fieldId("brand")} value={form.brand} onChange={(e) => set("brand", e.target.value)} className={inputClass}>
             <option value="">Select brand</option>
             {brands.map((b) => <option key={b._id} value={b.name}>{b.name}</option>)}
           </select>
         </div>
         <div>
-          <label htmlFor={fieldId("stock")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Stock</label>
-          <input id={fieldId("stock")} type="number" min="0" step="1" value={form.stock ?? ""} onChange={(e) => set("stock", e.target.value)} placeholder="Enter confirmed whole-number stock" className={inputClass} />
-        </div>
-        <div>
-          <label htmlFor={fieldId("return-eligibility")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Return eligibility</label>
+          <label htmlFor={fieldId("return-eligibility")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Return eligibility</label>
           <select id={fieldId("return-eligibility")} value={form.returnEligibility || "standard"} onChange={(e) => set("returnEligibility", e.target.value)} className={inputClass}>
             <option value="standard">Standard · eligible under return policy</option>
             <option value="final_sale">Final sale · no return or exchange</option>
@@ -190,14 +302,14 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
           </select>
         </div>
         <div>
-          <label htmlFor={fieldId("badge")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Badge</label>
+          <label htmlFor={fieldId("badge")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Badge</label>
           <select id={fieldId("badge")} value={form.badge} onChange={(e) => set("badge", e.target.value)} className={inputClass}>
             <option value="">None</option>
             {badges.map((b) => <option key={b._id} value={b.slug}>{b.chipLabel}</option>)}
           </select>
         </div>
         <div>
-          <label htmlFor={fieldId("category")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Category</label>
+          <label htmlFor={fieldId("category")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Category</label>
           <select
             id={fieldId("category")}
             value={selectedCategory?.name || form.category}
@@ -210,7 +322,7 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
           </select>
         </div>
         <div>
-          <label htmlFor={fieldId("subcategory")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Subcategory</label>
+          <label htmlFor={fieldId("subcategory")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Subcategory</label>
           <select
             id={fieldId("subcategory")}
             value={selectedSubcategory?.name || form.subcategory}
@@ -226,21 +338,43 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
           </select>
         </div>
         <div className="flex items-center gap-2 pt-5">
-          <input type="checkbox" id={fieldId("flash-sale")} checked={form.isFlashSale} onChange={(e) => set("isFlashSale", e.target.checked)} className="accent-mall-accent" />
-          <label htmlFor={fieldId("flash-sale")} className="text-cream/60 text-sm">Flash Sale</label>
+          <input type="checkbox" id={fieldId("flash-sale")} checked={form.isFlashSale} onChange={(e) => set("isFlashSale", e.target.checked)} className="h-4 w-4 accent-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2" />
+          <label htmlFor={fieldId("flash-sale")} className="text-cream/80 text-sm">Flash Sale</label>
         </div>
+        <fieldset className="sm:col-span-2">
+          <legend className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest mb-2">Purpose Tags</legend>
+          <div className="flex gap-2 flex-wrap">
+            {PURPOSES.map((tag) => (
+              <button key={tag} type="button" aria-pressed={form.purposeTags.includes(tag)} onClick={() => togglePurpose(tag)}
+                className={`font-mono-tag min-h-11 text-[9px] uppercase px-3 rounded-full border transition sm:min-h-0 sm:px-2.5 sm:py-1 ${
+                  form.purposeTags.includes(tag) ? "bg-mall-accent text-mall-900 border-mall-accent" : "border-cream/15 text-cream/50 hover:text-cream"
+                }`}>
+                {tag}
+              </button>
+            ))}
+          </div>
+        </fieldset>
+        </div>
+      </section>
+
+      <section className="mb-4 border-t border-cream/10 pt-4" aria-labelledby={fieldId("media-heading")}>
+        <div className="mb-4 border-l-2 border-mall-accent/70 pl-3">
+          <h2 id={fieldId("media-heading")} className="text-[15px] font-semibold text-cream">Product media</h2>
+          <p className="mt-0.5 text-xs text-cream/60">Add up to 12 secure image URLs and set their storefront order</p>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
         <div className="sm:col-span-2">
-          <label htmlFor={fieldId("image-url")} className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Product gallery images (HTTPS URLs, up to 12)</label>
+          <label htmlFor={fieldId("image-url")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Product gallery images (HTTPS URLs, up to 12)</label>
           <div className="flex min-w-0 gap-2">
             <input id={fieldId("image-url")} type="url" value={imageUrlInput} onChange={(e) => setImageUrlInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addImageUrl(); } }} placeholder="https://example.com/product-image.jpg" className={`${inputClass} min-w-0 flex-1`} />
             <button type="button" onClick={addImageUrl} disabled={imageUrls().length >= 12} className="h-11 w-11 shrink-0 rounded-xl bg-mall-accent text-mall-900 disabled:opacity-40" aria-label="Add image to gallery"><Plus size={16} /></button>
           </div>
-          <p className="mt-1 text-[10px] text-cream/35">The first image is the main product image. Reorder images to change the storefront gallery order.</p>
+          <p className="mt-1 text-[11px] leading-relaxed text-cream/60">The first image is the main product image. Reorder images to change the storefront gallery order.</p>
           <div className="mt-3 space-y-2">
             {imageUrls().map((url, index, urls) => (
               <div key={`${url}-${index}`} className="grid grid-cols-[3rem_minmax(0,1fr)] items-center gap-2 rounded-xl border border-cream/10 bg-mall-900/40 p-2 sm:flex">
                 <img src={productImageUrl(url, { width: 128, quality: 70 })} alt="" className="h-12 w-12 shrink-0 rounded-lg object-cover" />
-                <p className="min-w-0 flex-1 truncate text-xs text-cream/70" title={url}>{index === 0 ? "Main image · " : `Image ${index + 1} · `}{url}</p>
+                <p className="min-w-0 flex-1 truncate text-xs text-cream/80" title={url}>{index === 0 ? "Main image · " : `Image ${index + 1} · `}{url}</p>
                 <div className="col-span-2 flex justify-end sm:ml-auto">
                   <button type="button" onClick={() => moveImage(index, -1)} disabled={index === 0} aria-label={`Move image ${index + 1} earlier`} className="flex h-11 w-11 items-center justify-center rounded text-cream/60 hover:text-cream disabled:opacity-25 sm:h-8 sm:w-8"><ArrowUp size={14} /></button>
                   <button type="button" onClick={() => moveImage(index, 1)} disabled={index === urls.length - 1} aria-label={`Move image ${index + 1} later`} className="flex h-11 w-11 items-center justify-center rounded text-cream/60 hover:text-cream disabled:opacity-25 sm:h-8 sm:w-8"><ArrowDown size={14} /></button>
@@ -250,35 +384,24 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
             ))}
           </div>
         </div>
-        <fieldset className="sm:col-span-2">
-            <legend className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest mb-2">Purpose Tags</legend>
-          <div className="flex gap-2 flex-wrap">
-            {PURPOSES.map((tag) => (
-                <button key={tag} type="button" aria-pressed={form.purposeTags.includes(tag)} onClick={() => togglePurpose(tag)}
-                className={`font-mono-tag min-h-11 text-[9px] uppercase px-3 rounded-full border transition sm:min-h-0 sm:px-2.5 sm:py-1 ${
-                  form.purposeTags.includes(tag) ? "bg-mall-accent text-mall-900 border-mall-accent" : "border-cream/15 text-cream/50 hover:text-cream"
-                }`}>
-                {tag}
-              </button>
-            ))}
-          </div>
-        </fieldset>
-      </div>
+        </div>
+      </section>
 
       {/* Variants — optional. A product with none behaves exactly as before,
           using its own top-level price/stock. */}
-      <div className="mb-4 pt-4 border-t border-cream/10">
-        <div className="flex flex-col gap-2 mb-2 sm:flex-row sm:items-center sm:justify-between">
-          <p className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest">
-            Variants (optional — e.g. sizes or colors)
-          </p>
+      <section className="mb-4 border-t border-cream/10 pt-4" aria-labelledby={fieldId("options-heading")}>
+        <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div className="border-l-2 border-mall-accent/70 pl-3">
+            <h2 id={fieldId("options-heading")} className="text-[15px] font-semibold text-cream">Options & variants</h2>
+            <p className="mt-0.5 text-xs text-cream/60">Optional sizes or colors, with their own SKU, price and stock</p>
+          </div>
           <button type="button" onClick={addVariant}
             className="flex min-h-11 items-center gap-1 text-mall-accent text-xs font-medium hover:text-mall-accentDark transition sm:min-h-0">
             <Plus size={11} /> Add Variant
           </button>
         </div>
         {form.variants.length === 0 ? (
-          <p className="text-cream/25 text-xs">No variants — this product uses its own price and stock above.</p>
+          <p className="text-cream/60 text-xs">No variants — this product uses its own price and stock above.</p>
         ) : (
           <div className="space-y-3">
             {form.variants.map((variant, i) => (
@@ -287,19 +410,21 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
                   <input
                     value={variant.name}
                     onChange={(e) => updateVariant(i, "name", e.target.value)}
+                    onBlur={() => autoSuggestVariantSku(i)}
                     placeholder="e.g. Red / Large"
                     aria-label={`Name for variant ${i + 1}`}
-                    className="min-h-11 flex-1 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/20 outline-none focus:border-mall-accent transition sm:min-h-0"
+                    className="min-h-11 flex-1 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/40 outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition sm:min-h-0"
                   />
                   <input
                     value={variant.sku || ""}
-                    onChange={(e) => updateVariant(i, "sku", e.target.value)}
+                    onChange={(e) => updateVariant(i, "sku", e.target.value.toUpperCase())}
                     placeholder="Variant SKU (required to publish)"
                     aria-label={`SKU for ${variant.name || `variant ${i + 1}`}`}
-                    className="min-h-11 w-full sm:min-h-0 sm:w-48 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/20 outline-none focus:border-mall-accent transition"
+                    className="min-h-11 w-full sm:min-h-0 sm:w-48 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/40 outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition"
                   />
+                  <button type="button" disabled={Boolean(skuGenerating)} onClick={() => generateSku(`${form.name} ${variant.name || ""}`, (sku) => updateVariant(i, "sku", sku), `variant-${i}`)} className="min-h-9 rounded-lg border border-cream/15 px-3 text-[11px] text-cream/80 hover:text-cream disabled:opacity-50 sm:min-h-0">{skuGenerating === `variant-${i}` ? "Generating…" : variant.sku ? "New SKU" : "Generate SKU"}</button>
                   <button type="button" aria-label={`Remove variant ${i + 1}`} onClick={() => removeVariant(i)}
-                    className="flex h-11 w-11 shrink-0 items-center justify-center text-cream/30 hover:text-red-400 transition sm:h-7 sm:w-7">
+                    className="flex h-11 w-11 shrink-0 items-center justify-center text-cream/65 hover:text-red-400 transition sm:h-7 sm:w-7">
                     <X size={13} />
                   </button>
                 </div>
@@ -310,7 +435,7 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
                     onChange={(e) => updateVariant(i, "price", e.target.value)}
                     placeholder="Price (blank = default)"
                     aria-label={`Price for variant ${i + 1}`}
-                    className="min-h-11 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/20 outline-none focus:border-mall-accent transition sm:min-h-0"
+                    className="min-h-11 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/40 outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition sm:min-h-0"
                   />
                   <input
                     type="number"
@@ -318,7 +443,7 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
                     onChange={(e) => updateVariant(i, "compareAtPrice", e.target.value)}
                     placeholder="Compare at (optional)"
                     aria-label={`Compare-at price for variant ${i + 1}`}
-                    className="min-h-11 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/20 outline-none focus:border-mall-accent transition sm:min-h-0"
+                    className="min-h-11 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/40 outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition sm:min-h-0"
                   />
                   <input
                     type="number"
@@ -328,21 +453,21 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
                     onChange={(e) => updateVariant(i, "stock", e.target.value)}
                     placeholder="Stock"
                     aria-label={`Stock for variant ${i + 1}`}
-                    className="min-h-11 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/20 outline-none focus:border-mall-accent transition sm:min-h-0"
+                    className="min-h-11 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/40 outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition sm:min-h-0"
                   />
                   <input
                     value={variant.image || ""}
                     onChange={(e) => updateVariant(i, "image", e.target.value)}
                     placeholder="Image URL (optional)"
                     aria-label={`Image URL for variant ${i + 1}`}
-                    className="min-h-11 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/20 outline-none focus:border-mall-accent transition sm:min-h-0"
+                    className="min-h-11 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/40 outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition sm:min-h-0"
                   />
                 </div>
               </div>
             ))}
           </div>
         )}
-      </div>
+      </section>
 
       {publishIssues.length > 0 && <div role="alert" className="mb-3 rounded-xl border border-red-500/30 bg-red-500/5 p-3"><p className="text-red-300 text-xs font-medium mb-1">Cannot publish yet. Fix these details:</p><ul className="list-disc pl-4 space-y-0.5">{publishIssues.map((issue, index) => <li key={index} className="text-red-300/80 text-xs">{issue}</li>)}</ul></div>}
       {error && <p role="alert" className="text-red-400 text-xs mb-3">{error}</p>}
@@ -366,108 +491,6 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
 // on the backend for the field mapping). Two-step flow: first analyze the
 // file to see which categories it contains, then map each category to a
 // shop (or leave it on the default) before actually importing anything.
-function ImportPanel({ shops, categories, onDone, onCancel }) {
-  const [file, setFile] = useState(null);
-  const [items, setItems] = useState([]);
-  const [previewHash, setPreviewHash] = useState("");
-  const [result, setResult] = useState(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const inputClass = "w-full min-h-11 sm:min-h-0 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm placeholder-cream/20 outline-none focus:border-mall-accent transition";
-  const updateItem = (rowIndex, changes) => setItems((current) => current.map((item) => item.index === rowIndex ? { ...item, ...changes } : item));
-
-  async function analyze(event) {
-    event.preventDefault(); setError("");
-    if (!file) return setError("Choose a WooCommerce CSV file first.");
-    setBusy(true);
-    try {
-      const body = new FormData(); body.append("csv", file);
-      const response = await api.post("/products/bulk-import/preview", body);
-      setPreviewHash(response.data.fileHash || "");
-      setItems((response.data.items || []).map((item) => {
-        const source = String(item.sourceCategory || "").trim().toLowerCase();
-        const categoryMatch = categories.find((entry) => entry.name.toLowerCase() === source || entry.subcategories?.some((sub) => sub.name.toLowerCase() === source));
-        const subcategoryMatch = categoryMatch?.subcategories?.find((sub) => sub.name.toLowerCase() === source);
-        const singleMatch = item.candidates?.length === 1 ? item.candidates[0] : null;
-        return { ...item,
-          action: item.product ? (item.candidates?.length ? "skip" : "create") : "skip",
-          productId: singleMatch ? String(singleMatch.id) : "",
-          status: "draft", shopId: singleMatch?.shop?.id || "",
-          category: subcategoryMatch ? categoryMatch.name : categoryMatch?.name || "",
-          subcategory: subcategoryMatch?.name || "",
-          stock: item.product?.stock ?? "", variantStock: item.product?.variants?.map((variant) => variant.stock ?? "") || [],
-        };
-      }));
-    } catch (err) { setError(err.response?.data?.message || "Could not analyze this CSV."); }
-    finally { setBusy(false); }
-  }
-
-  async function commit(event) {
-    event.preventDefault(); setError("");
-    for (const item of items.filter((entry) => entry.action !== "skip")) {
-      if (!item.shopId) return setError(`Choose a shop for ${item.product.name}.`);
-      if (item.status === "published" && (!item.category || !item.subcategory)) return setError(`Choose a category and subcategory for ${item.product.name} before publishing.`);
-      if (item.action === "overwrite" && !item.productId) return setError(`Choose the existing product to overwrite for ${item.product.name}.`);
-      const invalidStock = item.product.variants?.length
-        ? item.variantStock.some((stock) => stock !== "" && (!Number.isInteger(Number(stock)) || Number(stock) < 0))
-        : item.stock !== "" && (!Number.isInteger(Number(item.stock)) || Number(item.stock) < 0);
-      if (invalidStock) return setError(`Stock for ${item.product.name} must use whole numbers of zero or more.`);
-      if (item.status === "published") {
-        const missingStock = item.product.variants?.length
-          ? item.variantStock.some((stock) => stock === "" || !Number.isInteger(Number(stock)) || Number(stock) < 0)
-          : item.stock === "" || !Number.isInteger(Number(item.stock)) || Number(item.stock) < 0;
-        if (missingStock) return setError(`Confirm stock for ${item.product.name} before publishing.`);
-      }
-    }
-    setBusy(true);
-    try {
-      const body = new FormData(); body.append("csv", file);
-      body.append("previewHash", previewHash);
-      body.append("plan", JSON.stringify(items.map(({ index, action, productId, status, shopId, category, subcategory, stock, variantStock }) => ({ index, action, productId, status, shopId, category, subcategory, stock, variantStock }))));
-      setResult((await api.post("/products/bulk-import", body)).data);
-    } catch (err) { setError(err.response?.data?.message || "Import could not be completed."); }
-    finally { setBusy(false); }
-  }
-
-  if (result) return <div className="mb-4 rounded-2xl border border-cream/10 bg-mall-800/50 p-3 sm:p-5">
-    <div className="mb-3 flex items-center gap-2"><CheckCircle2 size={18} className="text-emerald-400" /><p className="text-sm font-medium text-cream">Import finished: {result.created} added · {result.overwritten} overwritten · {result.skipped} skipped · {result.failed} need attention</p></div>
-    {result.results?.filter((entry) => entry.status === "failed").map((entry) => <div key={entry.index} className="mb-2 text-xs text-red-300"><p>CSV row {entry.index + 1}: {entry.message}</p>{entry.issues?.map((issue, index) => <p key={index} className="ml-3 mt-0.5 text-red-200/70">• {issue}</p>)}</div>)}
-    <button type="button" onClick={onDone} className="mt-3 flex min-h-11 items-center gap-1.5 rounded-lg bg-mall-accent px-4 py-2 text-xs font-semibold text-mall-900"><Check size={13} /> Done</button>
-  </div>;
-
-  if (!items.length) return <div className="mb-4 rounded-2xl border border-cream/10 bg-mall-800/50 p-3 sm:p-5"><form onSubmit={analyze}>
-    <label className="mb-1.5 block font-mono-tag text-[9px] uppercase tracking-widest text-cream/40">WooCommerce CSV export</label>
-    <input type="file" accept=".csv" onChange={(event) => setFile(event.target.files?.[0] || null)} className={`${inputClass} min-w-0 file:mr-2 file:max-w-full file:rounded-lg file:border-0 file:bg-mall-accent file:px-2 file:py-2.5 file:text-xs file:font-semibold file:text-mall-900`} />
-    <p className="mt-2 text-xs text-cream/40">The file is previewed first. Products are saved only after you review and confirm.</p>
-    {error && <p role="alert" className="mt-2 text-xs text-red-400">{error}</p>}
-    <div className="mt-4 flex flex-col gap-2 sm:flex-row"><button type="submit" disabled={busy} className="flex min-h-11 w-full items-center justify-center gap-1.5 rounded-lg bg-mall-accent px-4 py-2 text-xs font-semibold text-mall-900 disabled:opacity-50 sm:w-auto"><FileSpreadsheet size={13} />{busy ? "Analyzing…" : "Analyze CSV"}</button><button type="button" onClick={onCancel} className="min-h-11 w-full rounded-lg border border-cream/15 px-4 py-2 text-xs text-cream/60 sm:w-auto">Cancel</button></div>
-  </form></div>;
-
-  return <div className="mb-4 rounded-2xl border border-cream/10 bg-mall-800/50 p-3 sm:p-5">
-    <div className="mb-4"><h2 className="text-sm font-semibold text-cream">Review {items.length} product rows</h2><p className="mt-1 text-xs text-cream/40">Missing stock stays blank. Choose how each product is saved before confirming.</p></div>
-    <form onSubmit={commit} className="space-y-3">
-      {items.map((item) => {
-        const product = item.product;
-        const category = categories.find((entry) => entry.name === item.category);
-        return <section key={item.index} className="rounded-xl border border-cream/10 bg-mall-900/40 p-3">
-          <div className="flex min-w-0 gap-3">{product?.images?.[0] && <img src={product.images[0]} alt="" className="h-14 w-14 shrink-0 rounded-lg object-cover" />}<div className="min-w-0 flex-1"><p className="truncate text-sm font-medium text-cream">{product?.name || `CSV row ${item.index + 1}`}</p><p className="mt-0.5 break-words text-[11px] text-cream/45">{product?.sku ? `SKU ${product.sku} · ` : "SKU missing · "}{product?.price ? `KSh ${Number(product.price).toLocaleString()}` : "Price missing"}{product?.variants?.length ? ` · ${product.variants.length} variants` : ""}</p>{item.sourceCategory && <p className="mt-0.5 break-words text-[10px] text-cream/35">CSV category: {item.sourceCategory}</p>}</div></div>
-          {item.errors?.map((warning, index) => <p key={index} className="mt-2 flex items-center gap-1.5 text-[11px] text-red-300"><AlertCircle size={12} />{warning}</p>)}
-          {!!item.candidates?.length && <div className="mt-2 rounded-lg border border-amber-400/20 bg-amber-400/5 p-2"><p className="mb-1 text-[11px] text-amber-200">Possible existing match — review before overwriting.</p>{item.candidates.map((candidate) => <label key={candidate.id} className="flex min-h-11 items-center gap-2 break-words py-1 text-[11px] text-cream/70"><input type="radio" name={`match-${item.index}`} checked={item.productId === String(candidate.id)} onChange={() => updateItem(item.index, { productId: String(candidate.id), shopId: item.shopId || candidate.shop?.id || "" })} />{candidate.name} · {candidate.sku || "no SKU"}{candidate.shop?.name ? ` · ${candidate.shop.name}` : ""} · {candidate.status}</label>)}</div>}
-          {product && <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-            <select value={item.action} onChange={(event) => updateItem(item.index, { action: event.target.value })} className={inputClass}>{!item.candidates?.length && <option value="create">Add as new product</option>}{item.candidates?.length > 0 && <option value="overwrite">Overwrite selected match</option>}<option value="skip">Skip this row</option></select>
-            <select value={item.status} onChange={(event) => updateItem(item.index, { status: event.target.value })} disabled={item.action === "skip"} className={inputClass}><option value="draft">Save only (draft)</option><option value="published">Save and publish</option></select>
-            <select value={item.shopId} onChange={(event) => updateItem(item.index, { shopId: event.target.value })} disabled={item.action === "skip"} className={inputClass}><option value="">Choose shop</option>{shops.map((shop) => <option key={shop._id} value={shop._id}>#{shop.shopNumber} {shop.name}</option>)}</select>
-            <div className="grid grid-cols-1 min-[400px]:grid-cols-2 gap-2"><select value={item.category} onChange={(event) => updateItem(item.index, { category: event.target.value, subcategory: "" })} disabled={item.action === "skip"} className={inputClass}><option value="">Category</option>{categories.map((entry) => <option key={entry._id} value={entry.name}>{entry.name}</option>)}</select><select value={item.subcategory} onChange={(event) => updateItem(item.index, { subcategory: event.target.value })} disabled={item.action === "skip" || !category} className={inputClass}><option value="">Subcategory</option>{(category?.subcategories || []).map((sub) => <option key={sub._id} value={sub.name}>{sub.name}</option>)}</select></div>
-            {product.variants?.length ? product.variants.map((variant, variantIndex) => <label key={variantIndex} className="text-[10px] text-cream/55">{variant.name || `Option ${variantIndex + 1}`} stock<input type="number" min="0" step="1" value={item.variantStock[variantIndex]} disabled={item.action === "skip"} onChange={(event) => updateItem(item.index, { variantStock: item.variantStock.map((value, i) => i === variantIndex ? event.target.value : value) })} className={`${inputClass} mt-1`} /></label>) : <label className="text-[10px] text-cream/55">Stock<input type="number" min="0" step="1" value={item.stock} disabled={item.action === "skip"} onChange={(event) => updateItem(item.index, { stock: event.target.value })} className={`${inputClass} mt-1`} /></label>}
-          </div>}
-        </section>;
-      })}
-      {error && <p role="alert" className="text-xs text-red-400">{error}</p>}
-      <div className="flex flex-col gap-2 sm:flex-row"><button type="submit" disabled={busy} className="flex min-h-11 w-full items-center justify-center gap-1.5 rounded-lg bg-mall-accent px-4 py-2 text-xs font-semibold text-mall-900 disabled:opacity-50 sm:w-auto"><Upload size={13} />{busy ? "Saving reviewed products…" : "Confirm import"}</button><button type="button" onClick={onCancel} className="min-h-11 w-full rounded-lg border border-cream/15 px-4 py-2 text-xs text-cream/60 sm:w-auto">Cancel</button></div>
-    </form>
-  </div>;
-}
-
 function BulkEditPanel({ count, shops, categories, brands, selectionHasVariants, onApply, onCancel }) {
   const { badges } = useBadges();
   const [shop, setShop] = useState("");
@@ -514,7 +537,7 @@ function BulkEditPanel({ count, shops, categories, brands, selectionHasVariants,
     }
   }
 
-  const inputClass = "w-full min-h-11 sm:min-h-0 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm placeholder-cream/20 outline-none focus:border-mall-accent transition";
+  const inputClass = "w-full min-h-11 sm:min-h-0 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm placeholder-cream/20 outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition";
   const selectedCategory = categories.find((entry) => entry.name === category);
 
   return (
@@ -604,10 +627,17 @@ export default function AdminProducts() {
   const [editId, setEditId] = useState(null);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const [inventoryFilter, setInventoryFilter] = useState("all");
   const [page, setPage] = useState(1);
   const [pages, setPages] = useState(1);
+  const [total, setTotal] = useState(0);
   const [selectedIds, setSelectedIds] = useState([]);
+  const [allMatchingSelected, setAllMatchingSelected] = useState(false);
   const [showBulkEdit, setShowBulkEdit] = useState(false);
+  const [showMatchingArchiveConfirm, setShowMatchingArchiveConfirm] = useState(false);
+  const [matchingArchiveBusy, setMatchingArchiveBusy] = useState(false);
+  const [matchingArchiveError, setMatchingArchiveError] = useState("");
   const [loadError, setLoadError] = useState("");
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [metadataLoading, setMetadataLoading] = useState(true);
@@ -639,19 +669,23 @@ export default function AdminProducts() {
   function load() {
     setLoading(true);
     setLoadError("");
-    api.get("/products/admin/list", { params: { search: search || undefined, status: statusFilter, page, limit: 20 } })
+    api.get("/products/admin/list", { params: { search: search || undefined, status: statusFilter, category: categoryFilter || undefined, inventory: inventoryFilter, page, limit: 20 } })
       .then((res) => {
         setProducts(res.data.products);
         setPages(res.data.pages);
+        setTotal(res.data.total);
       })
       .catch(() => setLoadError("Products could not be loaded."))
       .finally(() => setLoading(false));
   }
-  useEffect(load, [search, page, statusFilter, loadAttempt]);
-  // A search or page change means the on-screen product set has changed —
-  // clear any selection so Bulk Edit can never silently apply to products
-  // that are no longer even visible.
-  useEffect(() => { setSelectedIds([]); setShowBulkEdit(false); }, [search, page, statusFilter]);
+  useEffect(load, [search, page, statusFilter, categoryFilter, inventoryFilter, loadAttempt]);
+  // Keep selection scoped to the current query/page unless the admin
+  // explicitly opts into the all-matching archive selection.
+  useEffect(() => {
+    setSelectedIds([]);
+    setAllMatchingSelected(false);
+    setShowBulkEdit(false);
+  }, [search, page, statusFilter, categoryFilter, inventoryFilter]);
 
   async function handleAdd(form) { await api.post("/products", form); clearHomeCache(); setShowAdd(false); load(); }
   async function handleEdit(id, form) { await api.put(`/products/${id}`, form); clearHomeCache(); setEditId(null); load(); }
@@ -698,6 +732,41 @@ export default function AdminProducts() {
     load();
   }
 
+  async function handleArchiveAllMatching() {
+    setMatchingArchiveBusy(true);
+    setMatchingArchiveError("");
+    try {
+      await api.post("/products/admin/archive-matching", {
+        search,
+        status: statusFilter,
+        category: categoryFilter,
+        inventory: inventoryFilter,
+        expectedCount: total,
+      });
+      clearHomeCache();
+      setShowMatchingArchiveConfirm(false);
+      setAllMatchingSelected(false);
+      setSelectedIds([]);
+      setDeleteError("");
+      if (page !== 1) setPage(1);
+      else setLoadAttempt((attempt) => attempt + 1);
+    } catch (err) {
+      const message = err.response?.data?.message || "Matching products could not be archived.";
+      if (err.response?.status === 409) {
+        setShowMatchingArchiveConfirm(false);
+        setAllMatchingSelected(false);
+        setSelectedIds([]);
+        setDeleteError(message);
+        if (page !== 1) setPage(1);
+        else setLoadAttempt((attempt) => attempt + 1);
+      } else {
+        setMatchingArchiveError(message);
+      }
+    } finally {
+      setMatchingArchiveBusy(false);
+    }
+  }
+
   function handleSearchChange(value) {
     setSearch(value);
     setPage(1);
@@ -709,6 +778,12 @@ export default function AdminProducts() {
 
   function toggleSelectAll() {
     setSelectedIds((prev) => prev.length === filtered.length ? [] : filtered.map((p) => p._id));
+  }
+
+  function toggleAllMatching() {
+    setSelectedIds([]);
+    setAllMatchingSelected(true);
+    setShowBulkEdit(false);
   }
 
   const filtered = products;
@@ -748,7 +823,7 @@ export default function AdminProducts() {
 
       {deleteError && <p role="alert" className="mb-4 text-sm text-red-400">{deleteError}</p>}
       {showImport && (
-        <ImportPanel
+        <ProductImportPanel
           shops={shops}
           categories={categories}
           onDone={() => { clearHomeCache(); setShowImport(false); load(); }}
@@ -767,16 +842,56 @@ export default function AdminProducts() {
         ))}
       </div>
 
-      {/* Search */}
-      <div className="mb-5">
-        <label htmlFor="product-search" className="sr-only">Search products</label>
-        <input
-          id="product-search"
-          value={search}
-          onChange={(e) => handleSearchChange(e.target.value)}
-          placeholder="Search products..."
-          className="w-full sm:w-72 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm placeholder-cream/20 outline-none focus:border-mall-accent transition"
-        />
+      <div className="mb-5 rounded-2xl border border-cream/10 bg-mall-900/35 p-3 sm:p-4">
+        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-[minmax(16rem,1.4fr)_minmax(12rem,1fr)_minmax(12rem,1fr)]">
+          <label htmlFor="product-search" className="sr-only">Search products</label>
+          <input
+            id="product-search"
+            value={search}
+            onChange={(e) => handleSearchChange(e.target.value)}
+            placeholder="Search products..."
+            className="min-h-11 w-full min-w-0 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm placeholder-cream/35 outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition"
+          />
+          <label htmlFor="product-category-filter" className="sr-only">Filter products by category</label>
+          <select
+            id="product-category-filter"
+            aria-label="Filter products by category"
+            value={categoryFilter}
+            onChange={(event) => { setCategoryFilter(event.target.value); setPage(1); }}
+            className="min-h-11 w-full min-w-0 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition"
+          >
+            <option value="">All categories</option>
+            {categories.map((category) => <option key={category._id} value={category.name}>{category.name}</option>)}
+          </select>
+          <label htmlFor="product-inventory-filter" className="sr-only">Filter products by inventory</label>
+          <select
+            id="product-inventory-filter"
+            aria-label="Filter products by inventory"
+            value={inventoryFilter}
+            onChange={(event) => { setInventoryFilter(event.target.value); setPage(1); }}
+            className="min-h-11 w-full min-w-0 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition"
+          >
+            <option value="all">All inventory</option>
+            <option value="in_stock">In stock · more than 5</option>
+            <option value="low_stock">Low stock · 1–5</option>
+            <option value="out_of_stock">Out of stock</option>
+          </select>
+        </div>
+      </div>
+
+      <div className="mb-3 flex flex-wrap items-end justify-between gap-2 border-b border-cream/10 pb-3">
+        <div>
+          <p className="font-mono-tag text-[9px] uppercase tracking-[0.18em] text-cream/35">Catalog results</p>
+          <p className="mt-0.5 text-sm font-medium text-cream/80">{total.toLocaleString()} product{total === 1 ? "" : "s"} <span className="text-xs font-normal text-cream/40">· page {page} of {pages}</span></p>
+        </div>
+        {(search || categoryFilter || inventoryFilter !== "all" || statusFilter !== "all") && (
+          <div className="flex flex-wrap gap-1.5 text-[10px] text-cream/50">
+            {search && <span className="max-w-full break-words rounded-full border border-cream/10 px-2 py-1">Search: {search}</span>}
+            {categoryFilter && <span className="max-w-full break-words rounded-full border border-cream/10 px-2 py-1">{categoryFilter}</span>}
+            {inventoryFilter !== "all" && <span className="rounded-full border border-mall-accent/20 bg-mall-accent/5 px-2 py-1 text-mall-accent">{inventoryFilter === "in_stock" ? "In stock >5" : inventoryFilter === "low_stock" ? "Low stock 1–5" : "Out of stock"}</span>}
+            {statusFilter !== "all" && <span className="rounded-full border border-cream/10 px-2 py-1">{statusFilter}</span>}
+          </div>
+        )}
       </div>
 
       {loading ? (
@@ -792,26 +907,57 @@ export default function AdminProducts() {
         </div>
       ) : (
         <div>
-          <div className="flex items-center justify-between mb-4">
+          <div className="mb-4 flex flex-col items-stretch gap-3 sm:flex-row sm:items-center sm:justify-between">
             <label className="flex min-h-11 items-center gap-2 text-cream/50 text-xs cursor-pointer">
               <input
                 type="checkbox"
-                aria-label="Select all products"
-                checked={filtered.length > 0 && selectedIds.length === filtered.length}
-                onChange={toggleSelectAll}
-                className="w-5 h-5 accent-mall-accent"
+                aria-label="Select all products on this page"
+                checked={allMatchingSelected || (filtered.length > 0 && selectedIds.length === filtered.length)}
+                onChange={() => {
+                  if (allMatchingSelected) {
+                    setAllMatchingSelected(false);
+                    setSelectedIds([]);
+                  } else {
+                    toggleSelectAll();
+                  }
+                }}
+                className="w-5 h-5 accent-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2"
               />
-              {selectedIds.length > 0 ? `${selectedIds.length} selected` : `${filtered.length} products`}
+              {allMatchingSelected
+                ? `${total.toLocaleString()} matching products selected across all pages`
+                : selectedIds.length > 0
+                  ? `${selectedIds.length} selected on this page`
+                  : `${total.toLocaleString()} products`}
             </label>
-            {selectedIds.length > 0 && !showBulkEdit && (
+            {allMatchingSelected ? (
+              <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
+                <button type="button" onClick={() => { setAllMatchingSelected(false); setSelectedIds([]); }} className="min-h-11 w-full rounded-lg border border-cream/15 px-3 py-2 text-xs text-cream/65 hover:text-cream transition sm:w-auto">
+                  Clear selection
+                </button>
+                {statusFilter !== "archived" && (
+                  <button type="button" onClick={() => { setMatchingArchiveError(""); setShowMatchingArchiveConfirm(true); }} className="flex min-h-11 w-full items-center justify-center gap-1.5 rounded-lg bg-red-500 px-4 py-2 text-xs font-semibold text-white transition hover:bg-red-400 sm:w-auto">
+                    <Archive size={13} /> Archive all {total.toLocaleString()} matching
+                  </button>
+                )}
+              </div>
+            ) : selectedIds.length > 0 && !showBulkEdit && (
               <button onClick={() => setShowBulkEdit(true)}
-                className="flex min-h-11 items-center gap-1.5 bg-mall-accent text-mall-900 font-semibold text-xs px-4 py-2 rounded-lg hover:bg-mall-accentDark transition">
+                className="flex min-h-11 w-full items-center justify-center gap-1.5 bg-mall-accent text-mall-900 font-semibold text-xs px-4 py-2 rounded-lg hover:bg-mall-accentDark transition sm:w-auto">
                 <Pencil size={13} /> Bulk Edit
               </button>
             )}
           </div>
 
-          {showBulkEdit && selectedIds.length > 0 && (
+          {selectedIds.length > 0 && selectedIds.length === filtered.length && statusFilter !== "archived" && !allMatchingSelected && (
+            <div className="mb-4 flex flex-col items-stretch gap-2 rounded-xl border border-mall-accent/25 bg-mall-accent/5 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-xs text-cream/65">{total > filtered.length ? "You selected every product on this page." : `All ${total.toLocaleString()} matching products fit on this page.`}</p>
+              <button type="button" onClick={toggleAllMatching} className="min-h-11 w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-mall-accent underline decoration-mall-accent/40 underline-offset-4 hover:text-cream transition sm:w-auto sm:text-right">
+                {total > filtered.length ? `Select all ${total.toLocaleString()} matching products across all pages` : `Select all ${total.toLocaleString()} matching products`}
+              </button>
+            </div>
+          )}
+
+          {showBulkEdit && selectedIds.length > 0 && !allMatchingSelected && (
             <BulkEditPanel
               count={selectedIds.length}
               shops={shops}
@@ -823,7 +969,7 @@ export default function AdminProducts() {
             />
           )}
 
-          <div className="divide-y divide-cream/8">
+          <div className="space-y-2">
             {filtered.map((product) => (
               <div key={product._id}>
                 {editId === product._id ? (
@@ -831,14 +977,15 @@ export default function AdminProducts() {
                     <ProductForm initial={product} shops={shops} categories={categories} brands={brands} onSave={(form) => handleEdit(product._id, form)} onCancel={() => setEditId(null)} />
                   </div>
                 ) : (
-                  <div className="grid grid-cols-[auto_auto_minmax(0,1fr)] items-center gap-x-3 gap-y-3 py-4 sm:flex sm:gap-4">
+                  <div className="grid grid-cols-[auto_auto_minmax(0,1fr)] items-center gap-x-3 gap-y-3 rounded-xl border border-cream/10 bg-mall-900/35 p-3 transition-colors hover:bg-mall-900/55 sm:grid-cols-[auto_auto_minmax(0,1.35fr)_minmax(10rem,0.8fr)_minmax(9rem,0.75fr)_auto] sm:gap-4 sm:p-4">
                     <label className="flex h-11 w-11 shrink-0 items-center justify-center sm:h-5 sm:w-5">
                       <input
                         type="checkbox"
                         aria-label={`Select ${product.name}`}
-                        checked={selectedIds.includes(product._id)}
+                        checked={allMatchingSelected || selectedIds.includes(product._id)}
+                        disabled={allMatchingSelected}
                         onChange={() => toggleSelect(product._id)}
-                        className="h-5 w-5 accent-mall-accent"
+                        className="h-5 w-5 accent-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2"
                       />
                     </label>
                     {product.images?.[0] ? (
@@ -848,31 +995,43 @@ export default function AdminProducts() {
                         <Package size={16} className="text-cream/20" />
                       </div>
                     )}
-                    <div className="flex-1 min-w-0">
+                    <div className="min-w-0">
                       <div className="flex items-center gap-2 mb-0.5 flex-wrap">
                         {product.brand && <p className="font-mono-tag text-[9px] uppercase text-mall-accent tracking-widest">{product.brand}</p>}
                         {product.badge && <span className="font-mono-tag text-[9px] uppercase text-cream/30">{product.badge}</span>}
                       </div>
-                      <p className="text-cream text-sm font-medium line-clamp-1">{product.name}</p>
-                      <p className="break-words text-cream/40 text-xs">{product.sku ? `${product.sku} · ` : ""}{getStartingPrice(product) ? `${product.variants?.length ? "From " : ""}KSh ${getStartingPrice(product).toLocaleString()}` : "Price not set"} · Stock: {product.stock ?? "Not confirmed"}</p>
-                      {product.shop && <p className="mt-0.5 break-words text-cream/35 text-[10px]">Shop #{product.shop.shopNumber} · {product.shop.name}</p>}
+                      <p className="w-full break-words text-cream text-[15px] font-semibold leading-snug">{product.name}</p>
+                      <p className="mt-1 break-words font-mono-tag text-[11px] tracking-wide text-cream/65">{product.sku || "SKU not set"}</p>
+                    </div>
+                    <div className="col-span-3 grid min-w-0 grid-cols-2 gap-3 border-t border-cream/10 pt-2.5 sm:col-span-1 sm:block sm:border-t-0 sm:pt-0">
+                      <div className="min-w-0">
+                        <p className="font-mono-tag text-[10px] uppercase tracking-widest text-cream/60">Price</p>
+                        <p className="font-display mt-0.5 break-words text-base text-cream/90">{getStartingPrice(product) ? `${product.variants?.length ? "From " : ""}KSh ${getStartingPrice(product).toLocaleString()}` : "Price not set"}</p>
+                      </div>
+                      <div className="min-w-0">
+                        <p className="font-mono-tag text-[10px] uppercase tracking-widest text-cream/60">Stock</p>
+                        <p className="mt-0.5 break-words text-[13px] text-cream/70">{getStockLabel(product)}</p>
+                      </div>
+                    </div>
+                    <div className="col-span-3 min-w-0 border-t border-cream/10 pt-2.5 sm:col-span-1 sm:border-t-0 sm:pt-0">
+                      <span className={`inline-flex rounded-full border px-2.5 py-1 text-[9px] font-semibold uppercase tracking-wide ${product.status === "published" ? "border-emerald-300/20 bg-emerald-500/10 text-emerald-300" : product.status === "archived" ? "border-red-300/30 bg-red-400/15 text-red-200" : "border-amber-300/20 bg-amber-500/10 text-amber-200"}`}>{product.status === "archived" ? "Archived" : (product.status || (product.isActive ? "published" : "draft"))}</span>
+                      {product.shop && <p className="mt-0.5 break-words text-cream/60 text-[11px]">Shop #{product.shop.shopNumber} · {product.shop.name}</p>}
                       {product.shop?.isActive === false && <p className="mt-0.5 text-amber-200/80 text-[10px]">Shop inactive · hidden from storefront and new checkout</p>}
-                      <span className={`mt-1 inline-flex rounded-full px-2 py-0.5 text-[9px] uppercase tracking-wide ${product.status === "published" ? "bg-emerald-500/10 text-emerald-300" : product.status === "archived" ? "bg-cream/10 text-cream/40" : "bg-amber-500/10 text-amber-300"}`}>{product.status || (product.isActive ? "published" : "draft")}</span>
                       {product.publishIssues?.length > 0 && <p className="mt-1 text-[10px] text-red-300">{product.publishIssues.length} publication requirement{product.publishIssues.length === 1 ? "" : "s"} incomplete</p>}
                       {product.publishIssues?.length > 0 && <details className="mt-1"><summary className="cursor-pointer text-[10px] text-red-300/70">View required details</summary><ul className="mt-1 list-disc space-y-0.5 pl-4">{product.publishIssues.map((issue, index) => <li key={index} className="text-[10px] text-red-200/70">{issue}</li>)}</ul></details>}
                     </div>
-                    <div className="col-span-3 flex items-center justify-end gap-2 shrink-0 sm:col-auto sm:ml-auto">
+                    <div className="col-span-3 flex w-full items-center justify-end gap-2 border-t border-cream/10 pt-2.5 sm:col-auto sm:ml-0 sm:w-auto sm:border-t-0 sm:pt-0">
                       <button type="button" aria-label={`Edit ${product.name}`} title={`Edit ${product.name}`} onClick={() => { setEditId(product._id); setShowAdd(false); }} disabled={metadataLoading || Boolean(metadataError)}
-                        className="h-11 w-11 rounded-lg bg-mall-800 text-cream/50 hover:text-cream flex items-center justify-center transition disabled:opacity-30 disabled:cursor-not-allowed sm:h-8 sm:w-8">
-                        <Pencil size={13} />
+                        className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-cream disabled:opacity-30 disabled:cursor-not-allowed sm:min-h-11 sm:w-11 sm:flex-none sm:px-0">
+                        <Pencil size={13} /><span className="text-[11px] sm:hidden">Edit</span>
                       </button>
                       {product.status === "archived" ? (
                         <>
-                          <button type="button" aria-label={`Restore ${product.name} as draft`} title="Restore as draft" onClick={() => handleRestore(product)} className="h-11 w-11 rounded-lg bg-mall-800 text-cream/50 hover:text-emerald-300 flex items-center justify-center transition sm:h-8 sm:w-8"><ArchiveRestore size={13} /></button>
-                          <button type="button" aria-label={`Permanently delete ${product.name}`} title="Permanently delete" onClick={() => { setDeleteError(""); setDeleteTarget(product); }} className="h-11 w-11 rounded-lg bg-mall-800 text-cream/50 hover:text-red-400 flex items-center justify-center transition sm:h-8 sm:w-8"><Trash2 size={13} /></button>
+                          <button type="button" aria-label={`Restore ${product.name} as draft`} title="Restore as draft" onClick={() => handleRestore(product)} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-emerald-300 sm:w-11 sm:flex-none sm:px-0"><ArchiveRestore size={13} /><span className="text-[11px] sm:hidden">Restore</span></button>
+                          <button type="button" aria-label={`Permanently delete ${product.name}`} title="Permanently delete" onClick={() => { setDeleteError(""); setDeleteTarget(product); }} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-red-400 sm:w-11 sm:flex-none sm:px-0"><Trash2 size={13} /><span className="text-[11px] sm:hidden">Delete</span></button>
                         </>
                       ) : (
-                        <button type="button" aria-label={`Archive ${product.name}`} title="Archive product" onClick={() => handleArchive(product)} className="h-11 w-11 rounded-lg bg-mall-800 text-cream/50 hover:text-amber-300 flex items-center justify-center transition sm:h-8 sm:w-8"><Archive size={13} /></button>
+                        <button type="button" aria-label={`Archive ${product.name}`} title="Archive product" onClick={() => handleArchive(product)} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-amber-300 sm:w-11 sm:flex-none sm:px-0"><Archive size={13} /><span className="text-[11px] sm:hidden">Archive</span></button>
                       )}
                     </div>
                   </div>
@@ -884,6 +1043,16 @@ export default function AdminProducts() {
       )}
       <AdminPagination page={page} pages={pages} onChange={setPage} />
       {deleteTarget && <AdminConfirmDialog title={`Permanently delete ${deleteTarget.name}?`} description="This cannot be undone. Products with order history or active reservations cannot be permanently deleted; archive them instead." busy={deleting} onClose={() => !deleting && setDeleteTarget(null)} onConfirm={handleDelete} />}
+      {showMatchingArchiveConfirm && <AdminConfirmDialog
+        title="Archive all matching products?"
+        description={`Archive exactly ${total.toLocaleString()} products matching the current search and filters across all pages? Archived products can be restored as drafts.`}
+        confirmLabel={`Archive ${total.toLocaleString()} products`}
+        busy={matchingArchiveBusy}
+        busyLabel="Archiving…"
+        error={matchingArchiveError}
+        onClose={() => !matchingArchiveBusy && setShowMatchingArchiveConfirm(false)}
+        onConfirm={handleArchiveAllMatching}
+      />}
     </div>
   );
 }

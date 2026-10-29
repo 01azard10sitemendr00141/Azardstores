@@ -9,6 +9,7 @@ const Product = require("../models/Product");
 const { mapWooCommerceRows } = require("../utils/wooCommerceImport");
 const { getPort } = require("../config/runtime");
 const { parseListQuery, queryText, escapeRegex } = require("../utils/listQuery");
+const { buildAdminProductQuery, isValidExpectedProductCount, matchesExpectedProductCount } = require("../utils/adminProductQuery");
 const { customerOrderView } = require("../utils/customerOrderView");
 const { buildTopShopsPipeline, buildUnattributedShopRevenuePipeline } = require("../utils/shopAnalytics");
 const { getPublicDeliveryCounties } = require("../utils/publicDeliveryOptions");
@@ -20,6 +21,77 @@ test("admin list queries cap pagination and treat search as literal text", () =>
   assert.equal(queryText(["shop-a", "shop-b"]), "");
   assert.equal(queryText("  a long filter value  ", 8), "a long f");
   assert.equal(escapeRegex(".*(chair)+"), "\\.\\*\\(chair\\)\\+");
+});
+
+test("admin product filters compose consistently for listing and all-matching archive", () => {
+  const { filter, search, status, category } = buildAdminProductQuery({
+    search: "  chair.*  ",
+    status: "published",
+    category: "Home (Decor)",
+  });
+
+  assert.equal(search, "chair.*");
+  assert.equal(status, "published");
+  assert.equal(category, "Home (Decor)");
+  assert.equal(filter.$and.length, 3);
+  assert.deepEqual(filter.$and[0], {
+    isActive: true,
+    $or: [{ status: "published" }, { status: { $exists: false } }],
+  });
+  assert.equal(filter.$and[1].category.test("home (decor)"), true);
+  assert.equal(filter.$and[1].category.test("Home Decor"), false);
+  assert.equal(filter.$and[2].$or[0].name.test("Chair.*"), true);
+  assert.equal(filter.$and[2].$or[0].name.test("ChairX"), false);
+  assert.equal(filter.$and[2].$or[2]["variants.sku"].test("chair.*"), true);
+});
+
+test("admin product matching supports all status and category filters and rejects invalid statuses", () => {
+  const all = buildAdminProductQuery({ status: "all", category: "Shoes" });
+  assert.deepEqual(Object.keys(all.filter), ["category"]);
+  assert.equal(all.filter.category.test("shoes"), true);
+  assert.deepEqual(buildAdminProductQuery({ status: "archived" }).filter, { status: "archived" });
+  assert.throws(() => buildAdminProductQuery({ status: "anything" }), /valid product status filter/);
+});
+
+test("admin inventory filters distinguish confirmed stock levels for simple and variant products", () => {
+  const all = buildAdminProductQuery({ inventory: "all" });
+  assert.deepEqual(all.filter, {});
+  assert.equal(all.inventory, "all");
+
+  const low = buildAdminProductQuery({ inventory: "low_stock" });
+  assert.equal(low.filter.$or[0].$and[1].stock.$gte, 1);
+  assert.equal(low.filter.$or[0].$and[1].stock.$lte, 5);
+  assert.deepEqual(low.filter.$or[1], { variants: { $elemMatch: { stock: { $gte: 1, $lte: 5 } } } });
+
+  const inStock = buildAdminProductQuery({ inventory: "in_stock" });
+  assert.equal(inStock.filter.$or[0].$and[1].stock.$gt, 5);
+  assert.equal(inStock.filter.$or[1].$and[0].variants.$elemMatch.stock.$gt, 5);
+  assert.equal(inStock.filter.$or[1].$and[1].variants.$not.$elemMatch.stock.$lte, 5);
+  assert.equal(inStock.filter.$or[1].$and[2].variants.$not.$elemMatch.stock.$exists, false);
+
+  const outOfStock = buildAdminProductQuery({ inventory: "out_of_stock" });
+  assert.equal(outOfStock.filter.$or[0].$and[1].stock, 0);
+  assert.equal(outOfStock.filter.$or[1].$and[1].variants.$not.$elemMatch.stock.$ne, 0);
+  assert.throws(() => buildAdminProductQuery({ inventory: "unknown" }), /valid product inventory filter/);
+});
+
+test("inventory composes identically with product search, status, and category filters", () => {
+  const input = { search: "shoe", status: "published", category: "Shoes", inventory: "low_stock" };
+  const listQuery = buildAdminProductQuery(input);
+  const archiveQuery = buildAdminProductQuery(input);
+
+  assert.deepEqual(archiveQuery.filter, listQuery.filter);
+  assert.equal(listQuery.filter.$and.length, 4);
+  assert.equal(listQuery.inventory, "low_stock");
+});
+
+test("all-matching archive requires a positive exact count and detects stale confirmations", () => {
+  assert.equal(isValidExpectedProductCount(4), true);
+  assert.equal(isValidExpectedProductCount(0), false);
+  assert.equal(isValidExpectedProductCount("4"), false);
+  assert.equal(isValidExpectedProductCount(Number.MAX_SAFE_INTEGER + 1), false);
+  assert.equal(matchesExpectedProductCount(4, 4), true);
+  assert.equal(matchesExpectedProductCount(4, 3), false);
 });
 
 test("customer order responses omit internal references, claim tokens, and admin notes", () => {

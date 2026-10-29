@@ -11,20 +11,19 @@ body {
   color: #f7f4ec;
 }
 
-/* Visible keyboard focus everywhere - accessibility floor */
+/* Keep keyboard focus visible for non-input controls, but do not add a second border
+   on fields that already have their own focused border or underline treatment. */
 a:focus-visible,
-button:focus-visible,
-select:focus-visible,
-textarea:focus-visible {
+button:focus-visible {
   outline: 2px solid #1683FF;
   outline-offset: 2px;
 }
 
-/* Keep keyboard focus visible even on auth inputs that suppress their own ring. */
-input:focus-visible {
-  outline: 2px solid #1683FF !important;
-  outline-offset: 2px !important;
-  border-radius: 3px;
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
 }
 
 @media (prefers-reduced-motion: reduce) {

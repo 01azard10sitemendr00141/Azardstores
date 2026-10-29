@@ -6,6 +6,8 @@ export default function AdminConfirmDialog({
   description,
   confirmLabel = "Delete",
   busy = false,
+  busyLabel = "Deleting…",
+  error,
   onConfirm,
   onClose,
 }) {
@@ -66,12 +68,13 @@ export default function AdminConfirmDialog({
           <div className="min-w-0 flex-1">
             <h2 id="admin-confirm-title" className="font-display text-lg text-cream">{title}</h2>
             <p id="admin-confirm-description" className="mt-1 text-sm leading-relaxed text-cream/55">{description}</p>
+            {error && <p role="alert" className="mt-2 text-sm text-red-300">{error}</p>}
           </div>
           <button type="button" aria-label="Close confirmation" disabled={busy} onClick={onClose} className="rounded-lg p-2 text-cream/45 transition hover:bg-cream/5 hover:text-cream disabled:opacity-40"><X size={17} /></button>
         </div>
         <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
           <button type="button" data-dialog-initial-focus disabled={busy} onClick={onClose} className="rounded-xl border border-cream/15 px-4 py-2.5 text-sm text-cream/65 transition hover:text-cream disabled:opacity-40">Keep it</button>
-          <button type="button" disabled={busy} onClick={onConfirm} className="rounded-xl bg-red-500 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-red-400 disabled:opacity-50">{busy ? "Deleting…" : confirmLabel}</button>
+          <button type="button" disabled={busy} onClick={onConfirm} className="rounded-xl bg-red-500 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-red-400 disabled:opacity-50">{busy ? busyLabel : confirmLabel}</button>
         </div>
       </section>
     </div>

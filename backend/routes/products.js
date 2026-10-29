@@ -10,6 +10,9 @@ const { mapWooCommerceRows, cleanCategory } = require("../utils/wooCommerceImpor
 const { toCsv } = require("../utils/csvExport");
 const { productStatus, validatePublishable, normalizeProductTaxonomy, assertUniqueProductSkus, isValidProductImageUrl } = require("../utils/productLifecycle");
 const { parseListQuery, queryText, escapeRegex } = require("../utils/listQuery");
+const { buildAdminProductQuery, isValidExpectedProductCount, matchesExpectedProductCount } = require("../utils/adminProductQuery");
+const { normalizeReviewedProduct, validateImportPlan, validatePlannedSkuUniqueness } = require("../utils/productImportReview");
+const { suggestUniqueProductSku } = require("../utils/productSku");
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB cap
@@ -141,29 +144,46 @@ router.get("/", async (req, res, next) => {
 // deliberately remain published-only.
 router.get("/admin/list", protect, requireRole("admin"), async (req, res, next) => {
   try {
-    const { search, page: pageNumber, limit: pageSize } = parseListQuery(req.query);
-    const status = typeof req.query.status === "string" ? req.query.status : "all";
-    const filter = {};
-    if (status === "published") filter.$and = [{ isActive: true }, { $or: [{ status: "published" }, { status: { $exists: false } }] }];
-    if (status === "draft") filter.$or = [{ status: "draft" }, { status: { $exists: false }, isActive: false }];
-    if (status === "archived") filter.status = "archived";
-    if (search) {
-      const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const searchFilter = { $or: [
-        { name: new RegExp(escaped, "i") },
-        { sku: new RegExp(escaped, "i") },
-        { "variants.sku": new RegExp(escaped, "i") },
-        { brand: new RegExp(escaped, "i") },
-      ] };
-      if (filter.$and) filter.$and.push(searchFilter);
-      else if (filter.$or) filter.$and = [{ $or: filter.$or }, searchFilter], delete filter.$or;
-      else Object.assign(filter, searchFilter);
-    }
+    const { search, filter } = buildAdminProductQuery(req.query);
+    const { page: pageNumber, limit: pageSize } = parseListQuery(req.query);
     const [products, total] = await Promise.all([
       Product.find(filter).populate("shop", "name shopNumber isActive").sort({ updatedAt: -1 }).skip((pageNumber - 1) * pageSize).limit(pageSize),
       Product.countDocuments(filter),
     ]);
     res.json({ products: products.map((product) => ({ ...product.toJSON(), status: productStatus(product), publishIssues: validatePublishable(product) })), total, page: pageNumber, pages: Math.ceil(total / pageSize) });
+  } catch (err) { next(err); }
+});
+
+router.post("/admin/sku-suggestion", protect, requireRole("admin"), async (req, res, next) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    if (!name) return res.status(400).json({ message: "Add a product name before generating an SKU." });
+    const reservedSkus = new Set((Array.isArray(req.body?.reservedSkus) ? req.body.reservedSkus : [])
+      .map((sku) => String(sku || "").trim().toUpperCase()).filter(Boolean));
+    res.json({ sku: await suggestUniqueProductSku(name, reservedSkus) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/admin/archive-matching", protect, requireRole("admin"), async (req, res, next) => {
+  try {
+    const expectedCount = req.body?.expectedCount;
+    if (!isValidExpectedProductCount(expectedCount)) {
+      return res.status(400).json({ message: "A positive matching product count is required to confirm this archive." });
+    }
+    const { filter } = buildAdminProductQuery(req.body);
+    const matchingCount = await Product.countDocuments(filter);
+    if (!matchesExpectedProductCount(expectedCount, matchingCount)) {
+      return res.status(409).json({
+        message: `The matching product count changed from ${expectedCount} to ${matchingCount}. Refresh the list and confirm the current selection again.`,
+        matchingCount,
+      });
+    }
+
+    const archivedAt = new Date();
+    const result = await Product.updateMany(filter, { $set: { status: "archived", isActive: false, archivedAt } }, { runValidators: true });
+    res.json({ message: `${result.modifiedCount} matching products archived.`, total: expectedCount, archived: result.modifiedCount });
   } catch (err) { next(err); }
 });
 
@@ -448,6 +468,10 @@ router.post("/bulk-import/preview", protect, requireRole("admin"), upload.single
     if (!rows.length) return res.status(400).json({ message: "This CSV contains no product rows." });
     const mapped = mapWooCommerceRows(rows);
     const items = [];
+    const reservedSkus = new Set(mapped.flatMap((entry) => entry.product
+      ? [entry.product.sku, ...(entry.product.variants || []).map((variant) => variant.sku)]
+        .map((sku) => String(sku || "").trim().toUpperCase()).filter(Boolean)
+      : []));
     for (const entry of mapped) {
       if (!entry.product) {
         items.push({ index: entry.index, product: null, errors: [entry.reason || "This row could not be imported."], candidates: [] });
@@ -470,6 +494,20 @@ router.post("/bulk-import/preview", protect, requireRole("admin"), upload.single
         ? await Product.find({ $or: candidateConditions })
           .select("name sku brand shop variants.sku variants.name status isActive").populate("shop", "name shopNumber").limit(10)
         : [];
+      const generatedSkus = { product: false, variants: [] };
+      if (!candidates.length) {
+        if (p.variants?.length) {
+          for (let index = 0; index < p.variants.length; index += 1) {
+            if (!String(p.variants[index].sku || "").trim()) {
+              p.variants[index].sku = await suggestUniqueProductSku(`${p.name} ${p.variants[index].name}`, reservedSkus);
+              generatedSkus.variants.push(index);
+            }
+          }
+        } else if (!String(p.sku || "").trim()) {
+          p.sku = await suggestUniqueProductSku(p.name, reservedSkus);
+          generatedSkus.product = true;
+        }
+      }
       const errors = [];
       if ((p.images || []).length > 12) errors.push("This product has more than 12 images. Remove extra images from the CSV before importing.");
       if (!String(p.name || "").trim()) errors.push("Add a product name before publishing.");
@@ -498,7 +536,24 @@ router.post("/bulk-import/preview", protect, requireRole("admin"), upload.single
       }
       if (entry.reason) errors.push(entry.reason);
       const category = cleanCategory(p.sourceCategory);
-      items.push({ index: entry.index, product: p, sourceCategory: category, sourcePublished: Boolean(entry.sourcePublished), errors, candidates: candidates.map((candidate) => ({ id: candidate._id, name: candidate.name, sku: candidate.sku, brand: candidate.brand, shop: candidate.shop ? { id: candidate.shop._id, name: candidate.shop.name, shopNumber: candidate.shop.shopNumber } : null, status: productStatus(candidate) })) });
+      items.push({ index: entry.index, product: p, generatedSkus, sourceCategory: category, sourcePublished: Boolean(entry.sourcePublished), errors, candidates: candidates.map((candidate) => {
+        const candidateSkus = [candidate.sku, ...(candidate.variants || []).map((variant) => variant.sku)]
+          .map((sku) => String(sku || "").trim().toUpperCase()).filter(Boolean);
+        const sourceSkus = skus.map((sku) => sku.toUpperCase());
+        const sameName = String(candidate.name || "").trim().toLowerCase() === String(p.name || "").trim().toLowerCase()
+          && (!p.brand || String(candidate.brand || "").trim().toLowerCase() === String(p.brand).trim().toLowerCase());
+        return {
+          id: candidate._id,
+          name: candidate.name,
+          sku: candidate.sku,
+          variantSkus: candidateSkus.filter((sku) => sku !== String(candidate.sku || "").trim().toUpperCase()),
+          brand: candidate.brand,
+          matchedBySku: candidateSkus.some((sku) => sourceSkus.includes(sku)),
+          matchedByName: sameName,
+          shop: candidate.shop ? { id: candidate.shop._id, name: candidate.shop.name, shopNumber: candidate.shop.shopNumber } : null,
+          status: productStatus(candidate),
+        };
+      }) });
     }
     const fileHash = crypto.createHash("sha256").update(req.file.buffer).digest("hex");
     res.json({ total: rows.length, fileHash, items });
@@ -530,9 +585,14 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
     }
     const mappedEntries = mapWooCommerceRows(rows);
     const mappedIndexes = new Set(mappedEntries.map((entry) => entry.index));
-    if (plan.length !== mappedEntries.length || plan.some((item) => !mappedIndexes.has(Number(item.index)))) {
-      return res.status(400).json({ message: "Review every product row before importing. Analyze the CSV again if its preview is out of date." });
-    }
+    const planIssue = validateImportPlan(
+      [...mappedIndexes],
+      plan.filter((item) => item.action !== "skip"),
+      plan.filter((item) => item.action === "skip").map((item) => item.index),
+    );
+    if (planIssue) return res.status(400).json({ message: planIssue });
+    const skuPlanIssue = validatePlannedSkuUniqueness(plan);
+    if (skuPlanIssue) return res.status(400).json({ message: skuPlanIssue });
     const mapped = new Map(mappedEntries.map((entry) => [entry.index, entry]));
     const results = [];
     for (const decision of plan) {
@@ -540,7 +600,9 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
       const entry = mapped.get(Number(decision.index));
       if (!entry?.product) { results.push({ index: decision.index, status: "failed", message: entry?.reason || "Invalid product row" }); continue; }
       try {
-        const imported = { ...entry.product, variants: entry.product.variants || [] };
+        const reviewed = normalizeReviewedProduct(decision.product);
+        if (reviewed.issues.length) throw Object.assign(new Error("Reviewed product details are invalid."), { statusCode: 400, issues: reviewed.issues });
+        const imported = { ...reviewed.product, variants: reviewed.product.variants || [] };
         const shop = await Shop.findById(decision.shopId).select("_id isActive");
         if (!shop) throw Object.assign(new Error("Choose a valid shop."), { statusCode: 400 });
         imported.shop = shop._id;
@@ -558,26 +620,25 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
           if (!decision.productId) throw Object.assign(new Error("Choose which existing product to overwrite."), { statusCode: 400 });
           const existing = await Product.findById(decision.productId);
           if (!existing) throw Object.assign(new Error("The selected matching product no longer exists."), { statusCode: 409 });
-          const skuRegexes = [imported.sku, ...(imported.variants || []).map((variant) => variant.sku)].filter(Boolean)
+          const skuRegexes = [entry.product.sku, ...(entry.product.variants || []).map((variant) => variant.sku)].filter(Boolean)
             .map((sku) => new RegExp(`^${escapeRegExp(sku)}$`, "i"));
           const matchConditions = [];
           if (skuRegexes.length) matchConditions.push({ sku: { $in: skuRegexes } }, { "variants.sku": { $in: skuRegexes } });
           matchConditions.push({
-            name: new RegExp(`^${escapeRegExp(imported.name)}$`, "i"),
-            ...(imported.brand ? { brand: new RegExp(`^${escapeRegExp(imported.brand)}$`, "i") } : {}),
-            ...(decision.shopId ? { shop: decision.shopId } : {}),
+            name: new RegExp(`^${escapeRegExp(entry.product.name)}$`, "i"),
+            ...(entry.product.brand ? { brand: new RegExp(`^${escapeRegExp(entry.product.brand)}$`, "i") } : {}),
           });
           const matchingQuery = { $or: matchConditions };
           if (!await Product.exists({ _id: existing._id, ...matchingQuery })) throw Object.assign(new Error("The selected product no longer matches this import row."), { statusCode: 409 });
           // Preserve existing values when the CSV leaves a field blank.
           const merged = existing.toObject();
-          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brand", "category", "subcategory", "shop", "variants"]) {
+          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brand", "category", "subcategory", "shop", "returnEligibility", "badge", "isFlashSale", "purposeTags", "flashSaleEndsAt", "variants"]) {
             const value = imported[key];
             if (key === "variants") {
               merged.variants = mergeImportedVariants(existing.variants || [], imported.variants || []);
               continue;
             }
-            if (value === undefined || value === "" || (Array.isArray(value) && value.length === 0)) continue;
+            if (key === "sku" && !String(entry.product.sku || "").trim()) continue;
             merged[key] = value;
           }
           if (imported.stock !== undefined) {
@@ -599,7 +660,7 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
           if (issues.length) throw Object.assign(new Error("This item cannot be published yet"), { statusCode: 400, issues });
           merged.skuCodes = [merged.sku, ...(merged.variants || []).map((variant) => variant.sku)].filter(Boolean).map((sku) => String(sku).trim().toUpperCase());
           const update = {};
-          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brand", "category", "subcategory", "shop", "variants", "stock", "status", "isActive", "archivedAt", "skuCodes"]) {
+          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brand", "category", "subcategory", "shop", "returnEligibility", "badge", "isFlashSale", "purposeTags", "flashSaleEndsAt", "variants", "stock", "status", "isActive", "archivedAt", "skuCodes"]) {
             if (merged[key] !== undefined) update[key] = merged[key];
           }
           if (!merged.skuCodes.length) { delete update.skuCodes; update.$unset = { skuCodes: 1 }; }
@@ -612,7 +673,7 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
           if (!overwrittenProduct) {
             throw Object.assign(new Error("This product changed or gained an active order reservation while the import was being applied. Nothing was overwritten; refresh the catalog and review the product again."), { statusCode: 409 });
           }
-          results.push({ index: decision.index, status: "overwritten" });
+          results.push({ index: decision.index, status: "overwritten", productStatus: targetStatus });
         } else {
           if (targetStatus === "published") {
             const taxonomy = await normalizeProductTaxonomy(imported);
@@ -626,7 +687,7 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
           const sameName = await Product.findOne({ name: new RegExp(`^${escapeRegExp(imported.name)}$`, "i"), ...(imported.brand ? { brand: new RegExp(`^${escapeRegExp(imported.brand)}$`, "i") } : {}), shop: imported.shop }).select("name");
           if (sameName) throw Object.assign(new Error("A product with this name, brand, and shop already exists. Choose the matching product to overwrite or skip this row."), { statusCode: 409 });
           const created = await Product.create(imported);
-          results.push({ index: decision.index, status: "created", productId: created._id });
+          results.push({ index: decision.index, status: "created", productId: created._id, productStatus: targetStatus });
         }
       } catch (err) {
         const message = err.code === 11000
