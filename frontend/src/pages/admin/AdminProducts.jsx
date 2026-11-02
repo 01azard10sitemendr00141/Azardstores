@@ -12,7 +12,7 @@ import { clearHomeCache } from "../../utils/homeCache";
 import { productImageUrl } from "../../utils/productImageUrl";
 
 const PURPOSES = ["work", "gaming", "travel", "home", "fitness"];
-const EMPTY = { name: "", sku: "", description: "", longDescription: "", price: "", compareAtPrice: "", images: "", shop: "", category: "", subcategory: "", brand: "", stock: "", badge: "", returnEligibility: "standard", isFlashSale: false, purposeTags: [], variants: [], status: "draft" };
+const EMPTY = { name: "", sku: "", description: "", longDescription: "", price: "", compareAtPrice: "", images: "", shop: "", categoryId: "", subcategoryId: "", category: "", subcategory: "", brand: "", stock: "", badge: "", returnEligibility: "standard", isFlashSale: false, purposeTags: [], variants: [], status: "draft" };
 
 function getStockLabel(product) {
   if (product.variants?.length) {
@@ -22,13 +22,14 @@ function getStockLabel(product) {
   return Number.isInteger(product.stock) ? product.stock.toLocaleString() : "Not confirmed";
 }
 
-function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
+function ProductForm({ initial, floors, shops, categories, brands, onSave, onCancel }) {
   const { badges } = useBadges();
   const formId = useId().replace(/:/g, "");
   const fieldId = (name) => `${formId}-${name}`;
   const [form, setForm] = useState(initial
     ? { ...initial, images: initial.images?.join(", ") || "", purposeTags: initial.purposeTags || [], variants: initial.variants || [] }
     : EMPTY);
+  const [floorId, setFloorId] = useState(String(initial?.shop?.floor?._id || initial?.shop?.floor || ""));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [publishIssues, setPublishIssues] = useState(initial?.publishIssues || []);
@@ -136,8 +137,11 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
     updateImages(urls);
   }
 
-  const selectedCategory = categories.find((category) => category.name.trim().toLocaleLowerCase() === String(form.category || "").trim().toLocaleLowerCase());
-  const selectedSubcategory = selectedCategory?.subcategories?.find((subcategory) => subcategory.name.trim().toLocaleLowerCase() === String(form.subcategory || "").trim().toLocaleLowerCase());
+  const selectedCategory = categories.find((category) => String(category._id) === String(form.categoryId || "")
+    || category.name.trim().toLocaleLowerCase() === String(form.category || "").trim().toLocaleLowerCase());
+  const selectedSubcategory = selectedCategory?.subcategories?.find((subcategory) => String(subcategory._id) === String(form.subcategoryId || "")
+    || subcategory.name.trim().toLocaleLowerCase() === String(form.subcategory || "").trim().toLocaleLowerCase());
+  const floorShops = shops.filter((shop) => String(shop.floor?._id || shop.floor || "") === floorId);
 
   async function handleSave(e, requestedStatus = "draft") {
     e?.preventDefault();
@@ -188,6 +192,11 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
         ...saveForm,
         status: requestedStatus,
         shop: saveForm.shop?._id || saveForm.shop,
+        floorId,
+        categoryId: selectedCategory?._id || "",
+        subcategoryId: selectedSubcategory?._id || "",
+        category: selectedCategory?.name || saveForm.category,
+        subcategory: selectedSubcategory?.name || saveForm.subcategory,
         images: saveForm.images ? saveForm.images.split(",").map((s) => s.trim()).filter(Boolean) : [],
         price: saveForm.price === "" || saveForm.price === undefined ? null : Number(saveForm.price),
         compareAtPrice: saveForm.compareAtPrice ? Number(saveForm.compareAtPrice) : null,
@@ -277,11 +286,28 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
         <div>
+          <label htmlFor={fieldId("floor")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Floor</label>
+          <select
+            id={fieldId("floor")}
+            value={floorId}
+            onChange={(e) => {
+              const nextFloorId = e.target.value;
+              setFloorId(nextFloorId);
+              const currentShopId = String(form.shop?._id || form.shop || "");
+              if (!shops.some((shop) => String(shop._id) === currentShopId && String(shop.floor?._id || shop.floor || "") === nextFloorId)) set("shop", "");
+            }}
+            className={inputClass}
+          >
+            <option value="">Select floor first</option>
+            {floors.map((floor) => <option key={floor._id} value={floor._id} disabled={floor.isActive === false && String(floor._id) !== floorId}>Floor {floor.floorNumber}: {floor.name}{floor.isActive === false ? " (Inactive)" : ""}</option>)}
+          </select>
+        </div>
+        <div>
           <label htmlFor={fieldId("shop")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Shop</label>
-          <select id={fieldId("shop")} value={form.shop?._id || form.shop} onChange={(e) => set("shop", e.target.value)} className={inputClass}>
-            <option value="">Select shop</option>
-            {form.shop?._id && !shops.some((shop) => shop._id === form.shop._id) && <option value={form.shop._id} disabled>#{form.shop.shopNumber} {form.shop.name} (inactive)</option>}
-            {shops.map((s) => <option key={s._id} value={s._id}>#{s.shopNumber} {s.name}</option>)}
+          <select id={fieldId("shop")} value={form.shop?._id || form.shop} onChange={(e) => set("shop", e.target.value)} disabled={!floorId} className={`${inputClass} disabled:opacity-40`}>
+            <option value="">{floorId ? "Select shop on this floor" : "Choose a floor first"}</option>
+            {form.shop?._id && !floorShops.some((shop) => String(shop._id) === String(form.shop._id)) && <option value={form.shop._id} disabled>#{form.shop.shopNumber} {form.shop.name} (inactive)</option>}
+            {floorShops.map((s) => <option key={s._id} value={s._id}>#{s.shopNumber} {s.name}</option>)}
           </select>
           {form.shop?.isActive === false && <p className="mt-1 text-[10px] text-amber-200/80">This shop is inactive, so the product is hidden from shoppers. Move it to an active shop before publishing.</p>}
         </div>
@@ -312,28 +338,34 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
           <label htmlFor={fieldId("category")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Category</label>
           <select
             id={fieldId("category")}
-            value={selectedCategory?.name || form.category}
-            onChange={(e) => { set("category", e.target.value); set("subcategory", ""); }}
+            value={selectedCategory?._id || ""}
+            onChange={(e) => {
+              const category = categories.find((entry) => entry._id === e.target.value);
+              setForm((current) => ({ ...current, categoryId: category?._id || "", category: category?.name || "", subcategoryId: "", subcategory: "" }));
+            }}
             className={inputClass}
           >
             <option value="">Select category</option>
-            {form.category && !selectedCategory && <option value={form.category} disabled>{form.category} (not managed)</option>}
-            {categories.map((c) => <option key={c._id} value={c.name}>{c.name}</option>)}
+            {form.category && !selectedCategory && <option value="" disabled>{form.category} (not managed)</option>}
+            {categories.map((c) => <option key={c._id} value={c._id}>{c.name}</option>)}
           </select>
         </div>
         <div>
           <label htmlFor={fieldId("subcategory")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Subcategory</label>
           <select
             id={fieldId("subcategory")}
-            value={selectedSubcategory?.name || form.subcategory}
-            onChange={(e) => set("subcategory", e.target.value)}
+            value={selectedSubcategory?._id || ""}
+            onChange={(e) => {
+              const subcategory = selectedCategory?.subcategories?.find((entry) => entry._id === e.target.value);
+              setForm((current) => ({ ...current, subcategoryId: subcategory?._id || "", subcategory: subcategory?.name || "" }));
+            }}
             disabled={!selectedCategory}
             className={`${inputClass} disabled:opacity-40 disabled:cursor-not-allowed`}
           >
             <option value="">{selectedCategory ? "Select subcategory" : "Pick a managed category first"}</option>
-            {form.subcategory && selectedCategory && !selectedSubcategory && <option value={form.subcategory} disabled>{form.subcategory} (not in this category)</option>}
+            {form.subcategory && selectedCategory && !selectedSubcategory && <option value="" disabled>{form.subcategory} (not in this category)</option>}
             {(selectedCategory?.subcategories || []).map((s) => (
-              <option key={s._id} value={s.name}>{s.name}</option>
+              <option key={s._id} value={s._id}>{s.name}</option>
             ))}
           </select>
         </div>
@@ -489,11 +521,12 @@ function ProductForm({ initial, shops, categories, brands, onSave, onCancel }) {
 // â”€â”€â”€ Bulk CSV import â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Currently supports WooCommerce product exports (see utils/wooCommerceImport.js
 // on the backend for the field mapping). Two-step flow: first analyze the
-// file to see which categories it contains, then map each category to a
-// shop (or leave it on the default) before actually importing anything.
-function BulkEditPanel({ count, shops, categories, brands, selectionHasVariants, onApply, onCancel }) {
+// file, then review each row's floor, shop, and managed category assignment
+// before any products are written.
+function BulkEditPanel({ count, floors, shops, categories, brands, selectionHasVariants, onApply, onCancel }) {
   const { badges } = useBadges();
   const [shop, setShop] = useState("");
+  const [floorId, setFloorId] = useState("");
   const [category, setCategory] = useState("");
   const [subcategory, setSubcategory] = useState("");
   const [badge, setBadge] = useState("");
@@ -508,14 +541,18 @@ function BulkEditPanel({ count, shops, categories, brands, selectionHasVariants,
     setError("");
 
     const set = {};
+    if (floorId && !shop) {
+      setError("Choose a shop on the selected floor.");
+      return;
+    }
     if (shop) set.shop = shop;
     if (category) {
       if (!subcategory) {
         setError("Choose a subcategory for the selected category.");
         return;
       }
-      set.category = category;
-      set.subcategory = subcategory;
+      set.categoryId = category;
+      set.subcategoryId = subcategory;
     }
     if (badge) set.badge = badge;
     if (stock !== "") set.stock = Number(stock);
@@ -538,7 +575,8 @@ function BulkEditPanel({ count, shops, categories, brands, selectionHasVariants,
   }
 
   const inputClass = "w-full min-h-11 sm:min-h-0 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm placeholder-cream/20 outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition";
-  const selectedCategory = categories.find((entry) => entry.name === category);
+  const selectedCategory = categories.find((entry) => entry._id === category);
+  const floorShops = shops.filter((entry) => String(entry.floor?._id || entry.floor || "") === floorId);
 
   return (
     <div className="border border-mall-accent/30 rounded-2xl p-3 sm:p-5 bg-mall-accent/5 mb-4">
@@ -548,24 +586,31 @@ function BulkEditPanel({ count, shops, categories, brands, selectionHasVariants,
       <form onSubmit={handleApply}>
         <div className="grid sm:grid-cols-2 gap-3 mb-3">
           <div>
+            <label className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Move to Floor</label>
+            <select value={floorId} onChange={(e) => { setFloorId(e.target.value); setShop(""); }} className={inputClass}>
+              <option value="">Don't change floor/shop</option>
+              {floors.filter((floor) => floor.isActive !== false).map((floor) => <option key={floor._id} value={floor._id}>Floor {floor.floorNumber}: {floor.name}</option>)}
+            </select>
+          </div>
+          <div>
             <label className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Move to Shop</label>
-            <select value={shop} onChange={(e) => setShop(e.target.value)} className={inputClass}>
-              <option value="">Don't change</option>
-              {shops.map((s) => <option key={s._id} value={s._id}>#{s.shopNumber} {s.name}</option>)}
+            <select value={shop} onChange={(e) => setShop(e.target.value)} disabled={!floorId} className={`${inputClass} disabled:opacity-40`}>
+              <option value="">{floorId ? "Choose shop on this floor" : "Choose a floor first"}</option>
+              {floorShops.map((s) => <option key={s._id} value={s._id}>#{s.shopNumber} {s.name}</option>)}
             </select>
           </div>
           <div>
             <label className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Set Category</label>
             <select value={category} onChange={(e) => { setCategory(e.target.value); setSubcategory(""); }} className={inputClass}>
               <option value="">Don't change</option>
-              {categories.map((c) => <option key={c._id} value={c.name}>{c.name}</option>)}
+              {categories.map((c) => <option key={c._id} value={c._id}>{c.name}</option>)}
             </select>
           </div>
           <div>
             <label className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Set Subcategory</label>
             <select value={subcategory} onChange={(e) => setSubcategory(e.target.value)} disabled={!selectedCategory} className={`${inputClass} disabled:opacity-40 disabled:cursor-not-allowed`}>
               <option value="">{selectedCategory ? "Choose subcategory" : "Choose a category first"}</option>
-              {(selectedCategory?.subcategories || []).map((entry) => <option key={entry._id} value={entry.name}>{entry.name}</option>)}
+              {(selectedCategory?.subcategories || []).map((entry) => <option key={entry._id} value={entry._id}>{entry.name}</option>)}
             </select>
           </div>
           <div>
@@ -618,6 +663,7 @@ function BulkEditPanel({ count, shops, categories, brands, selectionHasVariants,
 
 export default function AdminProducts() {
   const [products, setProducts] = useState([]);
+  const [floors, setFloors] = useState([]);
   const [shops, setShops] = useState([]);
   const [categories, setCategories] = useState([]);
   const [brands, setBrands] = useState([]);
@@ -654,9 +700,10 @@ export default function AdminProducts() {
     let active = true;
     setMetadataLoading(true);
     setMetadataError("");
-    Promise.all([api.get("/shops"), api.get("/categories"), api.get("/brands")])
-      .then(([shopsRes, catRes, brandRes]) => {
+    Promise.all([api.get("/floors/admin/list"), api.get("/shops"), api.get("/categories"), api.get("/brands")])
+      .then(([floorsRes, shopsRes, catRes, brandRes]) => {
         if (!active) return;
+        setFloors(floorsRes.data);
         setShops(shopsRes.data);
         setCategories(catRes.data);
         setBrands(brandRes.data);
@@ -824,6 +871,7 @@ export default function AdminProducts() {
       {deleteError && <p role="alert" className="mb-4 text-sm text-red-400">{deleteError}</p>}
       {showImport && (
         <ProductImportPanel
+          floors={floors}
           shops={shops}
           categories={categories}
           onDone={() => { clearHomeCache(); setShowImport(false); load(); }}
@@ -831,7 +879,7 @@ export default function AdminProducts() {
         />
       )}
 
-      {showAdd && <ProductForm shops={shops} categories={categories} brands={brands} onSave={handleAdd} onCancel={() => setShowAdd(false)} />}
+      {showAdd && <ProductForm floors={floors} shops={shops} categories={categories} brands={brands} onSave={handleAdd} onCancel={() => setShowAdd(false)} />}
 
       <div className="mb-4 flex gap-2 overflow-x-auto" role="tablist" aria-label="Product status">
         {[ ["all", "All products"], ["published", "Published"], ["draft", "Drafts"], ["archived", "Archived"] ].map(([value, label]) => (
@@ -960,6 +1008,7 @@ export default function AdminProducts() {
           {showBulkEdit && selectedIds.length > 0 && !allMatchingSelected && (
             <BulkEditPanel
               count={selectedIds.length}
+              floors={floors}
               shops={shops}
               categories={categories}
               brands={brands}
@@ -974,7 +1023,7 @@ export default function AdminProducts() {
               <div key={product._id}>
                 {editId === product._id ? (
                   <div className="py-3">
-                    <ProductForm initial={product} shops={shops} categories={categories} brands={brands} onSave={(form) => handleEdit(product._id, form)} onCancel={() => setEditId(null)} />
+                    <ProductForm initial={product} floors={floors} shops={shops} categories={categories} brands={brands} onSave={(form) => handleEdit(product._id, form)} onCancel={() => setEditId(null)} />
                   </div>
                 ) : (
                   <div className="grid grid-cols-[auto_auto_minmax(0,1fr)] items-center gap-x-3 gap-y-3 rounded-xl border border-cream/10 bg-mall-900/35 p-3 transition-colors hover:bg-mall-900/55 sm:grid-cols-[auto_auto_minmax(0,1.35fr)_minmax(10rem,0.8fr)_minmax(9rem,0.75fr)_auto] sm:gap-4 sm:p-4">

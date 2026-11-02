@@ -5,21 +5,46 @@ function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-async function normalizeProductTaxonomy(product) {
+async function normalizeProductTaxonomy(product, { requireComplete = true } = {}) {
   const categoryName = String(product.category || "").trim();
   const subcategoryName = String(product.subcategory || "").trim();
+  const categoryId = String(product.categoryId || "").trim();
+  const subcategoryId = String(product.subcategoryId || "").trim();
   const issues = [];
-  if (!categoryName) issues.push("Choose a managed product category.");
-  if (!subcategoryName) issues.push("Choose a subcategory from the selected category.");
-  if (issues.length) return { category: categoryName, subcategory: subcategoryName, issues };
-
-  const category = await Category.findOne({ name: new RegExp(`^${escapeRegex(categoryName)}$`, "i") });
-  if (!category) return { category: categoryName, subcategory: subcategoryName, issues: ["Choose a category from the managed category list."] };
-  const subcategory = category.subcategories.find((entry) => entry.name.toLowerCase() === subcategoryName.toLowerCase());
-  if (!subcategory) {
-    return { category: category.name, subcategory: subcategoryName, issues: [`Choose a subcategory that belongs to ${category.name}.`] };
+  if (!categoryName && !categoryId) {
+    if (requireComplete) issues.push("Choose a managed product category.");
+    return { category: categoryName, subcategory: subcategoryName, categoryId: null, subcategoryId: null, issues };
   }
-  return { category: category.name, subcategory: subcategory.name, issues: [] };
+
+  let category;
+  if (categoryId) {
+    if (!/^[a-f\d]{24}$/i.test(categoryId)) {
+      return { category: categoryName, subcategory: subcategoryName, categoryId: null, subcategoryId: null, issues: ["Choose a valid managed product category."] };
+    }
+    category = await Category.findById(categoryId);
+  } else {
+    category = await Category.findOne({ name: new RegExp(`^${escapeRegex(categoryName)}$`, "i") });
+  }
+  if (!category) {
+    return { category: categoryName, subcategory: subcategoryName, categoryId: null, subcategoryId: null, issues: ["Choose a category from the managed category list."] };
+  }
+  if (!subcategoryName && !subcategoryId) {
+    if (requireComplete) issues.push("Choose a subcategory from the selected category.");
+    return { category: category.name, subcategory: "", categoryId: category._id, subcategoryId: null, issues };
+  }
+  let subcategory;
+  if (subcategoryId) {
+    if (!/^[a-f\d]{24}$/i.test(subcategoryId)) {
+      return { category: category.name, subcategory: subcategoryName, categoryId: category._id, subcategoryId: null, issues: ["Choose a valid subcategory from the selected category."] };
+    }
+    subcategory = category.subcategories.id(subcategoryId);
+  } else {
+    subcategory = category.subcategories.find((entry) => entry.name.toLowerCase() === subcategoryName.toLowerCase());
+  }
+  if (!subcategory) {
+    return { category: category.name, subcategory: subcategoryName, categoryId: category._id, subcategoryId: null, issues: [`Choose a subcategory that belongs to ${category.name}.`] };
+  }
+  return { category: category.name, subcategory: subcategory.name, categoryId: category._id, subcategoryId: subcategory._id, issues: [] };
 }
 
 function isValidProductImageUrl(image) {

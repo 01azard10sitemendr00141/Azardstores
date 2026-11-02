@@ -21,11 +21,8 @@ const categorySchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// This model is deliberately independent of Product.category/subcategory —
-// those remain plain strings on Product for backward compatibility with
-// products imported or added before this model existed. This list exists
-// to constrain what the *admin UI* offers as options, not to enforce a
-// foreign-key relationship at the database level.
+// Product documents keep managed-record IDs for new assignments plus their
+// names for existing storefront routes and legacy catalog compatibility.
 categorySchema.pre("save", function (next) {
   if (this.isModified("name") && !this.slug) {
     this.slug = makeSlug(this.name, Date.now().toString(36));

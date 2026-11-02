@@ -61,7 +61,12 @@ router.put("/:id", protect, requireRole("admin"), async (req, res, next) => {
       return res.status(400).json({ message: "A category with this name already exists" });
     }
 
-    const assignedProducts = await Product.countDocuments({ category: new RegExp(`^${category.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") });
+    const assignedProducts = await Product.countDocuments({
+      $or: [
+        { categoryId: category._id },
+        { category: new RegExp(`^${category.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") },
+      ],
+    });
     if (assignedProducts) return res.status(409).json({ message: `Move the ${assignedProducts} product${assignedProducts === 1 ? "" : "s"} to another category before renaming this one.` });
 
     category.name = trimmed;
@@ -78,7 +83,12 @@ router.delete("/:id", protect, requireRole("admin"), async (req, res, next) => {
   try {
     const category = await Category.findById(req.params.id);
     if (!category) return res.status(404).json({ message: "Category not found" });
-    const assignedProducts = await Product.countDocuments({ category: new RegExp(`^${category.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") });
+    const assignedProducts = await Product.countDocuments({
+      $or: [
+        { categoryId: category._id },
+        { category: new RegExp(`^${category.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") },
+      ],
+    });
     if (assignedProducts) return res.status(409).json({ message: `Move the ${assignedProducts} product${assignedProducts === 1 ? "" : "s"} to another category before deleting this one.` });
     await category.deleteOne();
     res.json({ message: "Category deleted" });
@@ -127,8 +137,10 @@ router.put("/:id/subcategories/:subId", protect, requireRole("admin"), async (re
     if (duplicate) return res.status(400).json({ message: "That subcategory already exists on this category" });
 
     const assignedProducts = await Product.countDocuments({
-      category: new RegExp(`^${category.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
-      subcategory: new RegExp(`^${sub.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
+      $and: [
+        { $or: [{ categoryId: category._id }, { category: new RegExp(`^${category.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") }] },
+        { $or: [{ subcategoryId: sub._id }, { subcategory: new RegExp(`^${sub.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") }] },
+      ],
     });
     if (assignedProducts) return res.status(409).json({ message: `Move the ${assignedProducts} product${assignedProducts === 1 ? "" : "s"} to another subcategory before renaming this one.` });
 
@@ -152,8 +164,10 @@ router.delete("/:id/subcategories/:subId", protect, requireRole("admin"), async 
     if (!sub) return res.status(404).json({ message: "Subcategory not found" });
 
     const assignedProducts = await Product.countDocuments({
-      category: new RegExp(`^${category.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
-      subcategory: new RegExp(`^${sub.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
+      $and: [
+        { $or: [{ categoryId: category._id }, { category: new RegExp(`^${category.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") }] },
+        { $or: [{ subcategoryId: sub._id }, { subcategory: new RegExp(`^${sub.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") }] },
+      ],
     });
     if (assignedProducts) return res.status(409).json({ message: `Move the ${assignedProducts} product${assignedProducts === 1 ? "" : "s"} to another subcategory before deleting this one.` });
 

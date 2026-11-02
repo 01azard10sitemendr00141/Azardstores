@@ -36,6 +36,86 @@ function numberOrUndefined(value) {
   return Number.isFinite(number) ? number : undefined;
 }
 
+function readLocationField(row, labels) {
+  const keys = new Map(Object.keys(row).map((key) => [key.trim().toLowerCase(), key]));
+  for (const label of labels) {
+    const key = keys.get(label.toLowerCase());
+    const value = key ? String(row[key] || "").trim() : "";
+    if (value) return value;
+  }
+  return "";
+}
+
+function sourcePlacement(row) {
+  return {
+    floor: readLocationField(row, ["Floor", "Floor Name", "Floor Number"]),
+    shop: readLocationField(row, ["Shop", "Shop Name"]),
+  };
+}
+
+function normalizedLocation(value) {
+  return String(value || "").trim().toLocaleLowerCase();
+}
+
+function matchFloor(value, floors) {
+  const normalized = normalizedLocation(value);
+  if (!normalized) return { floor: null, provided: false };
+  const floorNumber = normalized.match(/^(?:floor\s*)?#?\s*(\d+)(?:\s*[:\-].*)?$/);
+  const matches = floors.filter((floor) => (
+    normalizedLocation(floor.name) === normalized
+    || (floorNumber && Number(floorNumber[1]) === Number(floor.floorNumber))
+  ));
+  return { floor: matches.length === 1 ? matches[0] : null, provided: true, ambiguous: matches.length > 1 };
+}
+
+function suggestImportPlacement(source, floors, shops) {
+  const sourceFloor = String(source?.floor || "").trim();
+  const sourceShop = String(source?.shop || "").trim();
+  const floorMatch = matchFloor(sourceFloor, floors);
+  let floor = floorMatch.floor;
+  let shop = null;
+  let issue = "";
+
+  if (sourceFloor && !floor) {
+    issue = floorMatch.ambiguous ? "The CSV floor matches more than one floor." : `CSV floor "${sourceFloor}" was not matched; choose a floor.`;
+  }
+
+  if (sourceShop) {
+    let candidates = sourceFloor && !floor ? [] : shops;
+    if (floor) candidates = candidates.filter((entry) => String(entry.floor?._id || entry.floor || "") === String(floor._id));
+    const numberedShop = sourceShop.match(/^#?\s*(\d+)$/);
+    const numberedName = sourceShop.match(/^#?\s*(\d+)\s+(.+)$/);
+    candidates = candidates.filter((entry) => (
+      normalizedLocation(entry.name) === normalizedLocation(sourceShop)
+      || (numberedShop && Number(entry.shopNumber) === Number(numberedShop[1]))
+      || (numberedName && Number(entry.shopNumber) === Number(numberedName[1])
+        && normalizedLocation(entry.name) === normalizedLocation(numberedName[2]))
+    ));
+
+    if (!floor && candidates.length === 1) {
+      shop = candidates[0];
+      floor = floors.find((entry) => String(entry._id) === String(shop.floor?._id || shop.floor)) || null;
+    } else if (candidates.length === 1) {
+      shop = candidates[0];
+    } else if (!issue) {
+      issue = candidates.length > 1
+        ? `CSV shop "${sourceShop}" matches more than one shop; choose a floor and shop.`
+        : `CSV shop "${sourceShop}" was not matched; choose a shop.`;
+    }
+
+    if (shop && floor && String(shop.floor?._id || shop.floor || "") !== String(floor._id)) {
+      shop = null;
+      issue = `CSV shop "${sourceShop}" does not belong to floor "${sourceFloor}". Choose a shop on that floor.`;
+    }
+  }
+
+  return {
+    floorId: floor?._id ? String(floor._id) : "",
+    shopId: shop?._id ? String(shop._id) : "",
+    issue,
+  };
+}
+
 function rowSku(row) { return String(row.SKU || row.sku || "").trim().toUpperCase(); }
 function rowPublished(row) { return ["1", "yes", "true"].includes(String(row.Published || "").trim().toLowerCase()); }
 
@@ -65,6 +145,7 @@ function mapSimple(row) {
     ...(hasSale ? { compareAtPrice: regularPrice } : {}),
     images: parseImages(row.Images),
     sourceCategory: cleanCategory(row.Categories),
+    sourcePlacement: sourcePlacement(row),
     brand: extractBrand(shortDescription),
     description: shortDescription,
     longDescription,
@@ -135,4 +216,4 @@ function mapWooCommerceRow(row) {
   return mapSimple(row);
 }
 
-module.exports = { mapWooCommerceRow, mapWooCommerceRows, extractBrand, cleanCategory, parseImages, stripHtml };
+module.exports = { mapWooCommerceRow, mapWooCommerceRows, extractBrand, cleanCategory, parseImages, stripHtml, sourcePlacement, suggestImportPlacement };

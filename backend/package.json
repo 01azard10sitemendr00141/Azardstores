@@ -8,6 +8,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "seed": "node utils/seed.js",
+    "migrate:catalog-taxonomy": "node utils/migrateCatalogTaxonomy.js",
     "audit:retention": "node utils/audit-retention.js",
     "test": "node --test test/*.test.js"
   },

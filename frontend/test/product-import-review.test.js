@@ -43,11 +43,46 @@ test("skipped and unmappable rows are accounted as skipped rather than needing a
 });
 
 test("import validation catches SKU conflicts and allows an explicit skip", () => {
-  const item = { index: 0, action: "create", status: "draft", shopId: "shop", category: "", subcategory: "", productId: "", candidates: [], product: prepareImportProduct({ name: "Mug", sku: "same" }) };
+  const item = { index: 0, action: "create", status: "draft", floorId: "floor-1", shopId: "shop", category: "", subcategory: "", productId: "", candidates: [], product: prepareImportProduct({ name: "Mug", sku: "same" }) };
   const duplicate = { ...item, index: 1, product: { ...item.product, name: "Other" } };
   const errors = validateImportItem(item, [item, duplicate], []);
   assert.ok(errors.some((error) => error.includes("SKU also appears")));
   assert.deepEqual(validateImportItem({ ...item, action: "skip" }, [item], []), []);
+});
+
+test("published CSV rows require a floor-aligned shop and managed taxonomy IDs", () => {
+  const categories = [{
+    _id: "category-1",
+    name: "Electronics",
+    subcategories: [{ _id: "subcategory-1", name: "Headphones" }],
+  }];
+  const shops = [{ _id: "shop-1", floor: "floor-1", name: "Audio" }];
+  const item = {
+    index: 0,
+    action: "create",
+    status: "published",
+    floorId: "floor-1",
+    shopId: "shop-1",
+    categoryId: "category-1",
+    subcategoryId: "subcategory-1",
+    category: "Electronics",
+    subcategory: "Headphones",
+    productId: "",
+    candidates: [],
+    product: prepareImportProduct({
+      name: "Studio headphones",
+      sku: "HEADPHONE-1",
+      price: 2500,
+      stock: 5,
+      images: ["https://cdn.example.com/headphones.jpg"],
+    }),
+  };
+
+  assert.deepEqual(validateImportItem(item, [item], categories, shops), []);
+  assert.ok(validateImportItem({ ...item, floorId: "floor-2" }, [item], categories, shops)
+    .some((issue) => issue.includes("belongs to the selected floor")));
+  assert.ok(validateImportItem({ ...item, subcategoryId: "" }, [item], categories, shops)
+    .some((issue) => issue.includes("subcategory")));
 });
 
 test("import permits a replacement for a catalog SKU match but keeps same-name matches guarded", () => {
@@ -56,6 +91,7 @@ test("import permits a replacement for a catalog SKU match but keeps same-name m
     index: 0,
     action: "create",
     status: "draft",
+    floorId: "floor-1",
     shopId: "new-shop",
     category: "",
     subcategory: "",

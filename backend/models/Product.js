@@ -21,6 +21,9 @@ const productSchema = new Schema(
       validate: { validator: (images) => Array.isArray(images) && images.length <= 12, message: "A product can have up to 12 gallery images." },
     },
     shop: { type: Schema.Types.ObjectId, ref: "Shop", required: true, index: true },
+    // IDs are the managed taxonomy links; names remain for legacy products and public URLs.
+    categoryId: { type: Schema.Types.ObjectId, ref: "Category", default: null, index: true },
+    subcategoryId: { type: Schema.Types.ObjectId, default: null, index: true },
     category: { type: String, default: "" },
     subcategory: { type: String, default: "" },
     brand: { type: String, default: "" },

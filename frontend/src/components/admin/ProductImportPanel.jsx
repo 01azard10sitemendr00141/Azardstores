@@ -39,7 +39,7 @@ function ReviewBadge({ children, tone = "neutral" }) {
   return <span className={`inline-flex min-h-6 items-center rounded-md border px-2 py-1 text-[9px] font-mono-tag uppercase tracking-wider ${tones[tone]}`}>{children}</span>;
 }
 
-export default function ProductImportPanel({ shops, categories, onDone, onCancel }) {
+export default function ProductImportPanel({ floors = [], shops, categories, onDone, onCancel }) {
   const { badges } = useBadges();
   const [file, setFile] = useState(null);
   const [items, setItems] = useState([]);
@@ -56,8 +56,8 @@ export default function ProductImportPanel({ shops, categories, onDone, onCancel
   const counts = useMemo(() => getImportCounts(items), [items]);
   const issuesByIndex = useMemo(() => new Map(items.map((item) => [
     item.index,
-    validateImportItem(item, items, categories),
-  ])), [items, categories]);
+    validateImportItem(item, items, categories, shops),
+  ])), [items, categories, shops]);
   const reviewCounts = useMemo(() => ({
     attention: items.filter((item) => ["blocked", "attention"].includes(getImportReviewStatus(item, issuesByIndex.get(item.index)))).length,
     ready: items.filter((item) => getImportReviewStatus(item, issuesByIndex.get(item.index)) === "ready").length,
@@ -156,10 +156,15 @@ export default function ProductImportPanel({ shops, categories, onDone, onCancel
         return {
           ...item,
           product: item.product ? prepareImportProduct(item.product) : null,
+          sourcePlacement: item.product?.sourcePlacement || { floor: "", shop: "" },
           action: item.product ? (item.candidates?.length ? "skip" : "create") : "skip",
           productId: "",
           status: "draft",
-          shopId: "",
+          floorId: item.placementSuggestion?.floorId || "",
+          shopId: item.placementSuggestion?.shopId || "",
+          placementIssue: item.placementSuggestion?.issue || "",
+          categoryId: categoryMatch?._id || "",
+          subcategoryId: subcategoryMatch?._id || "",
           category: subcategoryMatch ? categoryMatch.name : categoryMatch?.name || "",
           subcategory: subcategoryMatch?.name || "",
           preferredMatch: singleMatch,
@@ -199,7 +204,10 @@ export default function ProductImportPanel({ shops, categories, onDone, onCancel
         ...(item.action === "skip" ? {} : {
           productId: item.productId,
           status: item.status,
+          floorId: item.floorId,
           shopId: item.shopId,
+          categoryId: item.categoryId,
+          subcategoryId: item.subcategoryId,
           category: item.category,
           subcategory: item.subcategory,
           product: {
@@ -351,6 +359,7 @@ export default function ProductImportPanel({ shops, categories, onDone, onCancel
           name: issue.startsWith("Add a product name") || issue.startsWith("Product name"),
           sku: issue.includes("product SKU") || issue.includes("Product SKU") || issue.includes("SKU codes") || issue.includes("SKU also appears"),
           price: issue.startsWith("Price ") || issue.includes("price greater than zero") || issue.includes("Compare-at price"),
+          floor: issue.includes("floor"),
           shop: issue.includes("shop"),
           category: issue.includes("category"),
           subcategory: issue.includes("subcategory"),
@@ -370,7 +379,9 @@ export default function ProductImportPanel({ shops, categories, onDone, onCancel
           const issue = fieldIssue(field);
           return issue ? <p id={`import-${item.index}-${field}-error`} className="mt-1 text-xs text-red-200">{issue}</p> : null;
         };
-        const category = categories.find((entry) => entry.name === item.category);
+        const category = categories.find((entry) => String(entry._id) === String(item.categoryId || "")
+          || entry.name === item.category);
+        const rowShops = shops.filter((shop) => String(shop.floor?._id || shop.floor || "") === String(item.floorId || ""));
         const blocked = !product;
         return <article key={item.index} className={`overflow-hidden rounded-xl border ${status === "blocked" || status === "attention" ? "border-amber-300/25" : "border-cream/10"} bg-mall-900/35`}>
           <div className="flex min-w-0 flex-wrap items-center gap-3 p-3 sm:flex-nowrap sm:p-4">
@@ -384,6 +395,7 @@ export default function ProductImportPanel({ shops, categories, onDone, onCancel
               </span>
               <span className="mt-1 block truncate text-[11px] text-cream/60">{product?.sku ? `SKU ${product.sku}` : "SKU missing"}{product?.price !== "" && product?.price != null ? ` · KSh ${Number(product.price).toLocaleString()}` : " · Price not set"}{product?.variants?.length ? ` · ${product.variants.length} options` : ""}{product?.variants?.length ? "" : ` · Stock ${product?.stock === "" || product?.stock == null ? "unconfirmed" : product?.stock}`}</span>
               <span className="mt-1 block truncate text-[10px] text-cream/50">{item.category ? `Mapped from CSV: ${item.sourceCategory || "category not provided"} → ${item.category}${item.subcategory ? ` / ${item.subcategory}` : ""}` : item.sourceCategory ? `Unmapped CSV category: ${item.sourceCategory}` : "Category not selected"}</span>
+              {(item.sourcePlacement?.floor || item.sourcePlacement?.shop) && <span className="mt-1 block truncate text-[10px] text-cream/50">CSV location: {[item.sourcePlacement.floor, item.sourcePlacement.shop].filter(Boolean).join(" · ")}</span>}
             </button>
             <label className="sr-only" htmlFor={`import-action-${item.index}`}>Decision for CSV row {item.index + 1}</label>
             <select id={`import-action-${item.index}`} value={item.action} onChange={(event) => updateItem(item.index, { action: event.target.value })} className="order-last min-h-10 w-full shrink-0 rounded-lg border border-cream/15 bg-mall-800 px-2 text-xs text-cream focus-visible:outline focus-visible:outline-2 focus-visible:outline-mall-accent sm:order-none sm:w-40" aria-label={`Decision for CSV row ${item.index + 1}`}>
@@ -403,6 +415,9 @@ export default function ProductImportPanel({ shops, categories, onDone, onCancel
                 <ReviewBadge tone="mapped">Imported fields · WooCommerce CSV</ReviewBadge>
                 {(item.generatedSkus?.product || item.generatedSkus?.variants?.length > 0) && <ReviewBadge tone="mapped">SKU suggestions generated · verify before import</ReviewBadge>}
                 {item.category && <ReviewBadge tone="mapped">Category mapped to {item.category}</ReviewBadge>}
+                {item.placementSuggestion?.floorId && item.placementSuggestion?.shopId && <ReviewBadge tone="mapped">CSV floor and shop matched</ReviewBadge>}
+                {item.placementIssue && <ReviewBadge tone="attention">Review CSV floor/shop match</ReviewBadge>}
+                {!item.floorId && <ReviewBadge tone="attention">Choose a floor</ReviewBadge>}
                 {!item.shopId && <ReviewBadge tone="attention">Choose a shop</ReviewBadge>}
                 {(!product.variants.length && (product.stock === "" || product.stock == null)) && <ReviewBadge tone="attention">Stock unconfirmed</ReviewBadge>}
                 <ReviewBadge tone="neutral">{item.status === "draft" ? "Safe default · draft" : "Admin selected · publish"}</ReviewBadge>
@@ -411,8 +426,8 @@ export default function ProductImportPanel({ shops, categories, onDone, onCancel
                 <p className="mb-2 text-xs font-semibold text-amber-100">Possible existing matches · verify before overwrite</p>
                 <div className="space-y-2">
                   {item.candidates.map((candidate) => <label key={candidate.id} className="flex min-h-11 items-center gap-2 text-xs text-cream/75">
-                    <input type="radio" name={`candidate-${item.index}`} checked={item.productId === String(candidate.id)} onChange={() => updateItem(item.index, { productId: String(candidate.id), shopId: item.shopId || candidate.shop?.id || "" })} className="accent-mall-accent" />
-                    <span>{candidate.name} · {candidate.sku || "no SKU"}{candidate.shop?.name ? ` · ${candidate.shop.name}` : ""} · {candidate.status}</span>
+                    <input type="radio" name={`candidate-${item.index}`} checked={item.productId === String(candidate.id)} onChange={() => updateItem(item.index, { productId: String(candidate.id), floorId: candidate.shop?.floor?.id || "", shopId: candidate.shop?.id || "" })} className="accent-mall-accent" />
+                    <span>{candidate.name} · {candidate.sku || "no SKU"}{candidate.shop?.name ? ` · ${candidate.shop.name}` : ""}{candidate.shop?.floor?.name ? ` · Floor ${candidate.shop.floor.floorNumber}: ${candidate.shop.floor.name}` : ""} · {candidate.status}</span>
                   </label>)}
                 </div>
               </div>}
@@ -431,9 +446,16 @@ export default function ProductImportPanel({ shops, categories, onDone, onCancel
                 <label><span className={LABEL_CLASS}>Brand</span><input value={product.brand} onChange={(event) => updateProduct(item.index, { brand: event.target.value })} className={FIELD_CLASS} /></label>
                 <label><span className={LABEL_CLASS}>Price (KSh)</span><input type="number" min="0" step="any" value={product.price} onChange={(event) => updateProduct(item.index, { price: event.target.value })} {...fieldAttributes("price")} />{fieldMessage("price")}</label>
                 <label><span className={LABEL_CLASS}>Compare-at price</span><input type="number" min="0" step="any" value={product.compareAtPrice} onChange={(event) => updateProduct(item.index, { compareAtPrice: event.target.value })} className={FIELD_CLASS} /></label>
-                <label><span className={LABEL_CLASS}>Shop</span><select value={item.shopId} onChange={(event) => updateItem(item.index, { shopId: event.target.value })} {...fieldAttributes("shop")}><option value="">Choose shop</option>{shops.map((shop) => <option key={shop._id} value={shop._id}>#{shop.shopNumber} {shop.name}</option>)}</select>{fieldMessage("shop")}</label>
-                <label><span className={LABEL_CLASS}>Category</span><select value={item.category} onChange={(event) => updateItem(item.index, { category: event.target.value, subcategory: "" })} {...fieldAttributes("category")}><option value="">Choose category</option>{categories.map((entry) => <option key={entry._id} value={entry.name}>{entry.name}</option>)}</select>{fieldMessage("category")}</label>
-                <label><span className={LABEL_CLASS}>Subcategory</span><select value={item.subcategory} disabled={!category} onChange={(event) => updateItem(item.index, { subcategory: event.target.value })} {...fieldAttributes("subcategory")}><option value="">Choose subcategory</option>{(category?.subcategories || []).map((sub) => <option key={sub._id} value={sub.name}>{sub.name}</option>)}</select>{fieldMessage("subcategory")}</label>
+                <label><span className={LABEL_CLASS}>Floor</span><select value={item.floorId} onChange={(event) => updateItem(item.index, { floorId: event.target.value, shopId: "", placementIssue: "" })} className={FIELD_CLASS}><option value="">Choose floor first</option>{floors.filter((floor) => floor.isActive !== false).map((floor) => <option key={floor._id} value={floor._id}>Floor {floor.floorNumber}: {floor.name}</option>)}</select>{item.placementIssue && <p className="mt-1 text-xs text-amber-100">{item.placementIssue}</p>}{fieldMessage("floor")}</label>
+                <label><span className={LABEL_CLASS}>Shop</span><select value={item.shopId} disabled={!item.floorId} onChange={(event) => updateItem(item.index, { shopId: event.target.value, placementIssue: "" })} {...fieldAttributes("shop")}><option value="">{item.floorId ? "Choose shop on this floor" : "Choose a floor first"}</option>{rowShops.map((shop) => <option key={shop._id} value={shop._id}>#{shop.shopNumber} {shop.name}</option>)}</select>{fieldMessage("shop")}</label>
+                <label><span className={LABEL_CLASS}>Category</span><select value={item.categoryId} onChange={(event) => {
+                  const selected = categories.find((entry) => entry._id === event.target.value);
+                  updateItem(item.index, { categoryId: selected?._id || "", subcategoryId: "", category: selected?.name || "", subcategory: "" });
+                }} {...fieldAttributes("category")}><option value="">Choose category</option>{categories.map((entry) => <option key={entry._id} value={entry._id}>{entry.name}</option>)}</select>{fieldMessage("category")}</label>
+                <label><span className={LABEL_CLASS}>Subcategory</span><select value={item.subcategoryId} disabled={!category} onChange={(event) => {
+                  const selected = category?.subcategories?.find((entry) => entry._id === event.target.value);
+                  updateItem(item.index, { subcategoryId: selected?._id || "", subcategory: selected?.name || "" });
+                }} {...fieldAttributes("subcategory")}><option value="">Choose subcategory</option>{(category?.subcategories || []).map((sub) => <option key={sub._id} value={sub._id}>{sub.name}</option>)}</select>{fieldMessage("subcategory")}</label>
                 <label><span className={LABEL_CLASS}>Stock quantity</span><input type="number" min="0" step="1" value={product.stock} onChange={(event) => updateProduct(item.index, { stock: event.target.value })} {...fieldAttributes("stock")} placeholder="Leave blank if unconfirmed" />{fieldMessage("stock")}</label>
                 <label><span className={LABEL_CLASS}>Return eligibility</span><select value={product.returnEligibility} onChange={(event) => updateProduct(item.index, { returnEligibility: event.target.value })} className={FIELD_CLASS}><option value="standard">Standard</option><option value="final_sale">Final sale</option><option value="perishable">Perishable</option><option value="digital_product">Digital product</option></select></label>
                 <label><span className={LABEL_CLASS}>Badge</span><select value={product.badge} onChange={(event) => updateProduct(item.index, { badge: event.target.value })} className={FIELD_CLASS}><option value="">No badge</option>{badges.map((badge) => <option key={badge._id} value={badge.slug}>{badge.chipLabel}</option>)}</select></label>

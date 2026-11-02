@@ -6,7 +6,7 @@ const { toCsv } = require("../utils/csvExport");
 const { digestOtp, verifyOtp } = require("../utils/otp");
 const { productStatus, productSkus, validatePublishable } = require("../utils/productLifecycle");
 const Product = require("../models/Product");
-const { mapWooCommerceRows } = require("../utils/wooCommerceImport");
+const { mapWooCommerceRows, suggestImportPlacement } = require("../utils/wooCommerceImport");
 const { getPort } = require("../config/runtime");
 const { parseListQuery, queryText, escapeRegex } = require("../utils/listQuery");
 const { buildAdminProductQuery, isValidExpectedProductCount, matchesExpectedProductCount } = require("../utils/adminProductQuery");
@@ -223,6 +223,13 @@ test("product schema accepts up to 12 gallery images and rejects larger gallerie
   assert.match((await validate(Array.from({ length: 13 }, (_, index) => `https://cdn.example.com/${index}.jpg`))).message, /up to 12/);
 });
 
+test("product schema exposes managed category and subcategory references", () => {
+  assert.equal(Product.schema.path("categoryId").options.ref, "Category");
+  assert.equal(Product.schema.path("subcategoryId").instance, "ObjectId");
+  assert.equal(Product.schema.path("category").instance, "String");
+  assert.equal(Product.schema.path("subcategory").instance, "String");
+});
+
 test("WooCommerce product image lists are preserved for review when they exceed the gallery limit", () => {
   const images = Array.from({ length: 13 }, (_, index) => `https://cdn.example.com/${index}.jpg`).join(", ");
   const [entry] = mapWooCommerceRows([{ Name: "Imported item", SKU: "IMPORT-1", Images: images }]);
@@ -246,4 +253,45 @@ test("WooCommerce imports preserve short and long descriptions separately", () =
   }]);
   assert.equal(longOnlyEntry.product.description, "");
   assert.equal(longOnlyEntry.product.longDescription, "Full product details");
+});
+
+test("WooCommerce imports read floor and shop columns for review", () => {
+  const [entry] = mapWooCommerceRows([{
+    Name: "Wireless speaker",
+    floor: "2",
+    "Shop Name": "Audio",
+  }]);
+  assert.deepEqual(entry.product.sourcePlacement, { floor: "2", shop: "Audio" });
+});
+
+test("CSV placement suggestions match floor/shop safely and leave ambiguous assignments unresolved", () => {
+  const floors = [
+    { _id: "floor-1", floorNumber: 1, name: "Fashion" },
+    { _id: "floor-2", floorNumber: 2, name: "Electronics" },
+  ];
+  const shops = [
+    { _id: "shop-audio", shopNumber: 1, name: "Audio", floor: { _id: "floor-2" } },
+    { _id: "shop-fashion", shopNumber: 1, name: "Audio", floor: { _id: "floor-1" } },
+    { _id: "shop-unique", shopNumber: 2, name: "Mobile Zone", floor: { _id: "floor-2" } },
+  ];
+
+  assert.deepEqual(suggestImportPlacement({ floor: "Floor 2", shop: "Audio" }, floors, shops), {
+    floorId: "floor-2",
+    shopId: "shop-audio",
+    issue: "",
+  });
+  assert.deepEqual(suggestImportPlacement({ floor: "", shop: "Mobile Zone" }, floors, shops), {
+    floorId: "floor-2",
+    shopId: "shop-unique",
+    issue: "",
+  });
+  const ambiguous = suggestImportPlacement({ floor: "", shop: "Audio" }, floors, shops);
+  assert.equal(ambiguous.floorId, "");
+  assert.equal(ambiguous.shopId, "");
+  assert.match(ambiguous.issue, /more than one shop/);
+
+  const mismatch = suggestImportPlacement({ floor: "Unknown floor", shop: "Audio" }, floors, shops);
+  assert.equal(mismatch.floorId, "");
+  assert.equal(mismatch.shopId, "");
+  assert.match(mismatch.issue, /not matched/);
 });

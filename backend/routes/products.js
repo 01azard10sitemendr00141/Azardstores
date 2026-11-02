@@ -6,7 +6,7 @@ const Product = require("../models/Product");
 const Shop = require("../models/Shop");
 const Floor = require("../models/Floor");
 const { protect, requireRole } = require("../middleware/auth");
-const { mapWooCommerceRows, cleanCategory } = require("../utils/wooCommerceImport");
+const { mapWooCommerceRows, cleanCategory, suggestImportPlacement } = require("../utils/wooCommerceImport");
 const { toCsv } = require("../utils/csvExport");
 const { productStatus, validatePublishable, normalizeProductTaxonomy, assertUniqueProductSkus, isValidProductImageUrl } = require("../utils/productLifecycle");
 const { parseListQuery, queryText, escapeRegex } = require("../utils/listQuery");
@@ -147,7 +147,7 @@ router.get("/admin/list", protect, requireRole("admin"), async (req, res, next) 
     const { search, filter } = buildAdminProductQuery(req.query);
     const { page: pageNumber, limit: pageSize } = parseListQuery(req.query);
     const [products, total] = await Promise.all([
-      Product.find(filter).populate("shop", "name shopNumber isActive").sort({ updatedAt: -1 }).skip((pageNumber - 1) * pageSize).limit(pageSize),
+      Product.find(filter).populate({ path: "shop", select: "name shopNumber isActive floor", populate: { path: "floor", select: "name floorNumber isActive" } }).sort({ updatedAt: -1 }).skip((pageNumber - 1) * pageSize).limit(pageSize),
       Product.countDocuments(filter),
     ]);
     res.json({ products: products.map((product) => ({ ...product.toJSON(), status: productStatus(product), publishIssues: validatePublishable(product) })), total, page: pageNumber, pages: Math.ceil(total / pageSize) });
@@ -246,7 +246,7 @@ router.post("/", protect, requireRole("admin"), async (req, res, next) => {
     const body = req.body || {};
     const createFields = new Set([
       "name", "sku", "description", "longDescription", "price", "compareAtPrice", "images", "imageUrls", "shop",
-      "category", "subcategory", "brand", "returnEligibility", "stock", "badge", "isFlashSale",
+      "floorId", "categoryId", "subcategoryId", "category", "subcategory", "brand", "returnEligibility", "stock", "badge", "isFlashSale",
       "purposeTags", "variants", "flashSaleEndsAt", "status", "publish",
     ]);
     const safeBody = Object.fromEntries(Object.entries(body).filter(([key]) => createFields.has(key)));
@@ -254,6 +254,8 @@ router.post("/", protect, requireRole("admin"), async (req, res, next) => {
     delete safeBody.stockReservations;
     delete safeBody.skuCodes;
     delete safeBody.isActive;
+    const submittedFloorId = String(safeBody.floorId || "").trim();
+    delete safeBody.floorId;
     const variants = Array.isArray(safeBody.variants) ? safeBody.variants.map((variant) => {
       const cleanVariant = { ...variant };
       delete cleanVariant.stockReservations;
@@ -262,8 +264,12 @@ router.post("/", protect, requireRole("admin"), async (req, res, next) => {
     }) : safeBody.variants;
     const status = safeBody.status === "published" || safeBody.publish === true ? "published" : "draft";
     delete safeBody.publish;
-    if (status === "published" ? !await Shop.exists({ _id: safeBody.shop, isActive: true }) : !await Shop.exists({ _id: safeBody.shop })) {
+    const selectedShop = await Shop.findById(safeBody.shop).select("_id floor isActive");
+    if (!selectedShop || (status === "published" && !selectedShop.isActive)) {
       return res.status(400).json({ message: status === "published" ? "Choose an active shop before publishing this product." : "Choose an existing shop for this product." });
+    }
+    if (submittedFloorId && String(selectedShop.floor) !== submittedFloorId) {
+      return res.status(400).json({ message: "The selected shop does not belong to the selected floor." });
     }
     if (String(safeBody.name || "").trim()) {
       const duplicateName = await Product.findOne({
@@ -277,11 +283,17 @@ router.post("/", protect, requireRole("admin"), async (req, res, next) => {
     }
     await assertUniqueProductSkus({ ...safeBody, variants });
     const candidate = { ...safeBody, variants, stockReservations: [], images, status, isActive: status === "published" };
-    if (status === "published") {
-      const taxonomy = await normalizeProductTaxonomy(candidate);
+    const taxonomy = await normalizeProductTaxonomy(candidate, { requireComplete: status === "published" });
+    if (status === "published" || safeBody.categoryId || safeBody.subcategoryId) {
       if (taxonomy.issues.length) return res.status(400).json({ message: "This product's category selection is invalid", issues: taxonomy.issues });
+    }
+    if (!taxonomy.issues.length) {
       candidate.category = taxonomy.category;
       candidate.subcategory = taxonomy.subcategory;
+      candidate.categoryId = taxonomy.categoryId;
+      candidate.subcategoryId = taxonomy.subcategoryId;
+    }
+    if (status === "published") {
       const issues = validatePublishable(candidate);
       if (issues.length) return res.status(400).json({ message: "This product cannot be published yet", issues });
     }
@@ -300,10 +312,12 @@ router.put("/:id", protect, requireRole("admin"), async (req, res, next) => {
     }
     const editableFields = new Set([
       "name", "sku", "description", "longDescription", "price", "compareAtPrice", "images", "imageUrls", "shop",
-      "category", "subcategory", "brand", "returnEligibility", "stock", "badge", "isFlashSale",
+      "floorId", "categoryId", "subcategoryId", "category", "subcategory", "brand", "returnEligibility", "stock", "badge", "isFlashSale",
       "purposeTags", "variants", "flashSaleEndsAt", "status", "isActive", "publish",
     ]);
     const updates = Object.fromEntries(Object.entries(req.body).filter(([key]) => editableFields.has(key)));
+    const submittedFloorId = String(updates.floorId || "").trim();
+    delete updates.floorId;
     if (req.body.images !== undefined || req.body.imageUrls !== undefined) {
       updates.images = parseImageUrls(req.body.images || req.body.imageUrls);
     }
@@ -367,6 +381,12 @@ router.put("/:id", protect, requireRole("admin"), async (req, res, next) => {
     const candidate = { ...currentProduct.toObject(), ...updates };
     if (updates.variants) candidate.variants = updates.variants;
     if (updates.images) candidate.images = updates.images;
+    if (submittedFloorId) {
+      const selectedShop = await Shop.findById(candidate.shop).select("floor");
+      if (!selectedShop || String(selectedShop.floor) !== submittedFloorId) {
+        return res.status(400).json({ message: "The selected shop does not belong to the selected floor." });
+      }
+    }
     if (String(candidate.name || "").trim() && candidate.shop) {
       const duplicateName = await Product.findOne({
         _id: { $ne: currentProduct._id },
@@ -378,16 +398,25 @@ router.put("/:id", protect, requireRole("admin"), async (req, res, next) => {
         return res.status(409).json({ message: `“${duplicateName.name}” already exists in this shop. Choose a different name or review the existing product.` });
       }
     }
-    if (productStatus(candidate) === "published") {
+    const isPublished = productStatus(candidate) === "published";
+    const taxonomy = await normalizeProductTaxonomy(candidate, { requireComplete: isPublished });
+    if ((isPublished || updates.categoryId || updates.subcategoryId) && taxonomy.issues.length) {
+      return res.status(400).json({ message: "This product's category selection is invalid", issues: taxonomy.issues });
+    }
+    if (!taxonomy.issues.length) {
+      candidate.category = taxonomy.category;
+      candidate.subcategory = taxonomy.subcategory;
+      candidate.categoryId = taxonomy.categoryId;
+      candidate.subcategoryId = taxonomy.subcategoryId;
+      updates.category = taxonomy.category;
+      updates.subcategory = taxonomy.subcategory;
+      updates.categoryId = taxonomy.categoryId;
+      updates.subcategoryId = taxonomy.subcategoryId;
+    }
+    if (isPublished) {
       if (!await Shop.exists({ _id: candidate.shop, isActive: true })) {
         return res.status(400).json({ message: "This product cannot be published until it is assigned to an active shop.", issues: ["Choose an active shop."] });
       }
-      const taxonomy = await normalizeProductTaxonomy(candidate);
-      if (taxonomy.issues.length) return res.status(400).json({ message: "This product's category selection is invalid", issues: taxonomy.issues });
-      candidate.category = taxonomy.category;
-      candidate.subcategory = taxonomy.subcategory;
-      updates.category = taxonomy.category;
-      updates.subcategory = taxonomy.subcategory;
       const issues = validatePublishable(candidate);
       if (issues.length) return res.status(400).json({ message: "This product cannot be published yet", issues });
     }
@@ -467,6 +496,12 @@ router.post("/bulk-import/preview", protect, requireRole("admin"), upload.single
     catch { return res.status(400).json({ message: "Could not read that CSV. Check that it is a valid WooCommerce export." }); }
     if (!rows.length) return res.status(400).json({ message: "This CSV contains no product rows." });
     const mapped = mapWooCommerceRows(rows);
+    const [floors, shops] = await Promise.all([
+      Floor.find({ isActive: true }).select("_id name floorNumber").lean(),
+      Shop.find({ isActive: true }).select("_id name shopNumber floor").populate("floor", "_id").lean(),
+    ]);
+    const activeFloorIds = new Set(floors.map((floor) => String(floor._id)));
+    const shopsOnActiveFloors = shops.filter((shop) => activeFloorIds.has(String(shop.floor?._id || shop.floor || "")));
     const items = [];
     const reservedSkus = new Set(mapped.flatMap((entry) => entry.product
       ? [entry.product.sku, ...(entry.product.variants || []).map((variant) => variant.sku)]
@@ -478,6 +513,7 @@ router.post("/bulk-import/preview", protect, requireRole("admin"), upload.single
         continue;
       }
       const p = entry.product;
+      const placementSuggestion = suggestImportPlacement(p.sourcePlacement, floors, shopsOnActiveFloors);
       const skus = [p.sku, ...(p.variants || []).map((variant) => variant.sku)].filter(Boolean).map((sku) => String(sku).trim());
       const regexes = skus.map((sku) => new RegExp(`^${escapeRegExp(sku)}$`, "i"));
       const candidateConditions = [];
@@ -492,7 +528,7 @@ router.post("/bulk-import/preview", protect, requireRole("admin"), upload.single
       });
       const candidates = candidateConditions.length
         ? await Product.find({ $or: candidateConditions })
-          .select("name sku brand shop variants.sku variants.name status isActive").populate("shop", "name shopNumber").limit(10)
+          .select("name sku brand shop variants.sku variants.name status isActive").populate({ path: "shop", select: "name shopNumber floor", populate: { path: "floor", select: "name floorNumber" } }).limit(10)
         : [];
       const generatedSkus = { product: false, variants: [] };
       if (!candidates.length) {
@@ -536,7 +572,7 @@ router.post("/bulk-import/preview", protect, requireRole("admin"), upload.single
       }
       if (entry.reason) errors.push(entry.reason);
       const category = cleanCategory(p.sourceCategory);
-      items.push({ index: entry.index, product: p, generatedSkus, sourceCategory: category, sourcePublished: Boolean(entry.sourcePublished), errors, candidates: candidates.map((candidate) => {
+      items.push({ index: entry.index, product: p, generatedSkus, sourceCategory: category, sourcePublished: Boolean(entry.sourcePublished), placementSuggestion, errors, candidates: candidates.map((candidate) => {
         const candidateSkus = [candidate.sku, ...(candidate.variants || []).map((variant) => variant.sku)]
           .map((sku) => String(sku || "").trim().toUpperCase()).filter(Boolean);
         const sourceSkus = skus.map((sku) => sku.toUpperCase());
@@ -550,7 +586,12 @@ router.post("/bulk-import/preview", protect, requireRole("admin"), upload.single
           brand: candidate.brand,
           matchedBySku: candidateSkus.some((sku) => sourceSkus.includes(sku)),
           matchedByName: sameName,
-          shop: candidate.shop ? { id: candidate.shop._id, name: candidate.shop.name, shopNumber: candidate.shop.shopNumber } : null,
+          shop: candidate.shop ? {
+            id: candidate.shop._id,
+            name: candidate.shop.name,
+            shopNumber: candidate.shop.shopNumber,
+            floor: candidate.shop.floor ? { id: candidate.shop.floor._id, name: candidate.shop.floor.name, floorNumber: candidate.shop.floor.floorNumber } : null,
+          } : null,
           status: productStatus(candidate),
         };
       }) });
@@ -603,11 +644,19 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
         const reviewed = normalizeReviewedProduct(decision.product);
         if (reviewed.issues.length) throw Object.assign(new Error("Reviewed product details are invalid."), { statusCode: 400, issues: reviewed.issues });
         const imported = { ...reviewed.product, variants: reviewed.product.variants || [] };
-        const shop = await Shop.findById(decision.shopId).select("_id isActive");
-        if (!shop) throw Object.assign(new Error("Choose a valid shop."), { statusCode: 400 });
+        if (!decision.floorId || !await Floor.exists({ _id: decision.floorId, isActive: true })) {
+          throw Object.assign(new Error("Choose a valid active floor."), { statusCode: 400 });
+        }
+        const shop = await Shop.findOne({ _id: decision.shopId, isActive: true }).select("_id floor isActive");
+        if (!shop) throw Object.assign(new Error("Choose a valid active shop."), { statusCode: 400 });
+        if (String(shop.floor) !== String(decision.floorId)) {
+          throw Object.assign(new Error("The selected shop does not belong to the selected floor."), { statusCode: 400 });
+        }
         imported.shop = shop._id;
         imported.category = String(decision.category || "").trim();
         imported.subcategory = String(decision.subcategory || "").trim();
+        imported.categoryId = decision.categoryId || null;
+        imported.subcategoryId = decision.subcategoryId || null;
         if (decision.stock !== "" && decision.stock !== undefined && decision.stock !== null) imported.stock = Number(decision.stock);
         if (Array.isArray(decision.variantStock)) imported.variants = imported.variants.map((variant, index) => ({ ...variant, stock: decision.variantStock[index] === "" || decision.variantStock[index] === undefined ? variant.stock : Number(decision.variantStock[index]) }));
         const targetStatus = decision.status === "published" ? "published" : "draft";
@@ -632,7 +681,7 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
           if (!await Product.exists({ _id: existing._id, ...matchingQuery })) throw Object.assign(new Error("The selected product no longer matches this import row."), { statusCode: 409 });
           // Preserve existing values when the CSV leaves a field blank.
           const merged = existing.toObject();
-          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brand", "category", "subcategory", "shop", "returnEligibility", "badge", "isFlashSale", "purposeTags", "flashSaleEndsAt", "variants"]) {
+          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brand", "categoryId", "subcategoryId", "category", "subcategory", "shop", "returnEligibility", "badge", "isFlashSale", "purposeTags", "flashSaleEndsAt", "variants"]) {
             const value = imported[key];
             if (key === "variants") {
               merged.variants = mergeImportedVariants(existing.variants || [], imported.variants || []);
@@ -650,17 +699,21 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
           merged.status = targetStatus; merged.isActive = targetStatus === "published";
           merged.archivedAt = null;
           await assertUniqueProductSkus(merged, existing._id);
-          if (targetStatus === "published") {
-            const taxonomy = await normalizeProductTaxonomy(merged);
-            if (taxonomy.issues.length) throw Object.assign(new Error("This item's category selection is invalid"), { statusCode: 400, issues: taxonomy.issues });
+          const taxonomy = await normalizeProductTaxonomy(merged, { requireComplete: targetStatus === "published" });
+          if ((targetStatus === "published" || decision.categoryId || decision.subcategoryId) && taxonomy.issues.length) {
+            throw Object.assign(new Error("This item's category selection is invalid"), { statusCode: 400, issues: taxonomy.issues });
+          }
+          if (!taxonomy.issues.length) {
             merged.category = taxonomy.category;
             merged.subcategory = taxonomy.subcategory;
+            merged.categoryId = taxonomy.categoryId;
+            merged.subcategoryId = taxonomy.subcategoryId;
           }
           const issues = targetStatus === "published" ? validatePublishable(merged) : [];
           if (issues.length) throw Object.assign(new Error("This item cannot be published yet"), { statusCode: 400, issues });
           merged.skuCodes = [merged.sku, ...(merged.variants || []).map((variant) => variant.sku)].filter(Boolean).map((sku) => String(sku).trim().toUpperCase());
           const update = {};
-          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brand", "category", "subcategory", "shop", "returnEligibility", "badge", "isFlashSale", "purposeTags", "flashSaleEndsAt", "variants", "stock", "status", "isActive", "archivedAt", "skuCodes"]) {
+          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brand", "categoryId", "subcategoryId", "category", "subcategory", "shop", "returnEligibility", "badge", "isFlashSale", "purposeTags", "flashSaleEndsAt", "variants", "stock", "status", "isActive", "archivedAt", "skuCodes"]) {
             if (merged[key] !== undefined) update[key] = merged[key];
           }
           if (!merged.skuCodes.length) { delete update.skuCodes; update.$unset = { skuCodes: 1 }; }
@@ -675,11 +728,17 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
           }
           results.push({ index: decision.index, status: "overwritten", productStatus: targetStatus });
         } else {
-          if (targetStatus === "published") {
-            const taxonomy = await normalizeProductTaxonomy(imported);
-            if (taxonomy.issues.length) throw Object.assign(new Error("This item's category selection is invalid"), { statusCode: 400, issues: taxonomy.issues });
+          const taxonomy = await normalizeProductTaxonomy(imported, { requireComplete: targetStatus === "published" });
+          if ((targetStatus === "published" || decision.categoryId || decision.subcategoryId) && taxonomy.issues.length) {
+            throw Object.assign(new Error("This item's category selection is invalid"), { statusCode: 400, issues: taxonomy.issues });
+          }
+          if (!taxonomy.issues.length) {
             imported.category = taxonomy.category;
             imported.subcategory = taxonomy.subcategory;
+            imported.categoryId = taxonomy.categoryId;
+            imported.subcategoryId = taxonomy.subcategoryId;
+          }
+          if (targetStatus === "published") {
             const issues = validatePublishable(imported);
             if (issues.length) throw Object.assign(new Error("This item cannot be published yet"), { statusCode: 400, issues });
           }
@@ -746,7 +805,7 @@ router.patch("/bulk-edit", protect, requireRole("admin"), async (req, res, next)
 
     const update = {};
     if (set && Object.keys(set).length > 0) {
-      const allowedFields = new Set(["shop", "category", "subcategory", "badge", "isFlashSale", "stock"]);
+      const allowedFields = new Set(["shop", "categoryId", "subcategoryId", "category", "subcategory", "badge", "isFlashSale", "stock"]);
       const disallowed = Object.keys(set).filter((key) => !allowedFields.has(key));
       if (disallowed.length) return res.status(400).json({ message: `Bulk edit cannot change: ${disallowed.join(", ")}. Use the product editor for publishing and SKU changes.` });
       if (Object.prototype.hasOwnProperty.call(set, "shop")) {
@@ -762,21 +821,33 @@ router.patch("/bulk-edit", protect, requireRole("admin"), async (req, res, next)
           set[field] = set[field].trim();
         }
       }
-      if (Object.prototype.hasOwnProperty.call(set, "category") || Object.prototype.hasOwnProperty.call(set, "subcategory")) {
-        const selectedProducts = await Product.find({ _id: { $in: productIds } }).select("name category subcategory status isActive").lean();
-        const taxonomyCache = new Map();
+      const hasTaxonomyChange = ["categoryId", "subcategoryId", "category", "subcategory"].some((field) => Object.prototype.hasOwnProperty.call(set, field));
+      if (hasTaxonomyChange && (set.categoryId || set.subcategoryId)) {
+        if (!/^[a-f\d]{24}$/i.test(String(set.categoryId || "")) || !/^[a-f\d]{24}$/i.test(String(set.subcategoryId || ""))) {
+          return res.status(400).json({ message: "Choose a managed category and one of its subcategories." });
+        }
+        const taxonomy = await normalizeProductTaxonomy({ categoryId: set.categoryId, subcategoryId: set.subcategoryId });
+        if (taxonomy.issues.length) return res.status(400).json({ message: "Choose a valid category and subcategory.", issues: taxonomy.issues });
+        for (const field of ["categoryId", "subcategoryId", "category", "subcategory"]) set[field] = taxonomy[field];
+      } else if (hasTaxonomyChange) {
+        const selectedProducts = await Product.find({ _id: { $in: productIds } }).select("name categoryId subcategoryId category subcategory").lean();
+        const resolved = [];
         for (const product of selectedProducts) {
-          const category = Object.prototype.hasOwnProperty.call(set, "category") ? set.category : product.category;
-          const subcategory = Object.prototype.hasOwnProperty.call(set, "subcategory") ? set.subcategory : product.subcategory;
-          const taxonomyKey = `${String(category || "").trim().toLocaleLowerCase()}\u0000${String(subcategory || "").trim().toLocaleLowerCase()}`;
-          let taxonomy = taxonomyCache.get(taxonomyKey);
-          if (!taxonomy) {
-            taxonomy = await normalizeProductTaxonomy({ category, subcategory });
-            taxonomyCache.set(taxonomyKey, taxonomy);
-          }
+          const taxonomy = await normalizeProductTaxonomy({
+            categoryId: Object.prototype.hasOwnProperty.call(set, "category") ? null : product.categoryId,
+            subcategoryId: Object.prototype.hasOwnProperty.call(set, "subcategory") ? null : product.subcategoryId,
+            category: Object.prototype.hasOwnProperty.call(set, "category") ? set.category : product.category,
+            subcategory: Object.prototype.hasOwnProperty.call(set, "subcategory") ? set.subcategory : product.subcategory,
+          });
           if (taxonomy.issues.length) return res.status(400).json({ message: `Cannot apply this category change to ${product.name}.`, issues: taxonomy.issues });
-          if (Object.prototype.hasOwnProperty.call(set, "category")) set.category = taxonomy.category;
-          if (Object.prototype.hasOwnProperty.call(set, "subcategory")) set.subcategory = taxonomy.subcategory;
+          resolved.push(taxonomy);
+        }
+        const taxonomyKeys = new Set(resolved.map((taxonomy) => `${taxonomy.categoryId}:${taxonomy.subcategoryId}`));
+        if (taxonomyKeys.size > 1) {
+          return res.status(400).json({ message: "Choose a managed category and subcategory to apply the same assignment to every selected product." });
+        }
+        if (resolved[0]) {
+          for (const field of ["categoryId", "subcategoryId", "category", "subcategory"]) set[field] = resolved[0][field];
         }
       }
       if (Object.prototype.hasOwnProperty.call(set, "isFlashSale") && typeof set.isFlashSale !== "boolean") {

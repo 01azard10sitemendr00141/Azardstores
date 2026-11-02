@@ -48,7 +48,7 @@ function validOptionalNumber(value, label, issues, integer = false) {
   return number;
 }
 
-export function validateImportItem(item, items, categories) {
+export function validateImportItem(item, items, categories, shops = []) {
   if (item.action === "skip" || !item.product) return [];
   const product = item.product;
   const issues = [];
@@ -59,7 +59,13 @@ export function validateImportItem(item, items, categories) {
   if (product.longDescription.length > 50000) issues.push("Long description must be 50,000 characters or fewer.");
   if (product.brand.length > 160) issues.push("Brand must be 160 characters or fewer.");
   if (product.badge.length > 80) issues.push("Badge must be 80 characters or fewer.");
+  if (!item.floorId) issues.push("Choose a floor.");
   if (!item.shopId) issues.push("Choose a shop.");
+  if (item.placementIssue) issues.push(item.placementIssue);
+  const shop = shops.find((entry) => String(entry._id) === String(item.shopId || ""));
+  if (shop && item.floorId && String(shop.floor?._id || shop.floor || "") !== String(item.floorId)) {
+    issues.push("Choose a shop that belongs to the selected floor.");
+  }
   if (!Array.isArray(product.images) || product.images.length > 12) issues.push("A product can have up to 12 gallery images.");
   else if (product.images.some((image) => !validHttpsImage(image))) issues.push("Every gallery image must be a valid HTTPS URL.");
 
@@ -71,10 +77,11 @@ export function validateImportItem(item, items, categories) {
   if (!Array.isArray(product.purposeTags) || product.purposeTags.length > 20) issues.push("Purpose tags must contain up to 20 values.");
   if (product.flashSaleEndsAt && Number.isNaN(new Date(product.flashSaleEndsAt).getTime())) issues.push("Flash sale end must be a valid date and time.");
 
-  const category = categories.find((entry) => entry.name === item.category);
+  const category = categories.find((entry) => String(entry._id) === String(item.categoryId || "")
+    || entry.name === item.category);
   if (item.status === "published") {
-    if (!category) issues.push("Choose a managed category before publishing.");
-    else if (!category.subcategories?.some((entry) => entry.name === item.subcategory)) issues.push("Choose a subcategory from the selected category.");
+    if (!category || !item.categoryId) issues.push("Choose a managed category before publishing.");
+    else if (!item.subcategoryId || !category.subcategories?.some((entry) => String(entry._id) === String(item.subcategoryId))) issues.push("Choose a subcategory from the selected category.");
     if (!product.images.length) issues.push("Add at least one product image before publishing.");
     if (!product.variants.length) {
       if (!product.sku.trim()) issues.push("Add a unique product SKU before publishing.");

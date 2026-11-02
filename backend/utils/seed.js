@@ -336,7 +336,7 @@ async function seed() {
   }
 
   console.log("Creating managed category taxonomy...");
-  await Category.insertMany(CATEGORY_TREE.map((c) => ({
+  const categories = await Category.insertMany(CATEGORY_TREE.map((c) => ({
     name: c.name,
     subcategories: c.subcategories.map((s) => ({ name: s })),
   })));
@@ -359,6 +359,11 @@ async function seed() {
 
   console.log("Creating products...");
   const docs = PRODUCTS.map((p) => {
+    const category = categories.find((entry) => entry.name.toLowerCase() === p.category.toLowerCase());
+    const subcategory = category?.subcategories.find((entry) => entry.name.toLowerCase() === p.subcategory.toLowerCase());
+    if (!category || !subcategory) {
+      throw new Error(`Seed product taxonomy is not managed: ${p.category} / ${p.subcategory}`);
+    }
     // Products in the seed array are described by category/subcategory and a
     // human description; build a customer-facing name from brand + subcategory
     // when one is not explicitly supplied, dropping the placeholder "Generic"
@@ -376,6 +381,8 @@ async function seed() {
       price: p.price,
       compareAtPrice: p.compareAtPrice || null,
       shop: s[p.shop]._id,
+      categoryId: category._id,
+      subcategoryId: subcategory._id,
       category: p.category,
       subcategory: p.subcategory,
       brand: p.brand,
