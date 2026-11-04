@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, Check, CheckCircle2, ChevronDown, ChevronUp, FileSpreadsheet, Plus, Search, Trash2, Upload, X } from "lucide-react";
 import api from "../../api/client";
 import { useBadges } from "../../context/BadgesContext";
-import { getImportCounts, getImportReviewStatus, prepareImportProduct, validateImportItem } from "../../utils/productImportReview";
+import { buildImportSkuIndex, getImportCounts, getImportReviewStatus, prepareImportProduct, validateImportItem } from "../../utils/productImportReview";
 
 const FIELD_CLASS = "w-full min-h-11 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm placeholder-cream/25 outline-none focus:border-mall-accent transition disabled:opacity-50";
 const LABEL_CLASS = "mb-1.5 block font-mono-tag text-[9px] uppercase tracking-widest text-cream/45";
@@ -19,6 +19,22 @@ function localDateToIso(value) {
   if (!value) return null;
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toISOString();
+}
+
+function loadSavedCategoryMappings() {
+  try {
+    const stored = window.localStorage.getItem("admin-product-import-category-mappings");
+    const parsed = stored ? JSON.parse(stored) : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { mappings: {}, error: "Saved category mappings are invalid and were ignored." };
+    }
+    const mappings = Object.fromEntries(Object.entries(parsed).filter(([, mapping]) => (
+      mapping && typeof mapping.categoryId === "string" && typeof mapping.subcategoryId === "string"
+    )));
+    return { mappings, error: "" };
+  } catch {
+    return { mappings: {}, error: "Saved category mappings could not be read from this browser." };
+  }
 }
 
 function SummaryMetric({ label, value, tone = "text-cream" }) {
@@ -39,13 +55,20 @@ function ReviewBadge({ children, tone = "neutral" }) {
   return <span className={`inline-flex min-h-6 items-center rounded-md border px-2 py-1 text-[9px] font-mono-tag uppercase tracking-wider ${tones[tone]}`}>{children}</span>;
 }
 
-export default function ProductImportPanel({ floors = [], shops, categories, onDone, onCancel }) {
+export default function ProductImportPanel({ floors = [], shops, categories, brands = [], onDone, onCancel }) {
   const { badges } = useBadges();
   const [file, setFile] = useState(null);
   const [items, setItems] = useState([]);
   const [previewHash, setPreviewHash] = useState("");
   const [result, setResult] = useState(null);
   const [expandedIndex, setExpandedIndex] = useState(null);
+  const [selectedRows, setSelectedRows] = useState([]);
+  const [batchFloorId, setBatchFloorId] = useState("");
+  const [batchShopId, setBatchShopId] = useState("");
+  const [categorySource, setCategorySource] = useState("");
+  const [mappedCategoryId, setMappedCategoryId] = useState("");
+  const [mappedSubcategoryId, setMappedSubcategoryId] = useState("");
+  const [storedMappings, setStoredMappings] = useState(loadSavedCategoryMappings);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
   const [page, setPage] = useState(0);
@@ -54,10 +77,11 @@ export default function ProductImportPanel({ floors = [], shops, categories, onD
   const [error, setError] = useState("");
   const [skuGenerating, setSkuGenerating] = useState("");
   const counts = useMemo(() => getImportCounts(items), [items]);
+  const skuIndex = useMemo(() => buildImportSkuIndex(items), [items]);
   const issuesByIndex = useMemo(() => new Map(items.map((item) => [
     item.index,
-    validateImportItem(item, items, categories, shops),
-  ])), [items, categories, shops]);
+    validateImportItem(item, items, categories, shops, brands, skuIndex),
+  ])), [items, categories, shops, brands, skuIndex]);
   const reviewCounts = useMemo(() => ({
     attention: items.filter((item) => ["blocked", "attention"].includes(getImportReviewStatus(item, issuesByIndex.get(item.index)))).length,
     ready: items.filter((item) => getImportReviewStatus(item, issuesByIndex.get(item.index)) === "ready").length,
@@ -81,12 +105,65 @@ export default function ProductImportPanel({ floors = [], shops, categories, onD
   }, [items, search, filter, issuesByIndex]);
   const pageItems = visibleItems.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
   const pageCount = Math.ceil(visibleItems.length / PAGE_SIZE);
+  const sourceCategories = [...new Set(items.map((item) => item.sourceCategory?.trim()).filter(Boolean))];
+  const mappedCategory = categories.find((entry) => String(entry._id) === mappedCategoryId);
+  const savedCategoryMappings = storedMappings.mappings;
+  const batchShops = shops.filter((shop) => String(shop.floor?._id || shop.floor || "") === batchFloorId);
+  const selectableVisibleRows = visibleItems.filter((item) => item.product && item.action !== "skip");
+  const itemByIndex = new Map(items.map((item) => [item.index, item]));
+  const selectedCount = selectedRows.filter((index) => {
+    const item = itemByIndex.get(index);
+    return item?.product && item.action !== "skip";
+  }).length;
   useEffect(() => {
     setPage((current) => Math.min(current, Math.max(0, pageCount - 1)));
   }, [pageCount]);
 
   function updateItem(rowIndex, changes) {
     setItems((current) => current.map((item) => item.index === rowIndex ? { ...item, ...changes } : item));
+  }
+
+  function applyPlacementToSelected() {
+    const selected = new Set(selectedRows);
+    setItems((current) => current.map((item) => selected.has(item.index) && item.product && item.action !== "skip"
+      ? { ...item, floorId: batchFloorId, shopId: batchShopId, placementIssue: "" }
+      : item));
+  }
+
+  function applyCategoryMapping() {
+    const category = categories.find((entry) => String(entry._id) === mappedCategoryId);
+    const subcategory = category?.subcategories?.find((entry) => String(entry._id) === mappedSubcategoryId);
+    if (!category || !subcategory || !categorySource) return;
+    const sourceKey = categorySource.trim().toLocaleLowerCase();
+    const mappings = {
+      ...savedCategoryMappings,
+      [sourceKey]: { categoryId: String(category._id), subcategoryId: String(subcategory._id) },
+    };
+    setStoredMappings({ mappings, error: "" });
+    try {
+      window.localStorage.setItem("admin-product-import-category-mappings", JSON.stringify(mappings));
+    } catch {
+      setStoredMappings({ mappings, error: "This mapping was applied to the current import but could not be saved in this browser." });
+    }
+    setItems((current) => current.map((item) => item.sourceCategory?.trim().toLocaleLowerCase() === sourceKey
+      ? {
+        ...item,
+        categoryId: String(category._id),
+        subcategoryId: String(subcategory._id),
+        category: category.name,
+        subcategory: subcategory.name,
+      }
+      : item));
+  }
+
+  function toggleVisibleRows() {
+    const visibleIndexes = selectableVisibleRows.map((item) => item.index);
+    const visibleSet = new Set(visibleIndexes);
+    const selectedSet = new Set(selectedRows);
+    const allSelected = visibleIndexes.length > 0 && visibleIndexes.every((index) => selectedSet.has(index));
+    setSelectedRows((current) => allSelected
+      ? current.filter((index) => !visibleSet.has(index))
+      : [...new Set([...current, ...visibleIndexes])]);
   }
 
   function updateProduct(rowIndex, changes) {
@@ -152,10 +229,15 @@ export default function ProductImportPanel({ floors = [], shops, categories, onD
         const categoryMatch = categories.find((entry) => entry.name.toLowerCase() === source
           || entry.subcategories?.some((sub) => sub.name.toLowerCase() === source));
         const subcategoryMatch = categoryMatch?.subcategories?.find((sub) => sub.name.toLowerCase() === source);
+        const savedMapping = savedCategoryMappings[source];
+        const savedCategory = categories.find((entry) => String(entry._id) === String(savedMapping?.categoryId || ""));
+        const savedSubcategory = savedCategory?.subcategories?.find((sub) => String(sub._id) === String(savedMapping?.subcategoryId || ""));
+        const matchingBrands = brands.filter((entry) => entry.name.trim().toLocaleLowerCase() === String(item.product?.brand || "").trim().toLocaleLowerCase());
+        const brandMatch = matchingBrands.length === 1 ? matchingBrands[0] : null;
         const singleMatch = item.candidates?.length === 1 ? item.candidates[0] : null;
         return {
           ...item,
-          product: item.product ? prepareImportProduct(item.product) : null,
+          product: item.product ? prepareImportProduct({ ...item.product, brandId: brandMatch?._id || "" }) : null,
           sourcePlacement: item.product?.sourcePlacement || { floor: "", shop: "" },
           action: item.product ? (item.candidates?.length ? "skip" : "create") : "skip",
           productId: "",
@@ -163,14 +245,15 @@ export default function ProductImportPanel({ floors = [], shops, categories, onD
           floorId: item.placementSuggestion?.floorId || "",
           shopId: item.placementSuggestion?.shopId || "",
           placementIssue: item.placementSuggestion?.issue || "",
-          categoryId: categoryMatch?._id || "",
-          subcategoryId: subcategoryMatch?._id || "",
-          category: subcategoryMatch ? categoryMatch.name : categoryMatch?.name || "",
-          subcategory: subcategoryMatch?.name || "",
+          categoryId: savedSubcategory ? savedCategory._id : categoryMatch?._id || "",
+          subcategoryId: savedSubcategory?._id || "",
+          category: savedSubcategory ? savedCategory.name : categoryMatch?.name || "",
+          subcategory: savedSubcategory?.name || "",
           preferredMatch: singleMatch,
         };
       });
       setItems(nextItems);
+      setSelectedRows([]);
       setExpandedIndex(nextItems.find((item) => item.product)?.index ?? null);
     } catch (err) {
       setError(err.response?.data?.message || "Could not analyze this CSV.");
@@ -318,6 +401,51 @@ export default function ProductImportPanel({ floors = [], shops, categories, onD
         })}
       </div>
       <p className="text-xs text-cream/55" aria-live="polite">Showing {visibleItems.length ? page * PAGE_SIZE + 1 : 0}–{Math.min((page + 1) * PAGE_SIZE, visibleItems.length)} of {visibleItems.length} filtered rows · {items.length} total rows. Counts above always include all rows.</p>
+      <div className="grid gap-3 border-t border-cream/10 pt-3 lg:grid-cols-2">
+        <section className="space-y-2 rounded-lg border border-cream/10 p-3" aria-label="Apply a location to selected rows">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-semibold text-cream">Assign location to selected rows</p>
+            <label className="flex min-h-10 items-center gap-2 text-[11px] text-cream/60">
+              <input type="checkbox" checked={selectableVisibleRows.length > 0 && selectableVisibleRows.every((item) => selectedRows.includes(item.index))} onChange={toggleVisibleRows} className="h-4 w-4 accent-mall-accent" />
+              Select filtered rows
+            </label>
+          </div>
+          <p className="text-[11px] text-cream/50">{selectedCount} eligible row{selectedCount === 1 ? "" : "s"} selected. Location assignments remain subject to review.</p>
+          {selectedRows.length > 0 && <button type="button" onClick={() => setSelectedRows([])} className="min-h-9 text-left text-[11px] text-cream/60 underline underline-offset-2">Clear selection</button>}
+          <div className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]">
+            <select aria-label="Floor to apply to selected rows" value={batchFloorId} onChange={(event) => { setBatchFloorId(event.target.value); setBatchShopId(""); }} className={FIELD_CLASS}>
+              <option value="">Choose floor</option>
+              {floors.filter((floor) => floor.isActive !== false).map((floor) => <option key={floor._id} value={floor._id}>Floor {floor.floorNumber}: {floor.name}</option>)}
+            </select>
+            <select aria-label="Shop to apply to selected rows" value={batchShopId} disabled={!batchFloorId} onChange={(event) => setBatchShopId(event.target.value)} className={FIELD_CLASS}>
+              <option value="">Choose shop</option>
+              {batchShops.map((shop) => <option key={shop._id} value={shop._id}>#{shop.shopNumber} {shop.name}</option>)}
+            </select>
+            <button type="button" disabled={!selectedCount || !batchFloorId || !batchShopId} onClick={applyPlacementToSelected} className="min-h-11 rounded-xl bg-mall-accent px-3 text-xs font-semibold text-mall-900 disabled:opacity-40">Apply location</button>
+          </div>
+        </section>
+        <section className="space-y-2 rounded-lg border border-cream/10 p-3" aria-label="Map CSV categories">
+          <p className="text-xs font-semibold text-cream">Reusable category mapping</p>
+          <p className="text-[11px] text-cream/50">Map one source label to a managed category and subcategory across every matching row in this import.</p>
+          <p className="text-[10px] text-cream/45">Saved mappings are reused for future imports in this browser; uncertain rows remain editable.</p>
+          {storedMappings.error && <p className="text-[10px] text-amber-100" role="status">{storedMappings.error}</p>}
+          <div className="grid gap-2 sm:grid-cols-2">
+            <select aria-label="CSV category label" value={categorySource} onChange={(event) => setCategorySource(event.target.value)} className={FIELD_CLASS}>
+              <option value="">Choose CSV category label</option>
+              {sourceCategories.map((source) => <option key={source} value={source}>{source}</option>)}
+            </select>
+            <select aria-label="Managed category for CSV mapping" value={mappedCategoryId} onChange={(event) => { setMappedCategoryId(event.target.value); setMappedSubcategoryId(""); }} className={FIELD_CLASS}>
+              <option value="">Choose managed category</option>
+              {categories.map((entry) => <option key={entry._id} value={entry._id}>{entry.name}</option>)}
+            </select>
+            <select aria-label="Managed subcategory for CSV mapping" value={mappedSubcategoryId} disabled={!mappedCategory} onChange={(event) => setMappedSubcategoryId(event.target.value)} className={FIELD_CLASS}>
+              <option value="">Choose managed subcategory</option>
+              {(mappedCategory?.subcategories || []).map((entry) => <option key={entry._id} value={entry._id}>{entry.name}</option>)}
+            </select>
+            <button type="button" disabled={!categorySource || !mappedCategoryId || !mappedSubcategoryId} onClick={applyCategoryMapping} className="min-h-11 rounded-xl border border-cream/15 px-3 text-xs text-cream/75 disabled:opacity-40">Save &amp; map rows</button>
+          </div>
+        </section>
+      </div>
     </div>
 
     {confirming ? <section className="rounded-xl border border-mall-accent/30 bg-mall-accent/5 p-4 sm:p-5" aria-labelledby="final-import-heading">
@@ -385,6 +513,9 @@ export default function ProductImportPanel({ floors = [], shops, categories, onD
         const blocked = !product;
         return <article key={item.index} className={`overflow-hidden rounded-xl border ${status === "blocked" || status === "attention" ? "border-amber-300/25" : "border-cream/10"} bg-mall-900/35`}>
           <div className="flex min-w-0 flex-wrap items-center gap-3 p-3 sm:flex-nowrap sm:p-4">
+            <label className="flex h-10 w-8 shrink-0 items-center justify-center">
+              <input type="checkbox" aria-label={`Select CSV row ${item.index + 1}`} disabled={!item.product || item.action === "skip"} checked={selectedRows.includes(item.index)} onChange={() => setSelectedRows((current) => current.includes(item.index) ? current.filter((index) => index !== item.index) : [...current, item.index])} className="h-4 w-4 accent-mall-accent disabled:opacity-30" />
+            </label>
             {product?.images?.[0] && <img src={product.images[0]} alt="" className="h-12 w-12 shrink-0 rounded-lg bg-mall-800 object-cover sm:h-14 sm:w-14" />}
             <button type="button" aria-expanded={expanded} onClick={() => setExpandedIndex(expanded ? null : item.index)} className="min-w-0 flex-1 text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-mall-accent">
               <span className="flex flex-wrap items-center gap-1.5">
@@ -443,7 +574,10 @@ export default function ProductImportPanel({ floors = [], shops, categories, onD
                   {item.generatedSkus?.product && <p className="mt-1 text-[10px] text-sky-100/70">Generated from the product name. Editable; uniqueness is checked again when saved.</p>}
                   {fieldMessage("sku")}
                 </div>
-                <label><span className={LABEL_CLASS}>Brand</span><input value={product.brand} onChange={(event) => updateProduct(item.index, { brand: event.target.value })} className={FIELD_CLASS} /></label>
+                <label><span className={LABEL_CLASS}>Brand</span><select value={product.brandId} onChange={(event) => {
+                  const brand = brands.find((entry) => String(entry._id) === event.target.value);
+                  updateProduct(item.index, { brandId: brand?._id || "", brand: brand?.name || "" });
+                }} className={FIELD_CLASS}><option value="">No brand / choose a managed match</option>{brands.map((brand) => <option key={brand._id} value={brand._id}>{brand.name}</option>)}</select>{product.brand && !product.brandId && <p className="mt-1 text-[10px] text-amber-100">CSV brand “{product.brand}” is not managed; map it or clear it before import.</p>}</label>
                 <label><span className={LABEL_CLASS}>Price (KSh)</span><input type="number" min="0" step="any" value={product.price} onChange={(event) => updateProduct(item.index, { price: event.target.value })} {...fieldAttributes("price")} />{fieldMessage("price")}</label>
                 <label><span className={LABEL_CLASS}>Compare-at price</span><input type="number" min="0" step="any" value={product.compareAtPrice} onChange={(event) => updateProduct(item.index, { compareAtPrice: event.target.value })} className={FIELD_CLASS} /></label>
                 <label><span className={LABEL_CLASS}>Floor</span><select value={item.floorId} onChange={(event) => updateItem(item.index, { floorId: event.target.value, shopId: "", placementIssue: "" })} className={FIELD_CLASS}><option value="">Choose floor first</option>{floors.filter((floor) => floor.isActive !== false).map((floor) => <option key={floor._id} value={floor._id}>Floor {floor.floorNumber}: {floor.name}</option>)}</select>{item.placementIssue && <p className="mt-1 text-xs text-amber-100">{item.placementIssue}</p>}{fieldMessage("floor")}</label>
@@ -457,6 +591,7 @@ export default function ProductImportPanel({ floors = [], shops, categories, onD
                   updateItem(item.index, { subcategoryId: selected?._id || "", subcategory: selected?.name || "" });
                 }} {...fieldAttributes("subcategory")}><option value="">Choose subcategory</option>{(category?.subcategories || []).map((sub) => <option key={sub._id} value={sub._id}>{sub.name}</option>)}</select>{fieldMessage("subcategory")}</label>
                 <label><span className={LABEL_CLASS}>Stock quantity</span><input type="number" min="0" step="1" value={product.stock} onChange={(event) => updateProduct(item.index, { stock: event.target.value })} {...fieldAttributes("stock")} placeholder="Leave blank if unconfirmed" />{fieldMessage("stock")}</label>
+                {!product.variants.length && <label><span className={LABEL_CLASS}>Reorder at or below <span className="text-cream/35">(blank = default 5)</span></span><input type="number" min="0" max="1000000" step="1" value={product.reorderLevel} onChange={(event) => updateProduct(item.index, { reorderLevel: event.target.value })} className={FIELD_CLASS} /></label>}
                 <label><span className={LABEL_CLASS}>Return eligibility</span><select value={product.returnEligibility} onChange={(event) => updateProduct(item.index, { returnEligibility: event.target.value })} className={FIELD_CLASS}><option value="standard">Standard</option><option value="final_sale">Final sale</option><option value="perishable">Perishable</option><option value="digital_product">Digital product</option></select></label>
                 <label><span className={LABEL_CLASS}>Badge</span><select value={product.badge} onChange={(event) => updateProduct(item.index, { badge: event.target.value })} className={FIELD_CLASS}><option value="">No badge</option>{badges.map((badge) => <option key={badge._id} value={badge.slug}>{badge.chipLabel}</option>)}</select></label>
                 <label><span className={LABEL_CLASS}>Save as</span><select value={item.status} onChange={(event) => updateItem(item.index, { status: event.target.value })} className={FIELD_CLASS}><option value="draft">Draft</option><option value="published">Published</option></select></label>
@@ -478,7 +613,7 @@ export default function ProductImportPanel({ floors = [], shops, categories, onD
               </div>
 
               <div className="rounded-xl border border-cream/10 bg-mall-800/35 p-3">
-                <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><div><h3 className="text-xs font-semibold text-cream">Product options</h3><p className="mt-0.5 text-[10px] text-cream/40">Each option has its own SKU, price, stock and image.</p></div><button type="button" onClick={() => updateProduct(item.index, { variants: [...product.variants, { name: "", sku: "", price: "", compareAtPrice: "", stock: "", image: "" }] })} className="flex min-h-10 items-center gap-1 rounded-lg border border-cream/15 px-3 text-xs text-cream/70 hover:text-cream"><Plus size={13} /> Add option</button></div>
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><div><h3 className="text-xs font-semibold text-cream">Product options</h3><p className="mt-0.5 text-[10px] text-cream/40">Each option has its own SKU, price, stock and reorder level.</p></div><button type="button" onClick={() => updateProduct(item.index, { variants: [...product.variants, { name: "", sku: "", price: "", compareAtPrice: "", stock: "", reorderLevel: 5, image: "" }] })} className="flex min-h-10 items-center gap-1 rounded-lg border border-cream/15 px-3 text-xs text-cream/70 hover:text-cream"><Plus size={13} /> Add option</button></div>
                 {product.variants.length === 0 && <p className="py-2 text-xs text-cream/35">No product options</p>}
                 <div className="space-y-3">
                   {product.variants.map((variant, index) => <div key={`${item.index}-variant-${index}`} className="rounded-lg border border-cream/10 p-3">
@@ -495,6 +630,7 @@ export default function ProductImportPanel({ floors = [], shops, categories, onD
                       <label><span className={LABEL_CLASS}>Price</span><input type="number" min="0" step="any" value={variant.price} onChange={(event) => updateVariant(item.index, index, { price: event.target.value })} className={FIELD_CLASS} /></label>
                       <label><span className={LABEL_CLASS}>Compare-at price</span><input type="number" min="0" step="any" value={variant.compareAtPrice} onChange={(event) => updateVariant(item.index, index, { compareAtPrice: event.target.value })} className={FIELD_CLASS} /></label>
                       <label><span className={LABEL_CLASS}>Stock</span><input type="number" min="0" step="1" value={variant.stock} onChange={(event) => updateVariant(item.index, index, { stock: event.target.value })} className={FIELD_CLASS} /></label>
+                      <label><span className={LABEL_CLASS}>Reorder at or below <span className="text-cream/35">(blank = default 5)</span></span><input type="number" min="0" max="1000000" step="1" value={variant.reorderLevel} onChange={(event) => updateVariant(item.index, index, { reorderLevel: event.target.value })} className={FIELD_CLASS} /></label>
                       <label><span className={LABEL_CLASS}>Option image URL</span><input value={variant.image} onChange={(event) => updateVariant(item.index, index, { image: event.target.value })} className={FIELD_CLASS} /></label>
                     </div>
                   </div>)}

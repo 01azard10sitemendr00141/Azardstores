@@ -153,6 +153,8 @@ function mapSimple(row) {
   };
   const stock = numberOrUndefined(row.Stock);
   if (stock !== undefined && stock >= 0) product.stock = stock;
+  const reorderLevel = numberOrUndefined(row["Reorder Level"] ?? row.reorderLevel);
+  if (Number.isInteger(reorderLevel) && reorderLevel >= 0 && reorderLevel <= 1000000) product.reorderLevel = reorderLevel;
   return { product, sourcePublished: rowPublished(row), sourceType: String(row.Type || "simple").trim().toLowerCase() };
 }
 
@@ -190,6 +192,8 @@ function mapWooCommerceRows(rows) {
     };
     const stock = numberOrUndefined(row.Stock);
     if (stock !== undefined && stock >= 0) variant.stock = stock;
+    const reorderLevel = numberOrUndefined(row["Reorder Level"] ?? row.reorderLevel);
+    if (Number.isInteger(reorderLevel) && reorderLevel >= 0 && reorderLevel <= 1000000) variant.reorderLevel = reorderLevel;
     parent.variants.push(variant);
   }
 

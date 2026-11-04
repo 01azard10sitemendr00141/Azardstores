@@ -1,10 +1,8 @@
 const mongoose = require("mongoose");
 const { makeSlug } = require("../utils/slug");
 
-// A flat managed list, same reasoning as Category: Product.brand stays a
-// plain string for backward compatibility with existing/imported products —
-// this model exists to constrain what the admin UI offers as options, not
-// to enforce a foreign-key relationship at the database level.
+// Product.brandId is the canonical link; Product.brand remains synchronized
+// as a compatibility value for existing storefront filters and CSVs.
 const brandSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true, maxlength: 100, unique: true },

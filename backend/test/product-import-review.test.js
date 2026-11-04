@@ -11,6 +11,7 @@ function reviewedProduct(overrides = {}) {
     price: 1800,
     compareAtPrice: 2200,
     images: ["https://cdn.example.com/mug.jpg"],
+    brandId: "",
     brand: "Field Goods",
     returnEligibility: "standard",
     badge: "",
@@ -43,7 +44,19 @@ test("reviewed product normalizes and preserves all editable catalog details", (
   assert.equal(product.description, "Insulated stainless steel mug.");
   assert.equal(product.longDescription, "Keeps drinks warm during travel.");
   assert.equal(product.variants[0].stock, 5);
+  assert.equal(product.reorderLevel, 5);
+  assert.equal(product.variants[0].reorderLevel, 5);
   assert.equal(product.variants[0].image, "https://cdn.example.com/mug-blue.jpg");
+});
+
+test("reviewed product accepts blank reorder levels so imports can preserve existing settings", () => {
+  const { product, issues } = normalizeReviewedProduct(reviewedProduct({
+    reorderLevel: "",
+    variants: [{ ...reviewedProduct().variants[0], reorderLevel: "" }],
+  }));
+  assert.deepEqual(issues, []);
+  assert.equal(product.reorderLevel, null);
+  assert.equal(product.variants[0].reorderLevel, null);
 });
 
 test("reviewed product rejects unsafe images, invalid stock, unsupported fields, and invalid pricing", () => {
@@ -57,6 +70,11 @@ test("reviewed product rejects unsafe images, invalid stock, unsupported fields,
   assert.ok(issues.some((issue) => issue.includes("whole number")));
   assert.ok(issues.some((issue) => issue.includes("Compare-at price")));
   assert.ok(issues.some((issue) => issue.includes("Unsupported product fields")));
+});
+
+test("reviewed product accepts only a valid managed brand ID format", () => {
+  const { issues } = normalizeReviewedProduct(reviewedProduct({ brandId: "not-an-object-id" }));
+  assert.ok(issues.some((issue) => issue.includes("valid managed brand")));
 });
 
 test("reviewed product requires all editable fields and validates variant data", () => {

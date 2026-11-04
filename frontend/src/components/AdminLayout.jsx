@@ -1,7 +1,7 @@
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useEffect, useRef, useState } from "react";
 import {
-  LayoutDashboard, Layers, Store, Package, ShoppingBag, LogOut, Tag, Award, Users, Settings, BarChart3, Sparkles, Home, Menu, X, Truck,
+  LayoutDashboard, Layers, Store, Package, ShoppingBag, LogOut, Tag, Award, Users, Settings, BarChart3, Sparkles, Home, Menu, X, Truck, ClipboardList, ArrowRightLeft,
 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 
@@ -20,7 +20,9 @@ const NAV_GROUPS = [
   ] },
   { label: "Operations", links: [
     { to: "/admin/products", label: "Products", icon: Package },
+    { to: "/admin/stock-operations", label: "Stock Operations", icon: ArrowRightLeft },
     { to: "/admin/orders", label: "Orders", icon: ShoppingBag },
+    { to: "/admin/purchase-orders", label: "Purchase Orders", icon: ClipboardList },
     { to: "/admin/delivery", label: "Delivery", icon: Truck },
     { to: "/admin/customers", label: "Customers", icon: Users },
   ] },

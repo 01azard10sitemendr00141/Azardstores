@@ -1,5 +1,6 @@
 const mongoose = require("mongoose");
 const { makeSlug } = require("../utils/slug");
+const { createInitialInventoryHistory } = require("../utils/inventoryHistory");
 const { Schema } = mongoose;
 
 const productSchema = new Schema(
@@ -26,11 +27,55 @@ const productSchema = new Schema(
     subcategoryId: { type: Schema.Types.ObjectId, default: null, index: true },
     category: { type: String, default: "" },
     subcategory: { type: String, default: "" },
+    brandId: { type: Schema.Types.ObjectId, ref: "Brand", default: null, index: true },
+    // Kept in sync with brandId for existing storefront filters and CSVs.
     brand: { type: String, default: "" },
     returnEligibility: { type: String, enum: ["standard", "final_sale", "perishable", "digital_product"], default: "standard" },
     // Undefined means inventory has not yet been confirmed. A deliberate
     // zero is valid and remains distinguishable for draft publish checks.
     stock: { type: Number, min: 0, validate: { validator: Number.isInteger, message: "Stock must be a whole number." } },
+    reorderLevel: { type: Number, min: 0, max: 1000000, default: 5, validate: { validator: Number.isInteger, message: "Reorder level must be a whole number." } },
+    inventoryHistory: {
+      type: [{
+        type: { type: String, enum: ["initial", "baseline", "restock", "return_inspected", "purchase_order_received", "stock_count", "transfer_in", "transfer_out", "admin_adjustment", "bulk_adjustment", "csv_import", "order_reserved", "order_released", "legacy_order_restored"], required: true },
+        delta: { type: Number, default: null },
+        previousStock: { type: Number, default: null },
+        stock: { type: Number, default: null },
+        variantId: { type: Schema.Types.ObjectId, default: null },
+        variantName: { type: String, default: "" },
+        source: { type: String, default: "" },
+        reason: { type: String, default: "", trim: true, maxlength: 500 },
+        orderId: { type: Schema.Types.ObjectId, default: null },
+        returnRequestId: { type: Schema.Types.ObjectId, default: null },
+        purchaseOrderId: { type: Schema.Types.ObjectId, default: null },
+        purchaseOrderLineId: { type: Schema.Types.ObjectId, default: null },
+        receiptId: { type: String, default: "" },
+        itemIndex: { type: Number, default: null },
+        restockedQuantity: { type: Number, default: null },
+        damagedQuantity: { type: Number, default: null },
+        discardedQuantity: { type: Number, default: null },
+        shopId: { type: Schema.Types.ObjectId, ref: "Shop", default: null },
+        transferId: { type: String, default: "" },
+        operationId: { type: String, default: "" },
+        changedAt: { type: Date, default: Date.now },
+      }],
+      default: [],
+      select: false,
+    },
+    inventoryLocations: {
+      type: [{
+        shop: { type: Schema.Types.ObjectId, ref: "Shop", required: true },
+        stock: { type: Number, min: 0, validate: { validator: Number.isInteger, message: "Stock must be a whole number." } },
+        stockReservations: [{ orderId: { type: Schema.Types.ObjectId, required: true }, itemIndex: { type: Number, required: true }, quantity: { type: Number, required: true, min: 1 } }],
+        variants: [{
+          variantId: { type: Schema.Types.ObjectId, required: true },
+          stock: { type: Number, min: 0, validate: { validator: Number.isInteger, message: "Stock must be a whole number." } },
+          stockReservations: [{ orderId: { type: Schema.Types.ObjectId, required: true }, itemIndex: { type: Number, required: true }, quantity: { type: Number, required: true, min: 1 } }],
+        }],
+      }],
+      default: [],
+      select: false,
+    },
     stockReservations: [{ orderId: { type: Schema.Types.ObjectId, required: true }, itemIndex: { type: Number, required: true }, quantity: { type: Number, required: true, min: 1 } }],
     badge: { type: String, default: "" },
     isFlashSale: { type: Boolean, default: false },
@@ -49,6 +94,7 @@ const productSchema = new Schema(
         price: { type: Number },
         compareAtPrice: { type: Number },
         stock: { type: Number, min: 0, validate: { validator: Number.isInteger, message: "Stock must be a whole number." } },
+        reorderLevel: { type: Number, min: 0, max: 1000000, default: 5, validate: { validator: Number.isInteger, message: "Reorder level must be a whole number." } },
         stockReservations: [{ orderId: { type: Schema.Types.ObjectId, required: true }, itemIndex: { type: Number, required: true }, quantity: { type: Number, required: true, min: 1 } }],
         image: { type: String, default: "" },
       },
@@ -78,6 +124,9 @@ productSchema.pre("save", function (next) {
   this.sku = String(this.sku || "").trim().toUpperCase();
   (this.variants || []).forEach((variant) => { variant.sku = String(variant.sku || "").trim().toUpperCase(); });
   this.skuCodes = codes.length ? [...new Set(codes)] : undefined;
+  if (this.isNew && !this.inventoryHistory?.length) {
+    this.inventoryHistory = createInitialInventoryHistory(this, "initial", "product-create");
+  }
   next();
 });
 
@@ -95,6 +144,9 @@ productSchema.pre("insertMany", function (next, docs) {
     const codes = [doc.sku, ...(doc.variants || []).map((variant) => variant.sku)]
       .map((code) => String(code || "").trim().toUpperCase()).filter(Boolean);
     doc.skuCodes = codes.length ? codes : undefined;
+    if (!doc.inventoryHistory?.length) {
+      doc.inventoryHistory = createInitialInventoryHistory(doc, "initial", "product-seed");
+    }
   });
   if (docs.some((doc) => new Set(doc.skuCodes).size !== doc.skuCodes.length)) return next(new Error("SKU codes must be unique across each product and its variants"));
   next();
@@ -110,7 +162,9 @@ productSchema.set("toJSON", {
   transform(_doc, value) {
     delete value.stockReservations;
     delete value.skuCodes;
+    delete value.inventoryHistory;
     for (const variant of value.variants || []) delete variant.stockReservations;
+    delete value.inventoryLocations;
     return value;
   },
 });

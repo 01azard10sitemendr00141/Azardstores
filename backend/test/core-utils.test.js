@@ -53,6 +53,20 @@ test("admin product matching supports all status and category filters and reject
   assert.throws(() => buildAdminProductQuery({ status: "anything" }), /valid product status filter/);
 });
 
+test("admin product location filters compose and validate floor and shop IDs", () => {
+  const floorId = "507f1f77bcf86cd799439011";
+  const shopId = "507f1f77bcf86cd799439012";
+  const query = buildAdminProductQuery({ floor: floorId, shop: shopId }, { floorShopIds: [shopId] });
+  assert.deepEqual(query.filter.$and, [
+    { $or: [{ shop: { $in: [shopId] } }, { "inventoryLocations.shop": { $in: [shopId] } }] },
+    { $or: [{ shop: shopId }, { "inventoryLocations.shop": shopId }] },
+  ]);
+  assert.equal(query.floor, floorId);
+  assert.equal(query.shop, shopId);
+  assert.throws(() => buildAdminProductQuery({ floor: "not-an-id" }), /valid floor/);
+  assert.throws(() => buildAdminProductQuery({ shop: "not-an-id" }), /valid shop/);
+});
+
 test("admin inventory filters distinguish confirmed stock levels for simple and variant products", () => {
   const all = buildAdminProductQuery({ inventory: "all" });
   assert.deepEqual(all.filter, {});
@@ -73,6 +87,23 @@ test("admin inventory filters distinguish confirmed stock levels for simple and 
   assert.equal(outOfStock.filter.$or[0].$and[1].stock, 0);
   assert.equal(outOfStock.filter.$or[1].$and[1].variants.$not.$elemMatch.stock.$ne, 0);
   assert.throws(() => buildAdminProductQuery({ inventory: "unknown" }), /valid product inventory filter/);
+});
+
+test("needs-restock filter uses per-product and per-variant reorder levels with the legacy default", () => {
+  const { filter } = buildAdminProductQuery({ inventory: "needs_restock" });
+  const branches = filter.$expr.$or;
+
+  assert.deepEqual(branches[0].$and[0], { $eq: [{ $size: { $ifNull: ["$variants", []] } }, 0] });
+  assert.deepEqual(branches[0].$and[1], { $isNumber: "$stock" });
+  assert.deepEqual(branches[0].$and[2], { $lte: ["$stock", { $ifNull: ["$reorderLevel", 5] }] });
+  const variantBranch = branches.find((branch) => branch.$anyElementTrue?.[0]?.$map?.as === "variant");
+  const locationBranch = branches.find((branch) => branch.$anyElementTrue?.[0]?.$map?.as === "location");
+  assert.deepEqual(variantBranch.$anyElementTrue[0].$map.in.$and[1], {
+    $lte: ["$$variant.stock", { $ifNull: ["$$variant.reorderLevel", 5] }],
+  });
+  assert.deepEqual(locationBranch.$anyElementTrue[0].$map.in.$and[1], {
+    $lte: ["$$location.stock", { $ifNull: ["$reorderLevel", 5] }],
+  });
 });
 
 test("inventory composes identically with product search, status, and category filters", () => {
@@ -226,8 +257,12 @@ test("product schema accepts up to 12 gallery images and rejects larger gallerie
 test("product schema exposes managed category and subcategory references", () => {
   assert.equal(Product.schema.path("categoryId").options.ref, "Category");
   assert.equal(Product.schema.path("subcategoryId").instance, "ObjectId");
+  assert.equal(Product.schema.path("brandId").options.ref, "Brand");
+  assert.equal(Product.schema.path("inventoryHistory").options.select, false);
   assert.equal(Product.schema.path("category").instance, "String");
   assert.equal(Product.schema.path("subcategory").instance, "String");
+  assert.equal(Product.schema.path("reorderLevel").options.default, 5);
+  assert.equal(Product.schema.path("variants.reorderLevel").options.default, 5);
 });
 
 test("WooCommerce product image lists are preserved for review when they exceed the gallery limit", () => {
@@ -262,6 +297,17 @@ test("WooCommerce imports read floor and shop columns for review", () => {
     "Shop Name": "Audio",
   }]);
   assert.deepEqual(entry.product.sourcePlacement, { floor: "2", shop: "Audio" });
+});
+
+test("WooCommerce CSV reorder levels are mapped for products and variants", () => {
+  const mapped = mapWooCommerceRows([
+    { Type: "simple", Name: "Mug", SKU: "MUG-1", "Reorder Level": "8" },
+    { Type: "variable", Name: "Bottle", SKU: "BOTTLE-1", "Reorder Level": "12" },
+    { Type: "variation", Parent: "BOTTLE-1", Name: "Blue", SKU: "BOTTLE-BLUE", "Reorder Level": "3" },
+  ]);
+  assert.equal(mapped[0].product.reorderLevel, 8);
+  assert.equal(mapped[1].product.reorderLevel, 12);
+  assert.equal(mapped[1].product.variants[0].reorderLevel, 3);
 });
 
 test("CSV placement suggestions match floor/shop safely and leave ambiguous assignments unresolved", () => {

@@ -8,6 +8,7 @@ const PRODUCT_FIELDS = [
   "price",
   "compareAtPrice",
   "images",
+  "brandId",
   "brand",
   "returnEligibility",
   "badge",
@@ -15,9 +16,10 @@ const PRODUCT_FIELDS = [
   "purposeTags",
   "flashSaleEndsAt",
   "stock",
+  "reorderLevel",
   "variants",
 ];
-const VARIANT_FIELDS = ["name", "sku", "price", "compareAtPrice", "stock", "image"];
+const VARIANT_FIELDS = ["name", "sku", "price", "compareAtPrice", "stock", "reorderLevel", "image"];
 const RETURN_ELIGIBILITY = new Set(["standard", "final_sale", "perishable", "digital_product"]);
 
 function isRecord(value) {
@@ -63,7 +65,7 @@ function normalizeReviewedProduct(value) {
     return { product: null, issues: ["Reviewed product details are missing. Analyze the CSV again and review each product."] };
   }
 
-  const missing = PRODUCT_FIELDS.filter((field) => !Object.prototype.hasOwnProperty.call(value, field));
+  const missing = PRODUCT_FIELDS.filter((field) => field !== "reorderLevel" && !Object.prototype.hasOwnProperty.call(value, field));
   const unexpected = Object.keys(value).filter((field) => !PRODUCT_FIELDS.includes(field));
   if (missing.length) issues.push("Reviewed product details are incomplete. Analyze the CSV again and review each product.");
   if (unexpected.length) issues.push(`Unsupported product fields: ${unexpected.join(", ")}.`);
@@ -76,6 +78,7 @@ function normalizeReviewedProduct(value) {
     price: readNumber(value.price, "Price", issues),
     compareAtPrice: readNumber(value.compareAtPrice, "Compare-at price", issues),
     images: [],
+    brandId: readText(value.brandId, "Managed brand ID", issues, 24),
     brand: readText(value.brand, "Brand", issues, 160),
     returnEligibility: value.returnEligibility,
     badge: readText(value.badge, "Badge", issues, 80),
@@ -83,8 +86,10 @@ function normalizeReviewedProduct(value) {
     purposeTags: [],
     flashSaleEndsAt: null,
     stock: readNumber(value.stock, "Stock", issues, { integer: true }),
+    reorderLevel: readNumber(value.reorderLevel ?? 5, "Reorder level", issues, { integer: true }),
     variants: [],
   };
+  if (product.reorderLevel > 1000000) issues.push("Reorder level must be 1,000,000 or less.");
 
   if (!Array.isArray(value.images) || value.images.length > 12) {
     issues.push("A product can have up to 12 gallery images.");
@@ -97,6 +102,9 @@ function normalizeReviewedProduct(value) {
   }
   if (typeof value.isFlashSale !== "boolean") {
     issues.push("Flash sale status must be true or false.");
+  }
+  if (product.brandId && !/^[0-9a-f]{24}$/i.test(product.brandId)) {
+    issues.push("Choose a valid managed brand.");
   }
 
   if (!Array.isArray(value.purposeTags) || value.purposeTags.length > 20) {
@@ -132,8 +140,10 @@ function normalizeReviewedProduct(value) {
         price: readNumber(variant.price, `${label} price`, issues),
         compareAtPrice: readNumber(variant.compareAtPrice, `${label} compare-at price`, issues),
         stock: readNumber(variant.stock, `${label} stock`, issues, { integer: true }),
+        reorderLevel: readNumber(variant.reorderLevel ?? 5, `${label} reorder level`, issues, { integer: true }),
         image: readImage(variant.image, `${label} image`, issues, true),
       };
+      if (normalized.reorderLevel > 1000000) issues.push(`${label} reorder level must be 1,000,000 or less.`);
       const effectivePrice = normalized.price ?? product.price;
       const effectiveCompareAt = normalized.compareAtPrice ?? product.compareAtPrice;
       if (effectivePrice !== null && effectiveCompareAt !== null && effectiveCompareAt > 0 && effectiveCompareAt <= effectivePrice) {
@@ -167,12 +177,13 @@ function validateImportPlan(mappedIndexes, plan, skippedIndexes) {
   const decisions = plan.map((item) => toIndex(item.index));
   const skipped = skippedIndexes.map(toIndex);
   const all = [...decisions, ...skipped];
+  const skippedSet = new Set(skipped);
   const allowed = new Set(mappedIndexes);
   if (
     all.some((index) => !Number.isInteger(index) || !allowed.has(index))
     || new Set(decisions).size !== decisions.length
     || new Set(skipped).size !== skipped.length
-    || decisions.some((index) => skipped.includes(index))
+    || decisions.some((index) => skippedSet.has(index))
     || all.length !== mappedIndexes.length
   ) {
     return "Review every product row before importing. Analyze the CSV again if its preview is out of date.";

@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { Plus, Pencil, Trash2, X, Check, Package, Upload, CheckCircle2, AlertCircle, FileSpreadsheet, Download, Archive, ArchiveRestore, Eye, ArrowUp, ArrowDown } from "lucide-react";
+import { Plus, Pencil, Trash2, X, Check, Package, Upload, CheckCircle2, AlertCircle, FileSpreadsheet, Download, Archive, ArchiveRestore, Eye, ArrowUp, ArrowDown, History } from "lucide-react";
 import api from "../../api/client";
 import AdminPagination from "../../components/AdminPagination";
 import AdminConfirmDialog from "../../components/admin/AdminConfirmDialog";
@@ -10,16 +10,180 @@ import { useBadges } from "../../context/BadgesContext";
 import { getStartingPrice } from "../../utils/productPricing";
 import { clearHomeCache } from "../../utils/homeCache";
 import { productImageUrl } from "../../utils/productImageUrl";
+import useModalAccessibility from "../../hooks/useModalAccessibility";
 
 const PURPOSES = ["work", "gaming", "travel", "home", "fitness"];
-const EMPTY = { name: "", sku: "", description: "", longDescription: "", price: "", compareAtPrice: "", images: "", shop: "", categoryId: "", subcategoryId: "", category: "", subcategory: "", brand: "", stock: "", badge: "", returnEligibility: "standard", isFlashSale: false, purposeTags: [], variants: [], status: "draft" };
+const DEFAULT_REORDER_LEVEL = 5;
+const EMPTY = { name: "", sku: "", description: "", longDescription: "", price: "", compareAtPrice: "", images: "", shop: "", categoryId: "", subcategoryId: "", category: "", subcategory: "", brandId: "", brand: "", stock: "", reorderLevel: DEFAULT_REORDER_LEVEL, badge: "", returnEligibility: "standard", isFlashSale: false, purposeTags: [], variants: [], status: "draft" };
+
+async function loadAllAdminShops() {
+  const first = await api.get("/shops/admin/list", { params: { page: 1, limit: 100 } });
+  const pages = Array.from({ length: Math.max(0, first.data.pages - 1) }, (_, index) => index + 2);
+  const rest = await Promise.all(pages.map((page) => api.get("/shops/admin/list", { params: { page, limit: 100 } })));
+  return [...(first.data.shops || []), ...rest.flatMap((response) => response.data.shops || [])];
+}
 
 function getStockLabel(product) {
+  const locations = product.inventoryLocations || [];
   if (product.variants?.length) {
     if (!product.variants.every((variant) => Number.isInteger(variant.stock))) return "Not fully confirmed across options";
-    return `${product.variants.reduce((total, variant) => total + variant.stock, 0).toLocaleString()} across options`;
+    const primaryTotal = product.variants.reduce((total, variant) => total + variant.stock, 0);
+    if (!locations.length) return `${primaryTotal.toLocaleString()} in primary shop`;
+    const secondaryStocks = locations.flatMap((location) => location.variants || []);
+    if (secondaryStocks.length !== locations.length * product.variants.length || secondaryStocks.some((variant) => !Number.isInteger(variant.stock))) {
+      return `${primaryTotal.toLocaleString()} in primary shop · other shop stock unconfirmed`;
+    }
+    const secondaryTotal = secondaryStocks.reduce((total, variant) => total + variant.stock, 0);
+    return `${primaryTotal.toLocaleString()} primary · ${secondaryTotal.toLocaleString()} in ${locations.length} other shop${locations.length === 1 ? "" : "s"}`;
   }
-  return Number.isInteger(product.stock) ? product.stock.toLocaleString() : "Not confirmed";
+  const primaryStock = Number.isInteger(product.stock) ? `${product.stock.toLocaleString()} primary` : "Primary stock unconfirmed";
+  if (!locations.length) return primaryStock;
+  if (locations.some((location) => !Number.isInteger(location.stock))) return `${primaryStock} · other shop stock unconfirmed`;
+  const secondaryTotal = locations.reduce((total, location) => total + location.stock, 0);
+  return `${primaryStock} · ${secondaryTotal.toLocaleString()} in ${locations.length} other shop${locations.length === 1 ? "" : "s"}`;
+}
+
+function getLowStockWarning(product) {
+  const locations = [
+    { shop: product.shop, stock: product.stock, variants: product.variants, primary: true },
+    ...(product.inventoryLocations || []),
+  ];
+  if (product.variants?.length) {
+    const low = locations.flatMap((location) => (location.variants || []).flatMap((entry) => {
+      const variant = location.primary
+        ? entry
+        : product.variants.find((candidate) => String(candidate._id) === String(entry.variantId));
+      const level = variant?.reorderLevel ?? DEFAULT_REORDER_LEVEL;
+      if (!variant || !Number.isInteger(entry.stock) || entry.stock > level) return [];
+      const shopName = location.primary ? "Primary shop" : location.shop?.name || "Other shop";
+      return [`${shopName} · ${variant.name || "Option"}: ${entry.stock} left (reorder at ${level})`];
+    }));
+    return low.length ? `Needs restock · ${low.join(", ")}` : "";
+  }
+  const level = product.reorderLevel ?? DEFAULT_REORDER_LEVEL;
+  const low = locations.filter((location) => Number.isInteger(location.stock) && location.stock <= level)
+    .map((location) => `${location.primary ? "Primary shop" : location.shop?.name || "Other shop"}: ${location.stock} left (reorder at ${level})`);
+  return low.length ? `Needs restock · ${low.join(", ")}` : "";
+}
+
+function ProductRestockForm({ product, shops, onSubmit, onCancel }) {
+  const dialogRef = useRef(null);
+  const [variantId, setVariantId] = useState("");
+  const [shopId, setShopId] = useState(String(product.shop?._id || product.shop || ""));
+  const [quantity, setQuantity] = useState("");
+  const [reason, setReason] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const isPrimaryShop = shopId === String(product.shop?._id || product.shop || "");
+  const location = isPrimaryShop ? product : product.inventoryLocations?.find((entry) => String(entry.shop?._id || entry.shop) === shopId);
+  const variant = isPrimaryShop
+    ? product.variants?.find((entry) => String(entry._id) === variantId)
+    : location?.variants?.find((entry) => String(entry.variantId) === variantId);
+  const isAssigned = isPrimaryShop || Boolean(location);
+  const currentStock = isAssigned ? (variant ? variant.stock : location?.stock) : 0;
+  const hasVariants = Boolean(product.variants?.length);
+  useModalAccessibility(dialogRef, onCancel, saving);
+
+  async function submit(event) {
+    event.preventDefault();
+    const parsedQuantity = Number(quantity);
+    if (!Number.isInteger(parsedQuantity) || parsedQuantity < 1) return setError("Enter a whole-number quantity greater than zero.");
+    if (!Number.isInteger(currentStock)) return setError("Confirm current stock in the product editor before recording a restock.");
+    if (reason.trim().length < 5) return setError("Add a reason for this stock receipt.");
+    setSaving(true);
+    setError("");
+    try {
+      await onSubmit({ variantId, shopId, quantity: parsedQuantity, reason: reason.trim() });
+    } catch (requestError) {
+      setError(requestError.response?.data?.message || requestError.message || "Could not record this restock.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <div className="fixed inset-0 z-[110] flex items-end justify-center bg-black/70 p-0 sm:items-center sm:p-4" role="presentation">
+    <form ref={dialogRef} onSubmit={submit} role="dialog" aria-modal="true" aria-labelledby="product-restock-title" className="w-full max-w-lg rounded-t-2xl border border-cream/10 bg-mall-900 p-5 shadow-2xl sm:rounded-2xl sm:p-6">
+      <div className="mb-4 flex items-start justify-between gap-3"><div><p className="font-mono-tag text-[10px] uppercase tracking-widest text-mall-orange">Inventory receipt</p><h2 id="product-restock-title" className="mt-1 font-display text-2xl text-cream">Restock {product.name}</h2></div><button type="button" onClick={onCancel} disabled={saving} aria-label="Close" className="rounded-lg p-2 text-cream/50 hover:bg-cream/5 disabled:opacity-40"><X size={18}/></button></div>
+      <label className="mb-4 block text-xs text-cream/65">Receiving shop<select value={shopId} onChange={(event) => setShopId(event.target.value)} className="mt-2 min-h-11 w-full rounded-xl border border-cream/10 bg-mall-800 px-3 text-sm text-cream outline-none focus:border-mall-accent"><option value="">Choose a shop</option>{shops.map((shop) => <option key={shop._id} value={shop._id}>{shop.name}</option>)}</select></label>
+      {hasVariants && <label className="mb-4 block text-xs text-cream/65">Product option<select data-dialog-initial-focus value={variantId} onChange={(event) => setVariantId(event.target.value)} className="mt-2 min-h-11 w-full rounded-xl border border-cream/10 bg-mall-800 px-3 text-sm text-cream outline-none focus:border-mall-accent"><option value="">Choose an option</option>{product.variants.map((entry) => {
+        const optionStock = isAssigned
+          ? isPrimaryShop
+            ? entry.stock
+            : location?.variants?.find((locationVariant) => String(locationVariant.variantId) === String(entry._id))?.stock
+          : 0;
+        return <option key={entry._id} value={entry._id}>{entry.name || "Unnamed option"} · {Number.isInteger(optionStock) ? `${optionStock} at this shop` : "stock unconfirmed"}</option>;
+      })}</select></label>}
+      {!hasVariants && <p className="mb-4 rounded-lg bg-mall-800 p-3 text-xs text-cream/65">Current quantity: {Number.isInteger(currentStock) ? currentStock : "Not confirmed"}</p>}
+      {hasVariants && variant && <p className="mb-4 rounded-lg bg-mall-800 p-3 text-xs text-cream/65">Current quantity: {Number.isInteger(currentStock) ? currentStock : "Not confirmed"}</p>}
+      <label className="mb-4 block text-xs text-cream/65">Quantity received<input data-dialog-initial-focus={!hasVariants} type="number" min="1" max="1000000" step="1" required value={quantity} onChange={(event) => setQuantity(event.target.value)} className="mt-2 min-h-11 w-full rounded-xl border border-cream/10 bg-mall-800 px-3 text-sm text-cream outline-none focus:border-mall-accent" /></label>
+      <label className="block text-xs text-cream/65">Reason<textarea required minLength="5" maxLength="500" rows={3} value={reason} onChange={(event) => setReason(event.target.value)} placeholder="For example: supplier delivery, inspected customer return" className="mt-2 w-full resize-y rounded-xl border border-cream/10 bg-mall-800 px-3 py-3 text-sm text-cream outline-none focus:border-mall-accent" /></label>
+      {error && <p role="alert" className="mt-3 text-xs text-red-300">{error}</p>}
+      <div className="mt-5 flex gap-3"><button type="button" onClick={onCancel} disabled={saving} className="flex-1 rounded-xl border border-cream/10 px-4 py-3 text-sm text-cream/65 disabled:opacity-40">Cancel</button><button type="submit" disabled={saving || (hasVariants && !variantId)} className="flex-1 rounded-xl bg-mall-accent px-4 py-3 text-sm font-semibold text-mall-900 disabled:opacity-50">{saving ? "Recording…" : "Record stock received"}</button></div>
+    </form>
+  </div>;
+}
+
+function ProductInventoryHistory({ product }) {
+  const [open, setOpen] = useState(false);
+  const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function toggle() {
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    setOpen(true);
+    if (entries.length || loading) return;
+    setLoading(true);
+    setError("");
+    try {
+      const { data } = await api.get(`/products/admin/${product._id}/inventory-history`);
+      setEntries(data.entries || []);
+    } catch (requestError) {
+      setError(requestError.response?.data?.message || "Inventory history could not be loaded.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return <>
+    <button type="button" aria-expanded={open} aria-label={`View stock history for ${product.name}`} onClick={toggle} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-mall-accent sm:w-11 sm:flex-none sm:px-0">
+      <History size={13} /><span className="text-[11px] sm:hidden">History</span>
+    </button>
+    {open && <section className="mt-2 rounded-xl border border-cream/10 bg-mall-900/50 p-3" aria-label={`Stock history for ${product.name}`}>
+      <h3 className="text-xs font-semibold text-cream">Inventory history</h3>
+      {loading && <p className="mt-2 text-xs text-cream/55" role="status">Loading stock changes…</p>}
+      {error && <p className="mt-2 text-xs text-red-200" role="alert">{error}</p>}
+      {!loading && !error && !entries.length && <p className="mt-2 text-xs text-cream/55">No stock changes have been recorded yet.</p>}
+      {entries.length > 0 && <ol className="mt-2 space-y-2">
+        {entries.map((entry, index) => {
+          const label = entry.type === "restock" ? "Stock received"
+            : entry.type === "purchase_order_received" ? "Supplier delivery received"
+              : entry.type === "return_inspected" ? "Return inspected"
+              : entry.type === "stock_count" ? "Stock count reconciled"
+                : entry.type === "transfer_in" ? "Stock transfer received"
+                  : entry.type === "transfer_out" ? "Stock transfer sent"
+            : entry.type === "order_reserved" ? "Order reserved"
+            : entry.type === "order_released" ? "Reservation released"
+              : entry.type === "legacy_order_restored" ? "Order stock restored"
+                : entry.type === "csv_import" ? "CSV stock update"
+                  : entry.type === "bulk_adjustment" ? "Bulk stock update"
+                    : entry.type === "initial" ? "Initial stock" : "Manual stock update";
+          const eventLabel = entry.type === "baseline" ? "History tracking started" : label;
+          const quantity = Number.isInteger(entry.stock)
+            ? `${Number.isInteger(entry.previousStock) ? entry.previousStock : "Unconfirmed"} → ${entry.stock}`
+            : Number.isInteger(entry.delta) ? `${entry.delta > 0 ? "+" : ""}${entry.delta}` : "Stock confirmation changed";
+          const shopLabel = entry.shopId?.name ? ` · ${entry.shopId.name}` : "";
+          return <li key={`${entry.changedAt}-${index}`} className="flex flex-wrap justify-between gap-2 border-t border-cream/5 pt-2 text-[11px]">
+            <span className="text-cream/75">{eventLabel}{shopLabel}{entry.variantName ? ` · ${entry.variantName}` : ""} · {quantity}{entry.reason ? ` · ${entry.reason}` : ""}</span>
+            <time className="text-cream/40" dateTime={entry.changedAt}>{new Date(entry.changedAt).toLocaleString()}</time>
+          </li>;
+        })}
+      </ol>}
+    </section>}
+  </>;
 }
 
 function ProductForm({ initial, floors, shops, categories, brands, onSave, onCancel }) {
@@ -27,7 +191,7 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
   const formId = useId().replace(/:/g, "");
   const fieldId = (name) => `${formId}-${name}`;
   const [form, setForm] = useState(initial
-    ? { ...initial, images: initial.images?.join(", ") || "", purposeTags: initial.purposeTags || [], variants: initial.variants || [] }
+    ? { ...initial, reorderLevel: initial.reorderLevel ?? DEFAULT_REORDER_LEVEL, images: initial.images?.join(", ") || "", purposeTags: initial.purposeTags || [], variants: (initial.variants || []).map((variant) => ({ ...variant, reorderLevel: variant.reorderLevel ?? DEFAULT_REORDER_LEVEL })) }
     : EMPTY);
   const [floorId, setFloorId] = useState(String(initial?.shop?.floor?._id || initial?.shop?.floor || ""));
   const [saving, setSaving] = useState(false);
@@ -100,7 +264,7 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
   }
 
   function addVariant() {
-    setForm((f) => ({ ...f, variants: [...f.variants, { name: "", sku: "", price: "", compareAtPrice: "", stock: "", image: "" }] }));
+    setForm((f) => ({ ...f, variants: [...f.variants, { name: "", sku: "", price: "", compareAtPrice: "", stock: "", reorderLevel: DEFAULT_REORDER_LEVEL, image: "" }] }));
   }
   function updateVariant(index, key, value) {
     setForm((f) => ({
@@ -139,6 +303,8 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
 
   const selectedCategory = categories.find((category) => String(category._id) === String(form.categoryId || "")
     || category.name.trim().toLocaleLowerCase() === String(form.category || "").trim().toLocaleLowerCase());
+  const selectedBrand = brands.find((brand) => String(brand._id) === String(form.brandId || "")
+    || brand.name.trim().toLocaleLowerCase() === String(form.brand || "").trim().toLocaleLowerCase());
   const selectedSubcategory = selectedCategory?.subcategories?.find((subcategory) => String(subcategory._id) === String(form.subcategoryId || "")
     || subcategory.name.trim().toLocaleLowerCase() === String(form.subcategory || "").trim().toLocaleLowerCase());
   const floorShops = shops.filter((shop) => String(shop.floor?._id || shop.floor || "") === floorId);
@@ -178,6 +344,7 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
         const effectivePrice = v.price === "" || v.price === undefined || v.price === null ? saveForm.price : v.price;
         if (!Number.isFinite(Number(effectivePrice)) || Number(effectivePrice) <= 0) issues.push(`${label}: add a price greater than zero.`);
         if (v.stock === "" || v.stock === undefined || v.stock === null || !Number.isInteger(Number(v.stock)) || Number(v.stock) < 0) issues.push(`${label}: confirm a whole-number stock quantity (zero is allowed).`);
+        if (v.reorderLevel === "" || !Number.isInteger(Number(v.reorderLevel ?? DEFAULT_REORDER_LEVEL)) || Number(v.reorderLevel ?? DEFAULT_REORDER_LEVEL) < 0 || Number(v.reorderLevel ?? DEFAULT_REORDER_LEVEL) > 1000000) issues.push(`${label}: set a whole-number reorder level from 0 to 1,000,000.`);
         const effectiveCompareAt = v.compareAtPrice === "" || v.compareAtPrice === undefined || v.compareAtPrice === null ? saveForm.compareAtPrice : v.compareAtPrice;
         if (effectiveCompareAt && Number(effectiveCompareAt) > 0 && Number(effectiveCompareAt) <= Number(effectivePrice)) issues.push(`${label}: compare-at price must be higher than its selling price.`);
       });
@@ -186,12 +353,15 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
         if (!(Number(saveForm.price) > 0)) issues.push("Add a price greater than zero.");
         if (saveForm.stock === "" || saveForm.stock === undefined || !Number.isInteger(Number(saveForm.stock)) || Number(saveForm.stock) < 0) issues.push("Confirm a whole-number stock quantity (zero is allowed).");
       }
+      if (saveForm.reorderLevel === "" || !Number.isInteger(Number(saveForm.reorderLevel)) || Number(saveForm.reorderLevel) < 0 || Number(saveForm.reorderLevel) > 1000000) issues.push("Set a whole-number reorder level from 0 to 1,000,000.");
       setPublishIssues(issues);
       if (requestedStatus === "published" && issues.length) return;
       const payload = {
         ...saveForm,
         status: requestedStatus,
         shop: saveForm.shop?._id || saveForm.shop,
+        brandId: selectedBrand?._id || "",
+        brand: selectedBrand?.name || saveForm.brand,
         floorId,
         categoryId: selectedCategory?._id || "",
         subcategoryId: selectedSubcategory?._id || "",
@@ -201,6 +371,7 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
         price: saveForm.price === "" || saveForm.price === undefined ? null : Number(saveForm.price),
         compareAtPrice: saveForm.compareAtPrice ? Number(saveForm.compareAtPrice) : null,
         stock: saveForm.stock === "" || saveForm.stock === undefined ? null : Number(saveForm.stock),
+        reorderLevel: Number(saveForm.reorderLevel),
         variants: saveForm.variants
           .map((v) => ({
             ...(v._id ? { _id: v._id } : {}),
@@ -209,6 +380,7 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
             price: v.price !== "" && v.price !== undefined ? Number(v.price) : null,
             compareAtPrice: v.compareAtPrice ? Number(v.compareAtPrice) : null,
             stock: v.stock === "" || v.stock === undefined ? null : Number(v.stock),
+            reorderLevel: Number(v.reorderLevel ?? DEFAULT_REORDER_LEVEL),
             image: v.image || "",
           })),
       };
@@ -276,6 +448,11 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
           <label htmlFor={fieldId("stock")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Stock</label>
           <input id={fieldId("stock")} type="number" min="0" step="1" value={form.stock ?? ""} onChange={(e) => set("stock", e.target.value)} placeholder="Enter confirmed whole-number stock" className={inputClass} />
         </div>
+        <div>
+          <label htmlFor={fieldId("reorder-level")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Reorder when at or below</label>
+          <input id={fieldId("reorder-level")} type="number" min="0" max="1000000" step="1" value={form.reorderLevel ?? DEFAULT_REORDER_LEVEL} onChange={(e) => set("reorderLevel", e.target.value)} className={inputClass} />
+        </div>
+        <p className="sm:col-span-2 -mt-2 text-[11px] text-cream/45">Set per product. For products with options, set the level on each option below. A level of 0 flags only out-of-stock items.</p>
         </div>
       </section>
 
@@ -313,10 +490,14 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
         </div>
         <div>
           <label htmlFor={fieldId("brand")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Brand</label>
-          <select id={fieldId("brand")} value={form.brand} onChange={(e) => set("brand", e.target.value)} className={inputClass}>
-            <option value="">Select brand</option>
-            {brands.map((b) => <option key={b._id} value={b.name}>{b.name}</option>)}
+          <select id={fieldId("brand")} value={selectedBrand?._id || ""} onChange={(e) => {
+            const brand = brands.find((entry) => String(entry._id) === e.target.value);
+            setForm((current) => ({ ...current, brandId: brand?._id || "", brand: brand?.name || "" }));
+          }} className={inputClass}>
+            <option value="">No brand</option>
+            {brands.map((b) => <option key={b._id} value={b._id}>{b.name}</option>)}
           </select>
+          {form.brand && !selectedBrand && <p className="mt-1 text-[10px] text-amber-200/80">Legacy brand “{form.brand}” is not linked. Choose a managed brand or clear this value before saving.</p>}
         </div>
         <div>
           <label htmlFor={fieldId("return-eligibility")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Return eligibility</label>
@@ -460,7 +641,7 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
                     <X size={13} />
                   </button>
                 </div>
-                <div className="grid grid-cols-1 min-[400px]:grid-cols-2 sm:grid-cols-4 gap-2">
+                <div className="grid grid-cols-1 min-[400px]:grid-cols-2 sm:grid-cols-3 gap-2">
                   <input
                     type="number"
                     value={variant.price ?? ""}
@@ -485,6 +666,17 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
                     onChange={(e) => updateVariant(i, "stock", e.target.value)}
                     placeholder="Stock"
                     aria-label={`Stock for variant ${i + 1}`}
+                    className="min-h-11 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/40 outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition sm:min-h-0"
+                  />
+                  <input
+                    type="number"
+                    min="0"
+                    max="1000000"
+                    step="1"
+                    value={variant.reorderLevel ?? DEFAULT_REORDER_LEVEL}
+                    onChange={(e) => updateVariant(i, "reorderLevel", e.target.value)}
+                    aria-label={`Reorder level for variant ${i + 1}`}
+                    placeholder={`Reorder at (${DEFAULT_REORDER_LEVEL})`}
                     className="min-h-11 bg-mall-800 border border-cream/10 rounded-lg px-2 py-1.5 text-cream text-xs placeholder-cream/40 outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition sm:min-h-0"
                   />
                   <input
@@ -665,6 +857,7 @@ export default function AdminProducts() {
   const [products, setProducts] = useState([]);
   const [floors, setFloors] = useState([]);
   const [shops, setShops] = useState([]);
+  const [allShops, setAllShops] = useState([]);
   const [categories, setCategories] = useState([]);
   const [brands, setBrands] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -675,6 +868,8 @@ export default function AdminProducts() {
   const [statusFilter, setStatusFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("");
   const [inventoryFilter, setInventoryFilter] = useState("all");
+  const [floorFilter, setFloorFilter] = useState("");
+  const [shopFilter, setShopFilter] = useState("");
   const [page, setPage] = useState(1);
   const [pages, setPages] = useState(1);
   const [total, setTotal] = useState(0);
@@ -682,6 +877,7 @@ export default function AdminProducts() {
   const [allMatchingSelected, setAllMatchingSelected] = useState(false);
   const [showBulkEdit, setShowBulkEdit] = useState(false);
   const [showMatchingArchiveConfirm, setShowMatchingArchiveConfirm] = useState(false);
+  const [restockTarget, setRestockTarget] = useState(null);
   const [matchingArchiveBusy, setMatchingArchiveBusy] = useState(false);
   const [matchingArchiveError, setMatchingArchiveError] = useState("");
   const [loadError, setLoadError] = useState("");
@@ -700,11 +896,12 @@ export default function AdminProducts() {
     let active = true;
     setMetadataLoading(true);
     setMetadataError("");
-    Promise.all([api.get("/floors/admin/list"), api.get("/shops"), api.get("/categories"), api.get("/brands")])
-      .then(([floorsRes, shopsRes, catRes, brandRes]) => {
+    Promise.all([api.get("/floors/admin/list"), api.get("/shops"), loadAllAdminShops(), api.get("/categories"), api.get("/brands")])
+      .then(([floorsRes, shopsRes, adminShops, catRes, brandRes]) => {
         if (!active) return;
         setFloors(floorsRes.data);
         setShops(shopsRes.data);
+        setAllShops(adminShops);
         setCategories(catRes.data);
         setBrands(brandRes.data);
       })
@@ -716,7 +913,7 @@ export default function AdminProducts() {
   function load() {
     setLoading(true);
     setLoadError("");
-    api.get("/products/admin/list", { params: { search: search || undefined, status: statusFilter, category: categoryFilter || undefined, inventory: inventoryFilter, page, limit: 20 } })
+    api.get("/products/admin/list", { params: { search: search || undefined, status: statusFilter, category: categoryFilter || undefined, inventory: inventoryFilter, floor: floorFilter || undefined, shop: shopFilter || undefined, page, limit: 20 } })
       .then((res) => {
         setProducts(res.data.products);
         setPages(res.data.pages);
@@ -725,14 +922,14 @@ export default function AdminProducts() {
       .catch(() => setLoadError("Products could not be loaded."))
       .finally(() => setLoading(false));
   }
-  useEffect(load, [search, page, statusFilter, categoryFilter, inventoryFilter, loadAttempt]);
+  useEffect(load, [search, page, statusFilter, categoryFilter, inventoryFilter, floorFilter, shopFilter, loadAttempt]);
   // Keep selection scoped to the current query/page unless the admin
   // explicitly opts into the all-matching archive selection.
   useEffect(() => {
     setSelectedIds([]);
     setAllMatchingSelected(false);
     setShowBulkEdit(false);
-  }, [search, page, statusFilter, categoryFilter, inventoryFilter]);
+  }, [search, page, statusFilter, categoryFilter, inventoryFilter, floorFilter, shopFilter]);
 
   async function handleAdd(form) { await api.post("/products", form); clearHomeCache(); setShowAdd(false); load(); }
   async function handleEdit(id, form) { await api.put(`/products/${id}`, form); clearHomeCache(); setEditId(null); load(); }
@@ -779,6 +976,13 @@ export default function AdminProducts() {
     load();
   }
 
+  async function handleRestock(payload) {
+    await api.post(`/products/admin/${restockTarget._id}/restock`, payload);
+    clearHomeCache();
+    setRestockTarget(null);
+    load();
+  }
+
   async function handleArchiveAllMatching() {
     setMatchingArchiveBusy(true);
     setMatchingArchiveError("");
@@ -788,6 +992,8 @@ export default function AdminProducts() {
         status: statusFilter,
         category: categoryFilter,
         inventory: inventoryFilter,
+        floor: floorFilter,
+        shop: shopFilter,
         expectedCount: total,
       });
       clearHomeCache();
@@ -874,6 +1080,7 @@ export default function AdminProducts() {
           floors={floors}
           shops={shops}
           categories={categories}
+          brands={brands}
           onDone={() => { clearHomeCache(); setShowImport(false); load(); }}
           onCancel={() => setShowImport(false)}
         />
@@ -891,7 +1098,7 @@ export default function AdminProducts() {
       </div>
 
       <div className="mb-5 rounded-2xl border border-cream/10 bg-mall-900/35 p-3 sm:p-4">
-        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-[minmax(16rem,1.4fr)_minmax(12rem,1fr)_minmax(12rem,1fr)]">
+        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
           <label htmlFor="product-search" className="sr-only">Search products</label>
           <input
             id="product-search"
@@ -923,6 +1130,29 @@ export default function AdminProducts() {
             <option value="in_stock">In stock · more than 5</option>
             <option value="low_stock">Low stock · 1–5</option>
             <option value="out_of_stock">Out of stock</option>
+            <option value="needs_restock">At or below reorder level</option>
+          </select>
+          <label htmlFor="product-floor-filter" className="sr-only">Filter products by floor</label>
+          <select
+            id="product-floor-filter"
+            aria-label="Filter products by floor"
+            value={floorFilter}
+            onChange={(event) => { setFloorFilter(event.target.value); setShopFilter(""); setPage(1); }}
+            className="min-h-11 w-full min-w-0 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition"
+          >
+            <option value="">All floors</option>
+            {floors.map((floor) => <option key={floor._id} value={floor._id}>Floor {floor.floorNumber}: {floor.name}</option>)}
+          </select>
+          <label htmlFor="product-shop-filter" className="sr-only">Filter products by shop</label>
+          <select
+            id="product-shop-filter"
+            aria-label="Filter products by shop"
+            value={shopFilter}
+            onChange={(event) => { setShopFilter(event.target.value); setPage(1); }}
+            className="min-h-11 w-full min-w-0 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm outline-none focus:border-mall-accent focus-visible:!outline-2 focus-visible:!outline-[#1683FF] focus-visible:!outline-offset-2 transition"
+          >
+            <option value="">All shops</option>
+            {allShops.filter((shop) => !floorFilter || String(shop.floor?._id || shop.floor || "") === floorFilter).map((shop) => <option key={shop._id} value={shop._id}>#{shop.shopNumber} {shop.name}{shop.isActive === false ? " (inactive)" : ""}</option>)}
           </select>
         </div>
       </div>
@@ -932,11 +1162,13 @@ export default function AdminProducts() {
           <p className="font-mono-tag text-[9px] uppercase tracking-[0.18em] text-cream/35">Catalog results</p>
           <p className="mt-0.5 text-sm font-medium text-cream/80">{total.toLocaleString()} product{total === 1 ? "" : "s"} <span className="text-xs font-normal text-cream/40">· page {page} of {pages}</span></p>
         </div>
-        {(search || categoryFilter || inventoryFilter !== "all" || statusFilter !== "all") && (
+        {(search || categoryFilter || inventoryFilter !== "all" || statusFilter !== "all" || floorFilter || shopFilter) && (
           <div className="flex flex-wrap gap-1.5 text-[10px] text-cream/50">
             {search && <span className="max-w-full break-words rounded-full border border-cream/10 px-2 py-1">Search: {search}</span>}
             {categoryFilter && <span className="max-w-full break-words rounded-full border border-cream/10 px-2 py-1">{categoryFilter}</span>}
-            {inventoryFilter !== "all" && <span className="rounded-full border border-mall-accent/20 bg-mall-accent/5 px-2 py-1 text-mall-accent">{inventoryFilter === "in_stock" ? "In stock >5" : inventoryFilter === "low_stock" ? "Low stock 1–5" : "Out of stock"}</span>}
+            {inventoryFilter !== "all" && <span className="rounded-full border border-mall-accent/20 bg-mall-accent/5 px-2 py-1 text-mall-accent">{inventoryFilter === "in_stock" ? "In stock >5" : inventoryFilter === "low_stock" ? "Low stock 1–5" : inventoryFilter === "needs_restock" ? "At or below reorder level" : "Out of stock"}</span>}
+            {floorFilter && <span className="rounded-full border border-cream/10 px-2 py-1">{floors.find((floor) => String(floor._id) === floorFilter)?.name || "Selected floor"}</span>}
+            {shopFilter && <span className="rounded-full border border-cream/10 px-2 py-1">{allShops.find((shop) => String(shop._id) === shopFilter)?.name || "Selected shop"}</span>}
             {statusFilter !== "all" && <span className="rounded-full border border-cream/10 px-2 py-1">{statusFilter}</span>}
           </div>
         )}
@@ -1060,6 +1292,7 @@ export default function AdminProducts() {
                       <div className="min-w-0">
                         <p className="font-mono-tag text-[10px] uppercase tracking-widest text-cream/60">Stock</p>
                         <p className="mt-0.5 break-words text-[13px] text-cream/70">{getStockLabel(product)}</p>
+                        {getLowStockWarning(product) && <p className="mt-1 text-[10px] font-medium text-amber-200" role="status">{getLowStockWarning(product)}</p>}
                       </div>
                     </div>
                     <div className="col-span-3 min-w-0 border-t border-cream/10 pt-2.5 sm:col-span-1 sm:border-t-0 sm:pt-0">
@@ -1068,8 +1301,12 @@ export default function AdminProducts() {
                       {product.shop?.isActive === false && <p className="mt-0.5 text-amber-200/80 text-[10px]">Shop inactive · hidden from storefront and new checkout</p>}
                       {product.publishIssues?.length > 0 && <p className="mt-1 text-[10px] text-red-300">{product.publishIssues.length} publication requirement{product.publishIssues.length === 1 ? "" : "s"} incomplete</p>}
                       {product.publishIssues?.length > 0 && <details className="mt-1"><summary className="cursor-pointer text-[10px] text-red-300/70">View required details</summary><ul className="mt-1 list-disc space-y-0.5 pl-4">{product.publishIssues.map((issue, index) => <li key={index} className="text-[10px] text-red-200/70">{issue}</li>)}</ul></details>}
+                      {product.catalogReview?.duplicateSiblings?.length > 0 && <details className="mt-1"><summary className="cursor-pointer text-[10px] text-amber-200">Possible duplicate · {product.catalogReview.duplicateSiblings.length} match{product.catalogReview.duplicateSiblings.length === 1 ? "" : "es"}</summary><ul className="mt-1 list-disc space-y-0.5 pl-4">{product.catalogReview.duplicateSiblings.map((sibling) => <li key={sibling._id} className="text-[10px] text-amber-100/70">{sibling.name}{sibling.brand ? ` · ${sibling.brand}` : ""} · same shop</li>)}</ul></details>}
+                      {product.catalogReview?.archiveReview && <p className="mt-1 text-[10px] text-amber-100/75">Review: {product.catalogReview.archiveReview}</p>}
                     </div>
                     <div className="col-span-3 flex w-full items-center justify-end gap-2 border-t border-cream/10 pt-2.5 sm:col-auto sm:ml-0 sm:w-auto sm:border-t-0 sm:pt-0">
+                      <button type="button" aria-label={`Restock ${product.name}`} title="Record stock received" onClick={() => setRestockTarget(product)} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-mall-accent sm:w-11 sm:flex-none sm:px-0"><Plus size={13} /><span className="text-[11px] sm:hidden">Restock</span></button>
+                      <ProductInventoryHistory product={product} />
                       <button type="button" aria-label={`Edit ${product.name}`} title={`Edit ${product.name}`} onClick={() => { setEditId(product._id); setShowAdd(false); }} disabled={metadataLoading || Boolean(metadataError)}
                         className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-cream disabled:opacity-30 disabled:cursor-not-allowed sm:min-h-11 sm:w-11 sm:flex-none sm:px-0">
                         <Pencil size={13} /><span className="text-[11px] sm:hidden">Edit</span>
@@ -1091,6 +1328,7 @@ export default function AdminProducts() {
         </div>
       )}
       <AdminPagination page={page} pages={pages} onChange={setPage} />
+      {restockTarget && <ProductRestockForm product={restockTarget} shops={shops} onSubmit={handleRestock} onCancel={() => setRestockTarget(null)} />}
       {deleteTarget && <AdminConfirmDialog title={`Permanently delete ${deleteTarget.name}?`} description="This cannot be undone. Products with order history or active reservations cannot be permanently deleted; archive them instead." busy={deleting} onClose={() => !deleting && setDeleteTarget(null)} onConfirm={handleDelete} />}
       {showMatchingArchiveConfirm && <AdminConfirmDialog
         title="Archive all matching products?"

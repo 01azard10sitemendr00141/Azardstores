@@ -30,8 +30,11 @@ router.get("/", async (req, res, next) => {
     // limit-100 product list, which silently undercounted once the
     // catalog passed 100 items.
     const counts = await Product.aggregate([
-      { $match: { isActive: true, $or: [{ status: "published" }, { status: { $exists: false } }], shop: { $in: shops.map((s) => s._id) } } },
-      { $group: { _id: "$shop", count: { $sum: 1 } } },
+      { $match: { isActive: true, $or: [{ status: "published" }, { status: { $exists: false } }] } },
+      { $project: { shopIds: { $setUnion: [["$shop"], { $ifNull: ["$inventoryLocations.shop", []] }] } } },
+      { $unwind: "$shopIds" },
+      { $match: { shopIds: { $in: shops.map((s) => s._id) } } },
+      { $group: { _id: "$shopIds", count: { $sum: 1 } } },
     ]);
     const countMap = Object.fromEntries(counts.map((c) => [c._id.toString(), c.count]));
     const shopsWithCounts = shops.map((s) => ({ ...s.toObject(), productCount: countMap[s._id.toString()] || 0 }));
@@ -147,9 +150,9 @@ router.delete("/:id", protect, requireRole("admin"), async (req, res, next) => {
     const shop = await Shop.findById(req.params.id);
     if (!shop) return res.status(404).json({ message: "Shop not found" });
 
-    const productCount = await Product.countDocuments({ shop: shop._id });
+    const productCount = await Product.countDocuments({ $or: [{ shop: shop._id }, { "inventoryLocations.shop": shop._id }] });
     if (productCount > 0) {
-      return res.status(409).json({ message: `This shop still has ${productCount} product${productCount === 1 ? "" : "s"}. Move or remove the products before deleting the shop.` });
+      return res.status(409).json({ message: `This shop is assigned to ${productCount} product${productCount === 1 ? "" : "s"}. Transfer inventory and remove its catalog assignments before deleting the shop.` });
     }
 
     await shop.deleteOne();

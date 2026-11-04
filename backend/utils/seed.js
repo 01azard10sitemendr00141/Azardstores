@@ -6,6 +6,7 @@ const Shop = require("../models/Shop");
 const Product = require("../models/Product");
 const User = require("../models/User");
 const Category = require("../models/Category");
+const Brand = require("../models/Brand");
 
 const BADGES = ["new-arrival", "trending", "hot-deal", "best-seller", "exclusive", "limited-stock"];
 
@@ -341,6 +342,26 @@ async function seed() {
     subcategories: c.subcategories.map((s) => ({ name: s })),
   })));
 
+  console.log("Resolving managed brands...");
+  const brands = await Brand.find().select("_id name");
+  const brandsByName = new Map();
+  for (const brand of brands) {
+    const key = brand.name.trim().toLocaleLowerCase();
+    const matches = brandsByName.get(key) || [];
+    matches.push(brand);
+    brandsByName.set(key, matches);
+  }
+  const seedBrandNames = [...new Set(PRODUCTS.map((product) => String(product.brand || "").trim()).filter(Boolean))];
+  for (const name of seedBrandNames) {
+    const key = name.toLocaleLowerCase();
+    const matches = brandsByName.get(key) || [];
+    if (matches.length > 1) throw new Error(`Seed brand "${name}" matches multiple managed records.`);
+    if (!matches.length) {
+      const brand = await Brand.create({ name });
+      brandsByName.set(key, [brand]);
+    }
+  }
+
   console.log("Creating floors...");
   const floors = await Floor.insertMany(FLOORS);
   const f = Object.fromEntries(floors.map((fl) => [fl.floorNumber, fl]));
@@ -385,7 +406,8 @@ async function seed() {
       subcategoryId: subcategory._id,
       category: p.category,
       subcategory: p.subcategory,
-      brand: p.brand,
+      brandId: brandsByName.get(String(p.brand || "").trim().toLocaleLowerCase())?.[0]?._id || null,
+      brand: brandsByName.get(String(p.brand || "").trim().toLocaleLowerCase())?.[0]?.name || "",
       stock: p.stock,
       sku: p.sku,
       badge: badge(p.i),

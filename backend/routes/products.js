@@ -1,10 +1,12 @@
 const express = require("express");
 const multer = require("multer");
 const crypto = require("crypto");
+const mongoose = require("mongoose");
 const { parse } = require("csv-parse/sync");
 const Product = require("../models/Product");
 const Shop = require("../models/Shop");
 const Floor = require("../models/Floor");
+const Brand = require("../models/Brand");
 const { protect, requireRole } = require("../middleware/auth");
 const { mapWooCommerceRows, cleanCategory, suggestImportPlacement } = require("../utils/wooCommerceImport");
 const { toCsv } = require("../utils/csvExport");
@@ -13,10 +15,65 @@ const { parseListQuery, queryText, escapeRegex } = require("../utils/listQuery")
 const { buildAdminProductQuery, isValidExpectedProductCount, matchesExpectedProductCount } = require("../utils/adminProductQuery");
 const { normalizeReviewedProduct, validateImportPlan, validatePlannedSkuUniqueness } = require("../utils/productImportReview");
 const { suggestUniqueProductSku } = require("../utils/productSku");
+const { serializeAvailableInventory } = require("../utils/productInventory");
+const { createOperationConflict, runInventoryOperation } = require("../utils/inventoryOperation");
+const {
+  INVENTORY_HISTORY_LIMIT,
+  createInventoryMovement,
+  createDeltaMovement,
+  createInitialInventoryHistory,
+  createInventoryChanges,
+} = require("../utils/inventoryHistory");
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB cap
 const MAX_BULK_EDIT_PRODUCTS = 500;
+
+async function buildAdminQuery(input) {
+  const floor = queryText(input?.floor, 64);
+  if (!floor) return buildAdminProductQuery(input);
+  if (!/^[0-9a-f]{24}$/i.test(floor)) {
+    const error = new Error("Choose a valid floor.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const floorDoc = await Floor.findById(floor).select("_id");
+  if (!floorDoc) {
+    const error = new Error("Floor not found.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const floorShopIds = await Shop.find({ floor: floorDoc._id }).distinct("_id");
+  return buildAdminProductQuery(input, { floorShopIds });
+}
+
+async function resolveProductBrand(brandId, brandName) {
+  const name = String(brandName || "").trim();
+  if (!brandId && !name) return { brandId: null, brand: "" };
+  let brand;
+  if (brandId) {
+    if (!/^[0-9a-f]{24}$/i.test(String(brandId))) {
+      const error = new Error("Choose a managed brand.");
+      error.statusCode = 400;
+      throw error;
+    }
+    brand = await Brand.findById(brandId).select("_id name");
+  } else {
+    const matches = await Brand.find({ name: new RegExp(`^${escapeRegExp(name)}$`, "i") }).select("_id name").limit(2);
+    if (matches.length > 1) {
+      const error = new Error("This brand name matches multiple managed brands. Select the intended brand by ID.");
+      error.statusCode = 400;
+      throw error;
+    }
+    brand = matches[0];
+  }
+  if (!brand) {
+    const error = new Error("Choose an existing managed brand or clear the brand field.");
+    error.statusCode = 400;
+    throw error;
+  }
+  return { brandId: brand._id, brand: brand.name };
+}
 
 function parseImageUrls(raw) {
   if (!raw) return [];
@@ -32,8 +89,150 @@ function parseImageUrls(raw) {
   return urls;
 }
 
+function isValidReorderLevel(value) {
+  return value !== null
+    && String(value).trim() !== ""
+    && Number.isInteger(Number(value))
+    && Number(value) >= 0
+    && Number(value) <= 1000000;
+}
+
+function addInventoryHistory(update, movements) {
+  if (!movements.length) return;
+  update.$push = {
+    ...(update.$push || {}),
+    inventoryHistory: { $each: movements, $slice: -INVENTORY_HISTORY_LIMIT },
+  };
+}
+
+function inventoryAtShop(product, shopId, variantId) {
+  const isPrimary = String(product.shop) === String(shopId);
+  const location = isPrimary
+    ? product
+    : (product.inventoryLocations || []).find((entry) => String(entry.shop?._id || entry.shop) === String(shopId));
+  if (!location) return null;
+  const variant = variantId
+    ? isPrimary
+      ? (product.variants || []).find((entry) => String(entry._id) === String(variantId))
+      : (location.variants || []).find((entry) => String(entry.variantId) === String(variantId))
+    : null;
+  return { isPrimary, location, variant, stock: variantId ? variant?.stock : location.stock };
+}
+
+function stockPath(shopId, product, variantId, locationFilterName, variantFilterName) {
+  const isPrimary = String(product.shop) === String(shopId);
+  if (isPrimary) return variantId ? `variants.$[${variantFilterName}].stock` : "stock";
+  return variantId
+    ? `inventoryLocations.$[${locationFilterName}].variants.$[${variantFilterName}].stock`
+    : `inventoryLocations.$[${locationFilterName}].stock`;
+}
+
+function stockLocationCondition(product, shopId, variantId, stockCondition, reservationFree = false) {
+  const isPrimary = String(product.shop) === String(shopId);
+  const reservationCondition = reservationFree
+    ? { stockReservations: { $not: { $elemMatch: { orderId: { $exists: true } } } } }
+    : {};
+  if (isPrimary && !variantId) {
+    return {
+      stock: stockCondition,
+      ...reservationCondition,
+    };
+  }
+  if (isPrimary) {
+    return {
+      variants: {
+        $elemMatch: {
+          _id: variantId,
+          stock: stockCondition,
+          ...reservationCondition,
+        },
+      },
+    };
+  }
+  return {
+    inventoryLocations: {
+      $elemMatch: {
+        shop: shopId,
+        ...(variantId
+          ? {
+              variants: {
+                $elemMatch: {
+                  variantId,
+                  stock: stockCondition,
+                  ...reservationCondition,
+                },
+              },
+            }
+          : {
+              stock: stockCondition,
+              ...reservationCondition,
+            }),
+      },
+    },
+  };
+}
+
+function stockArrayFilters(product, shopId, variantId, locationName, variantName) {
+  const filters = [];
+  if (String(product.shop) !== String(shopId)) filters.push({ [`${locationName}.shop`]: shopId });
+  if (variantId) filters.push({ [`${variantName}.${String(product.shop) === String(shopId) ? "_id" : "variantId"}`]: variantId });
+  return filters;
+}
+
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function catalogReviewFlags(product, duplicateSiblings = []) {
+  const status = productStatus(product);
+  const variants = product.variants || [];
+  const hasConfirmedStock = variants.length
+    ? variants.every((variant) => Number.isInteger(variant.stock))
+    : Number.isInteger(product.stock);
+  const hasAvailableStock = variants.length
+    ? variants.some((variant) => Number.isInteger(variant.stock) && variant.stock > 0)
+    : Number.isInteger(product.stock) && product.stock > 0;
+  return {
+    duplicateSiblings,
+    archiveReview: status === "draft"
+      ? "Draft is hidden from shoppers; publish or archive after review."
+      : status === "published" && hasConfirmedStock && !hasAvailableStock
+        ? "No sellable stock; restock or archive if discontinued."
+        : "",
+  };
+}
+
+async function findDuplicateProductIds(products) {
+  const candidates = products.filter((product) => String(product.name || "").trim() && product.shop);
+  if (!candidates.length) return new Map();
+  const matches = await Product.find({
+    $or: candidates.map((product) => ({
+      shop: product.shop?._id || product.shop,
+      name: new RegExp(`^${escapeRegExp(String(product.name).trim())}$`, "i"),
+      ...(String(product.brand || "").trim()
+        ? { brand: new RegExp(`^${escapeRegExp(String(product.brand).trim())}$`, "i") }
+        : { $or: [{ brand: { $exists: false } }, { brand: null }, { brand: "" }] }),
+    })),
+  }).select("_id name brand shop").lean();
+  const groups = new Map();
+  for (const product of matches) {
+    const key = [
+      String(product.shop || ""),
+      String(product.name || "").trim().replace(/\s+/g, " ").toLocaleLowerCase(),
+      String(product.brand || "").trim().toLocaleLowerCase(),
+    ].join(":");
+    groups.set(key, [...(groups.get(key) || []), product]);
+  }
+  const duplicates = new Map();
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    for (const product of group) {
+      duplicates.set(String(product._id), group
+        .filter((entry) => String(entry._id) !== String(product._id))
+        .map((entry) => ({ _id: entry._id, name: entry.name, brand: entry.brand || "" })));
+    }
+  }
+  return duplicates;
 }
 
 function mergeImportedVariants(existingVariants = [], importedVariants = []) {
@@ -54,6 +253,7 @@ function mergeImportedVariants(existingVariants = [], importedVariants = []) {
     const next = { ...old };
     for (const [key, value] of Object.entries(incoming)) {
       if (key === "stock" && (value === undefined || value === null)) continue;
+      if (key === "reorderLevel" && (value === undefined || value === null)) continue;
       if (value === undefined || value === "") continue;
       next[key] = value;
     }
@@ -86,7 +286,8 @@ router.get("/", async (req, res, next) => {
     const sort = queryText(req.query.sort, 20);
     const order = queryText(req.query.order, 10);
     const { search, page: pageNumber, limit: pageSize } = parseListQuery(req.query);
-    let availableShopIds = await Shop.find({ isActive: true }).distinct("_id");
+    const allActiveShopIds = await Shop.find({ isActive: true }).distinct("_id");
+    let availableShopIds = allActiveShopIds.slice();
     if (floor) {
       const floorDoc = /^[0-9a-fA-F]{24}$/.test(String(floor))
         ? await Floor.findById(floor).select("_id")
@@ -100,10 +301,15 @@ router.get("/", async (req, res, next) => {
       if (!/^[0-9a-fA-F]{24}$/.test(String(shop))) return res.status(400).json({ message: "Invalid shop ID" });
       availableShopIds = availableShopIds.filter((id) => String(id) === String(shop));
     }
+    const activeInventoryShopIds = floor || shop ? availableShopIds : allActiveShopIds;
 
     // Include legacy active products that predate the lifecycle status field,
     // but never expose drafts even if an old/manual write left isActive true.
-    const filter = { isActive: true, shop: { $in: availableShopIds }, $or: [{ status: "published" }, { status: { $exists: false } }] };
+    const filter = {
+      isActive: true,
+      $or: [{ status: "published" }, { status: { $exists: false } }],
+      $and: [{ $or: [{ shop: { $in: availableShopIds } }, { "inventoryLocations.shop": { $in: availableShopIds } }] }],
+    };
     if (purpose) filter.purposeTags = purpose;
     if (badge) filter.badge = badge;
     if (flashSale === "true") filter.isFlashSale = true;
@@ -127,6 +333,7 @@ router.get("/", async (req, res, next) => {
 
     const [products, total] = await Promise.all([
       Product.find(filter)
+        .select("+inventoryLocations")
         .populate({ path: "shop", select: "name shopNumber slug floor", populate: { path: "floor", select: "name floorNumber slug" } })
         .skip(skip)
         .limit(pageSize)
@@ -134,7 +341,7 @@ router.get("/", async (req, res, next) => {
       Product.countDocuments(filter),
     ]);
 
-    res.json({ products, total, page: pageNumber, pages: Math.ceil(total / pageSize) });
+    res.json({ products: products.map((product) => serializeAvailableInventory(product, activeInventoryShopIds)), total, page: pageNumber, pages: Math.ceil(total / pageSize) });
   } catch (err) {
     next(err);
   }
@@ -144,13 +351,375 @@ router.get("/", async (req, res, next) => {
 // deliberately remain published-only.
 router.get("/admin/list", protect, requireRole("admin"), async (req, res, next) => {
   try {
-    const { search, filter } = buildAdminProductQuery(req.query);
+    const { search, filter } = await buildAdminQuery(req.query);
     const { page: pageNumber, limit: pageSize } = parseListQuery(req.query);
     const [products, total] = await Promise.all([
-      Product.find(filter).populate({ path: "shop", select: "name shopNumber isActive floor", populate: { path: "floor", select: "name floorNumber isActive" } }).sort({ updatedAt: -1 }).skip((pageNumber - 1) * pageSize).limit(pageSize),
+      Product.find(filter).select("+inventoryLocations").populate({ path: "shop", select: "name shopNumber isActive floor", populate: { path: "floor", select: "name floorNumber isActive" } }).populate({ path: "inventoryLocations.shop", select: "name shopNumber isActive floor" }).sort({ updatedAt: -1 }).skip((pageNumber - 1) * pageSize).limit(pageSize),
       Product.countDocuments(filter),
     ]);
-    res.json({ products: products.map((product) => ({ ...product.toJSON(), status: productStatus(product), publishIssues: validatePublishable(product) })), total, page: pageNumber, pages: Math.ceil(total / pageSize) });
+    const duplicateIds = await findDuplicateProductIds(products);
+    res.json({ products: products.map((product) => {
+      const duplicateSiblings = duplicateIds.get(String(product._id)) || [];
+      const inventoryLocations = (product.inventoryLocations || []).map((location) => ({
+        shop: location.shop,
+        stock: location.stock,
+        variants: (location.variants || []).map((variant) => ({ variantId: variant.variantId, stock: variant.stock })),
+      }));
+      return {
+        ...product.toJSON(),
+        inventoryLocations,
+        status: productStatus(product),
+        publishIssues: validatePublishable(product),
+        catalogReview: catalogReviewFlags(product, duplicateSiblings),
+      };
+    }), total, page: pageNumber, pages: Math.ceil(total / pageSize) });
+  } catch (err) { next(err); }
+});
+
+router.post("/admin/:id/restock", protect, requireRole("admin"), async (req, res, next) => {
+  try {
+    if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+      return res.status(400).json({ message: "Enter the restock details." });
+    }
+    const { variantId = "", shopId = "", quantity, reason } = req.body;
+    const note = typeof reason === "string" ? reason.trim() : "";
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 1000000) {
+      return res.status(400).json({ message: "Enter a whole-number quantity from 1 to 1,000,000." });
+    }
+    if (note.length < 5 || note.length > 500) {
+      return res.status(400).json({ message: "Enter a restock reason between 5 and 500 characters." });
+    }
+    if (variantId && !/^[0-9a-f]{24}$/i.test(String(variantId))) {
+      return res.status(400).json({ message: "Choose a valid product option." });
+    }
+    if (shopId && !/^[0-9a-f]{24}$/i.test(String(shopId))) return res.status(400).json({ message: "Choose a valid shop." });
+
+    let product = await Product.findById(req.params.id).select("name shop stock variants._id variants.name variants.stock +inventoryLocations");
+    if (!product) return res.status(404).json({ message: "Product not found." });
+    const variant = variantId ? product.variants.id(variantId) : null;
+    if (variantId && !variant) return res.status(404).json({ message: "Product option not found." });
+    const targetShopId = shopId || String(product.shop);
+    if (!await Shop.exists({ _id: targetShopId, isActive: true })) return res.status(400).json({ message: "Choose an active shop to receive this stock." });
+    if (product.variants.length && !variant) return res.status(400).json({ message: "Choose a product option before recording a restock." });
+    if (String(product.shop) !== String(targetShopId) && !product.inventoryLocations.some((location) => String(location.shop) === String(targetShopId))) {
+      const location = product.variants.length
+        ? {
+            shop: targetShopId,
+            variants: product.variants.map((entry) => ({
+              variantId: entry._id,
+              ...(String(entry._id) === String(variantId) ? { stock: 0 } : {}),
+            })),
+          }
+        : { shop: targetShopId, stock: 0 };
+      await Product.updateOne(
+        { _id: product._id, inventoryLocations: { $not: { $elemMatch: { shop: targetShopId } } } },
+        { $push: { inventoryLocations: location } },
+        { runValidators: true }
+      );
+      product = await Product.findById(req.params.id).select("name shop stock variants._id variants.name variants.stock +inventoryLocations");
+      if (!product) return res.status(404).json({ message: "Product not found." });
+    }
+    const current = inventoryAtShop(product, targetShopId, variantId);
+    const currentStock = current?.stock;
+    if (!Number.isInteger(currentStock)) {
+      return res.status(409).json({ message: "Confirm the current stock quantity at this shop before recording a restock." });
+    }
+    if (!Number.isSafeInteger(currentStock + quantity)) {
+      return res.status(400).json({ message: "The restock quantity is too large for the current inventory count." });
+    }
+
+    const movement = createDeltaMovement("restock", quantity, {
+      variantId: variant?._id || null,
+      variantName: variant?.name || "",
+      shopId: targetShopId,
+      source: "admin-restock",
+      reason: note,
+    });
+    const update = {
+      $inc: { [stockPath(targetShopId, product, variant?._id, "restockLocation", "restockVariant")]: quantity },
+      $push: { inventoryHistory: { $each: [movement], $slice: -INVENTORY_HISTORY_LIMIT } },
+    };
+    const filter = {
+      $and: [
+        { _id: product._id },
+        stockLocationCondition(product, targetShopId, variant?._id, { $type: "number", $mod: [1, 0], $lte: Number.MAX_SAFE_INTEGER - quantity }),
+      ],
+    };
+    const arrayFilters = stockArrayFilters(product, targetShopId, variant?._id, "restockLocation", "restockVariant");
+    const updated = await Product.findOneAndUpdate(filter, update, {
+      new: true,
+      runValidators: true,
+      ...(arrayFilters.length ? { arrayFilters } : {}),
+    });
+    if (!updated) return res.status(409).json({ message: "Stock changed while recording the restock. Refresh and try again." });
+    res.json({ product: updated, movement });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/admin/:id/stock-count", protect, requireRole("admin"), async (req, res, next) => {
+  try {
+    const { shopId, variantId = "", expectedStock, countedStock, operationId, reason } = req.body || {};
+    if (!/^[0-9a-f]{24}$/i.test(String(req.params.id)) || !/^[0-9a-f]{24}$/i.test(String(shopId || ""))) {
+      return res.status(400).json({ message: "Choose a valid product and shop." });
+    }
+    if (variantId && !/^[0-9a-f]{24}$/i.test(String(variantId))) return res.status(400).json({ message: "Choose a valid product option." });
+    const hasConfirmedExpectedStock = Number.isSafeInteger(expectedStock) && expectedStock >= 0 && expectedStock <= 1000000;
+    if ((expectedStock !== null && !hasConfirmedExpectedStock)
+      || !Number.isSafeInteger(countedStock) || countedStock < 0 || countedStock > 1000000) {
+      return res.status(400).json({ message: "Expected and counted stock must be whole numbers from 0 to 1,000,000." });
+    }
+    if (!/^[\w-]{16,80}$/.test(String(operationId || ""))) return res.status(400).json({ message: "A valid stock-count idempotency key is required." });
+    const note = typeof reason === "string" ? reason.trim() : "";
+    if (note.length < 5 || note.length > 500) return res.status(400).json({ message: "Enter a stock-count reason between 5 and 500 characters." });
+    if (!await Shop.exists({ _id: shopId })) return res.status(400).json({ message: "Choose an existing shop." });
+
+    const operation = {
+      productId: req.params.id,
+      operationId,
+      type: "stock_count",
+      shopId,
+      variantId: variantId || null,
+      expectedStock: hasConfirmedExpectedStock ? expectedStock : null,
+      countedStock,
+      reason: note,
+    };
+    const outcome = await runInventoryOperation(operation, async (session) => {
+      const product = await Product.findById(req.params.id)
+        .select("shop stock stockReservations variants._id variants.name variants.stock variants.stockReservations +inventoryLocations +inventoryHistory")
+        .session(session);
+      if (!product) {
+        const error = new Error("Product not found.");
+        error.statusCode = 404;
+        throw error;
+      }
+      if (variantId && !product.variants.some((variant) => String(variant._id) === String(variantId))) {
+        const error = new Error("Product option not found.");
+        error.statusCode = 404;
+        throw error;
+      }
+      if (!variantId && product.variants.length) {
+        const error = new Error("Choose a product option before counting stock.");
+        error.statusCode = 400;
+        throw error;
+      }
+      const priorCount = product.inventoryHistory.find((entry) => entry.operationId === operationId);
+      if (priorCount) {
+        if (String(priorCount.shopId) !== String(shopId)
+          || String(priorCount.variantId || "") !== String(variantId || "")
+          || priorCount.previousStock !== operation.expectedStock
+          || priorCount.stock !== countedStock) {
+          throw createOperationConflict("This stock-count key was already used for a different count.");
+        }
+        return { message: "This stock count was already recorded.", stock: priorCount.stock };
+      }
+
+      const current = inventoryAtShop(product, shopId, variantId);
+      if (!current) {
+        const error = new Error("This product has no inventory location at the selected shop. Transfer stock there first.");
+        error.statusCode = 404;
+        throw error;
+      }
+      if (operation.expectedStock === null ? Number.isInteger(current.stock) : current.stock !== operation.expectedStock) {
+        throw createOperationConflict("Stock changed after the count was started. Refresh and count again.");
+      }
+      const reservations = variantId ? current.variant?.stockReservations : current.location.stockReservations;
+      if (reservations?.length) {
+        throw createOperationConflict("Complete or release active orders for this shop before reconciling its stock count.");
+      }
+
+      const movement = createInventoryMovement("stock_count", operation.expectedStock, countedStock, {
+        variantId: variantId || null,
+        variantName: variantId ? current.variant.name : "",
+        shopId,
+        operationId,
+        source: "admin-stock-count",
+        reason: note,
+      });
+      const filter = {
+        $and: [
+          { _id: product._id },
+          stockLocationCondition(product, shopId, variantId, operation.expectedStock === null ? { $in: [null] } : { $eq: operation.expectedStock }, true),
+        ],
+      };
+      const update = {
+        $set: { [stockPath(shopId, product, variantId, "countLocation", "countVariant")]: countedStock },
+        $push: { inventoryHistory: { $each: [movement], $slice: -INVENTORY_HISTORY_LIMIT } },
+      };
+      const arrayFilters = stockArrayFilters(product, shopId, variantId, "countLocation", "countVariant");
+      const result = await Product.updateOne(filter, update, {
+        session,
+        ...(arrayFilters.length ? { arrayFilters } : {}),
+        runValidators: true,
+      });
+      if (!result.modifiedCount) {
+        throw createOperationConflict("Stock changed or an order reserved it while recording the count. Refresh and try again.");
+      }
+      return { message: "Stock count recorded.", stock: countedStock, movement };
+    });
+    res.status(outcome.statusCode).json(outcome.body);
+  } catch (error) { next(error); }
+});
+
+router.post("/admin/:id/stock-transfer", protect, requireRole("admin"), async (req, res, next) => {
+  try {
+    const { fromShopId, toShopId, variantId = "", quantity, transferId, reason } = req.body || {};
+    if (!/^[0-9a-f]{24}$/i.test(String(req.params.id))
+      || !/^[0-9a-f]{24}$/i.test(String(fromShopId || ""))
+      || !/^[0-9a-f]{24}$/i.test(String(toShopId || ""))) {
+      return res.status(400).json({ message: "Choose a valid product, source shop, and destination shop." });
+    }
+    if (String(fromShopId) === String(toShopId)) return res.status(400).json({ message: "Choose two different shops for a stock transfer." });
+    if (variantId && !/^[0-9a-f]{24}$/i.test(String(variantId))) return res.status(400).json({ message: "Choose a valid product option." });
+    if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 1000000) return res.status(400).json({ message: "Transfer quantity must be a whole number from 1 to 1,000,000." });
+    if (!/^[\w-]{16,80}$/.test(String(transferId || ""))) return res.status(400).json({ message: "A valid transfer idempotency key is required." });
+    const note = typeof reason === "string" ? reason.trim() : "";
+    if (note.length < 5 || note.length > 500) return res.status(400).json({ message: "Enter a transfer reason between 5 and 500 characters." });
+    const [sourceExists, destinationIsActive] = await Promise.all([
+      Shop.exists({ _id: fromShopId }),
+      Shop.exists({ _id: toShopId, isActive: true }),
+    ]);
+    if (!sourceExists || !destinationIsActive) return res.status(400).json({ message: "Choose an existing source shop and an active destination shop." });
+
+    const operation = {
+      productId: req.params.id,
+      operationId: transferId,
+      type: "stock_transfer",
+      fromShopId,
+      toShopId,
+      variantId: variantId || null,
+      quantity,
+      reason: note,
+    };
+    const outcome = await runInventoryOperation(operation, async (session) => {
+      let product = await Product.findById(req.params.id)
+        .select("shop stock stockReservations variants._id variants.name variants.stock variants.stockReservations +inventoryLocations +inventoryHistory")
+        .session(session);
+      if (!product) {
+        const error = new Error("Product not found.");
+        error.statusCode = 404;
+        throw error;
+      }
+      if (variantId && !product.variants.some((variant) => String(variant._id) === String(variantId))) {
+        const error = new Error("Product option not found.");
+        error.statusCode = 404;
+        throw error;
+      }
+      if (!variantId && product.variants.length) {
+        const error = new Error("Choose a product option before transferring stock.");
+        error.statusCode = 400;
+        throw error;
+      }
+
+      const priorTransfer = product.inventoryHistory.filter((entry) => entry.transferId === transferId);
+      if (priorTransfer.length) {
+        const alreadyApplied = priorTransfer.some((entry) => entry.type === "transfer_out"
+          && String(entry.shopId) === String(fromShopId)
+          && String(entry.variantId || "") === String(variantId || "")
+          && entry.delta === -quantity
+          && priorTransfer.some((incoming) => incoming.type === "transfer_in"
+            && String(incoming.shopId) === String(toShopId)
+            && String(incoming.variantId || "") === String(variantId || "")
+            && incoming.delta === quantity));
+        if (!alreadyApplied) throw createOperationConflict("This transfer key was already used for a different transfer.");
+        return { message: "This stock transfer was already recorded.", transferId };
+      }
+
+      const initialSource = inventoryAtShop(product, fromShopId, variantId);
+      if (!initialSource) {
+        const error = new Error("The product has no inventory at the source shop.");
+        error.statusCode = 404;
+        throw error;
+      }
+      if (!Number.isInteger(initialSource.stock) || initialSource.stock < quantity) {
+        throw createOperationConflict("The source shop does not have enough confirmed stock for this transfer.");
+      }
+
+      if (String(product.shop) !== String(toShopId) && !product.inventoryLocations.some((location) => String(location.shop) === String(toShopId))) {
+        const newLocation = product.variants.length
+          ? {
+              shop: toShopId,
+              variants: product.variants.map((variant) => ({
+                variantId: variant._id,
+                ...(String(variant._id) === String(variantId) ? { stock: 0 } : {}),
+              })),
+            }
+          : { shop: toShopId, stock: 0 };
+        await Product.updateOne(
+          { _id: product._id, inventoryLocations: { $not: { $elemMatch: { shop: toShopId } } } },
+          { $push: { inventoryLocations: newLocation } },
+          { session, runValidators: true }
+        );
+        product = await Product.findById(req.params.id)
+          .select("shop stock stockReservations variants._id variants.name variants.stock variants.stockReservations +inventoryLocations +inventoryHistory")
+          .session(session);
+      }
+
+      if (!product) {
+        const error = new Error("Product not found.");
+        error.statusCode = 404;
+        throw error;
+      }
+      const source = inventoryAtShop(product, fromShopId, variantId);
+      const destination = inventoryAtShop(product, toShopId, variantId);
+      if (!source || !destination) throw createOperationConflict("The source or destination inventory location changed. Refresh and try again.");
+      if (!Number.isInteger(source.stock) || source.stock < quantity) {
+        throw createOperationConflict("The source shop does not have enough confirmed stock for this transfer.");
+      }
+      if (!Number.isInteger(destination.stock) || !Number.isSafeInteger(destination.stock + quantity)) {
+        throw createOperationConflict("Confirm destination stock before transferring inventory there.");
+      }
+
+      const variantName = variantId ? source.variant.name : "";
+      const movementDetails = {
+        variantId: variantId || null,
+        variantName,
+        transferId,
+        reason: note,
+        source: "admin-stock-transfer",
+      };
+      const movements = [
+        createDeltaMovement("transfer_out", -quantity, { ...movementDetails, shopId: fromShopId }),
+        createDeltaMovement("transfer_in", quantity, { ...movementDetails, shopId: toShopId }),
+      ];
+      const filter = {
+        $and: [
+          { _id: product._id },
+          stockLocationCondition(product, fromShopId, variantId, { $type: "number", $mod: [1, 0], $gte: quantity }),
+          stockLocationCondition(product, toShopId, variantId, { $type: "number", $mod: [1, 0], $lte: Number.MAX_SAFE_INTEGER - quantity }),
+        ],
+      };
+      const update = {
+        $inc: {
+          [stockPath(fromShopId, product, variantId, "sourceLocation", "sourceVariant")]: -quantity,
+          [stockPath(toShopId, product, variantId, "destinationLocation", "destinationVariant")]: quantity,
+        },
+        $push: { inventoryHistory: { $each: movements, $slice: -INVENTORY_HISTORY_LIMIT } },
+      };
+      const arrayFilters = [
+        ...stockArrayFilters(product, fromShopId, variantId, "sourceLocation", "sourceVariant"),
+        ...stockArrayFilters(product, toShopId, variantId, "destinationLocation", "destinationVariant"),
+      ];
+      const result = await Product.updateOne(filter, update, { session, arrayFilters, runValidators: true });
+      if (!result.modifiedCount) {
+        throw createOperationConflict("Shop stock changed while the transfer was being recorded. Refresh and try again.");
+      }
+      return { message: "Stock transferred.", transferId, movements };
+    });
+    res.status(outcome.statusCode).json(outcome.body);
+  } catch (error) { next(error); }
+});
+
+router.get("/admin/:id/inventory-history", protect, requireRole("admin"), async (req, res, next) => {
+  try {
+    const product = await Product.findById(req.params.id)
+      .select("name +inventoryHistory")
+      .populate("inventoryHistory.shopId", "name shopNumber")
+      .lean();
+    if (!product) return res.status(404).json({ message: "Product not found" });
+    const entries = (product.inventoryHistory || []).slice().sort((left, right) => new Date(right.changedAt) - new Date(left.changedAt));
+    res.json({ product: { _id: product._id, name: product.name }, entries });
   } catch (err) { next(err); }
 });
 
@@ -172,7 +741,7 @@ router.post("/admin/archive-matching", protect, requireRole("admin"), async (req
     if (!isValidExpectedProductCount(expectedCount)) {
       return res.status(400).json({ message: "A positive matching product count is required to confirm this archive." });
     }
-    const { filter } = buildAdminProductQuery(req.body);
+    const { filter } = await buildAdminQuery(req.body);
     const matchingCount = await Product.countDocuments(filter);
     if (!matchesExpectedProductCount(expectedCount, matchingCount)) {
       return res.status(409).json({
@@ -200,13 +769,15 @@ router.get("/export", protect, requireRole("admin"), async (req, res, next) => {
       { label: "Short Description", value: "description" },
       { label: "Long Description", value: "longDescription" },
       { label: "Brand", value: "brand" },
+      { label: "Brand ID", value: "brandId" },
       { label: "Category", value: "category" },
       { label: "Subcategory", value: "subcategory" },
       { label: "Price", value: "price" },
       { label: "Compare At Price", value: "compareAtPrice" },
       { label: "Stock", value: "stock" },
+      { label: "Reorder Level", value: (product) => product.reorderLevel ?? 5 },
       { label: "Status", value: (p) => productStatus(p) },
-      { label: "Variants", value: (p) => JSON.stringify((p.variants || []).map((variant) => ({ name: variant.name, sku: variant.sku, price: variant.price, compareAtPrice: variant.compareAtPrice, stock: variant.stock, image: variant.image }))) },
+      { label: "Variants", value: (p) => JSON.stringify((p.variants || []).map((variant) => ({ name: variant.name, sku: variant.sku, price: variant.price, compareAtPrice: variant.compareAtPrice, stock: variant.stock, reorderLevel: variant.reorderLevel ?? 5, image: variant.image }))) },
       { label: "Badge", value: "badge" },
       { label: "Return Eligibility", value: (p) => p.returnEligibility || "standard" },
       { label: "Shop", value: (p) => p.shop ? `#${p.shop.shopNumber} ${p.shop.name}` : "" },
@@ -228,14 +799,14 @@ router.get("/:slug", async (req, res, next) => {
       slug: req.params.slug,
       isActive: true,
       $or: [{ status: "published" }, { status: { $exists: false } }],
-    }).populate({
+    }).select("+inventoryLocations").populate({
       path: "shop",
-      match: { isActive: true },
       select: "name shopNumber slug floor",
       populate: { path: "floor", select: "name floorNumber slug" },
     });
     if (!product || !product.shop) return res.status(404).json({ message: "Product not found" });
-    res.json(product);
+    const activeShopIds = await Shop.find({ isActive: true }).distinct("_id");
+    res.json(serializeAvailableInventory(product, activeShopIds));
   } catch (err) {
     next(err);
   }
@@ -246,10 +817,17 @@ router.post("/", protect, requireRole("admin"), async (req, res, next) => {
     const body = req.body || {};
     const createFields = new Set([
       "name", "sku", "description", "longDescription", "price", "compareAtPrice", "images", "imageUrls", "shop",
-      "floorId", "categoryId", "subcategoryId", "category", "subcategory", "brand", "returnEligibility", "stock", "badge", "isFlashSale",
+      "floorId", "categoryId", "subcategoryId", "category", "subcategory", "brandId", "brand", "returnEligibility", "stock", "reorderLevel", "badge", "isFlashSale",
       "purposeTags", "variants", "flashSaleEndsAt", "status", "publish",
     ]);
     const safeBody = Object.fromEntries(Object.entries(body).filter(([key]) => createFields.has(key)));
+    if (safeBody.reorderLevel !== undefined && !isValidReorderLevel(safeBody.reorderLevel)) {
+      return res.status(400).json({ message: "Reorder level must be a whole number from 0 to 1,000,000." });
+    }
+    if (Array.isArray(safeBody.variants) && safeBody.variants.some((variant) => variant.reorderLevel !== undefined && !isValidReorderLevel(variant.reorderLevel))) {
+      return res.status(400).json({ message: "Each option's reorder level must be a whole number from 0 to 1,000,000." });
+    }
+    Object.assign(safeBody, await resolveProductBrand(safeBody.brandId, safeBody.brand));
     const images = parseImageUrls(safeBody.images || safeBody.imageUrls);
     delete safeBody.stockReservations;
     delete safeBody.skuCodes;
@@ -297,6 +875,7 @@ router.post("/", protect, requireRole("admin"), async (req, res, next) => {
       const issues = validatePublishable(candidate);
       if (issues.length) return res.status(400).json({ message: "This product cannot be published yet", issues });
     }
+    candidate.inventoryHistory = createInitialInventoryHistory(candidate, "initial", "manual-entry");
     const product = await Product.create(candidate);
     res.status(201).json(product);
   } catch (err) {
@@ -312,32 +891,57 @@ router.put("/:id", protect, requireRole("admin"), async (req, res, next) => {
     }
     const editableFields = new Set([
       "name", "sku", "description", "longDescription", "price", "compareAtPrice", "images", "imageUrls", "shop",
-      "floorId", "categoryId", "subcategoryId", "category", "subcategory", "brand", "returnEligibility", "stock", "badge", "isFlashSale",
+      "floorId", "categoryId", "subcategoryId", "category", "subcategory", "brandId", "brand", "returnEligibility", "stock", "reorderLevel", "badge", "isFlashSale",
       "purposeTags", "variants", "flashSaleEndsAt", "status", "isActive", "publish",
     ]);
     const updates = Object.fromEntries(Object.entries(req.body).filter(([key]) => editableFields.has(key)));
+    if (updates.reorderLevel !== undefined && !isValidReorderLevel(updates.reorderLevel)) {
+      return res.status(400).json({ message: "Reorder level must be a whole number from 0 to 1,000,000." });
+    }
+    if (Array.isArray(updates.variants) && updates.variants.some((variant) => variant.reorderLevel !== undefined && !isValidReorderLevel(variant.reorderLevel))) {
+      return res.status(400).json({ message: "Each option's reorder level must be a whole number from 0 to 1,000,000." });
+    }
     const submittedFloorId = String(updates.floorId || "").trim();
     delete updates.floorId;
     if (req.body.images !== undefined || req.body.imageUrls !== undefined) {
       updates.images = parseImageUrls(req.body.images || req.body.imageUrls);
     }
     if (Array.isArray(updates.variants)) {
-      const current = await Product.findById(req.params.id).select("variants._id variants.stockReservations");
+      const current = await Product.findById(req.params.id).select("variants._id variants.stockReservations +inventoryLocations");
       if (!current) return res.status(404).json({ message: "Product not found" });
       const variants = updates.variants.map((variant) => {
         const cleanVariant = { ...variant };
+        if (!cleanVariant._id) cleanVariant._id = new mongoose.Types.ObjectId();
         delete cleanVariant.stockReservations;
         cleanVariant.sku = String(cleanVariant.sku || "").trim().toUpperCase();
         return cleanVariant;
       });
       for (const currentVariant of current.variants) {
         const activeReservations = currentVariant.stockReservations || [];
-        if (!activeReservations.length) continue;
         const nextVariant = variants.find((variant) => String(variant._id || "") === String(currentVariant._id));
-        if (!nextVariant) return res.status(409).json({ message: "This product option has an active order reservation and cannot be removed yet" });
+        const locationInventory = (current.inventoryLocations || []).some((location) => {
+          const locationVariant = (location.variants || []).find((entry) => String(entry.variantId) === String(currentVariant._id));
+          return locationVariant && (
+            (locationVariant.stockReservations || []).length
+            ||             (locationVariant.stock !== 0)
+          );
+        });
+        if (!activeReservations.length && !locationInventory) continue;
+        if (!nextVariant) return res.status(409).json({ message: "This product option still has inventory or an active order reservation at a shop and cannot be removed yet." });
         nextVariant.stockReservations = activeReservations;
       }
       updates.variants = variants;
+      if (current.inventoryLocations?.length) {
+        updates.inventoryLocations = current.inventoryLocations.map((location) => {
+          const locationObject = location.toObject();
+          const currentVariants = new Map((location.variants || []).map((variant) => [String(variant.variantId), variant]));
+          locationObject.variants = variants.map((variant) => {
+            const existing = currentVariants.get(String(variant._id));
+            return existing ? existing.toObject() : { variantId: variant._id };
+          });
+          return locationObject;
+        });
+      }
     }
     if (updates.sku !== undefined) updates.sku = String(updates.sku || "").trim().toUpperCase();
     if (updates.status === "published" || updates.publish === true || (updates.isActive === true && updates.status === undefined)) {
@@ -350,10 +954,27 @@ router.put("/:id", protect, requireRole("admin"), async (req, res, next) => {
     delete updates.skuCodes;
     delete updates.publish;
     delete updates.imageUrls;
-    const currentProduct = await Product.findById(req.params.id);
+    const currentProduct = await Product.findById(req.params.id).select("+inventoryLocations");
     if (!currentProduct) return res.status(404).json({ message: "Product not found" });
     if (currentProduct.updatedAt?.getTime() !== expectedUpdatedAt.getTime()) {
       return res.status(409).json({ message: "This product changed after you opened it. Refresh the product, review the latest details, and apply your changes again." });
+    }
+    if (updates.shop && String(updates.shop) !== String(currentProduct.shop)) {
+      const inventoryLocations = currentProduct.inventoryLocations || [];
+      const hasInventory = !Number.isInteger(currentProduct.stock)
+        || currentProduct.stock !== 0
+        || (currentProduct.variants || []).some((variant) => !Number.isInteger(variant.stock) || variant.stock !== 0)
+        || inventoryLocations.some((location) => !Number.isInteger(location.stock)
+          || location.stock !== 0
+          || (location.variants || []).some((variant) => !Number.isInteger(variant.stock) || variant.stock !== 0));
+      const hasReservations = (currentProduct.stockReservations || []).length
+        || (currentProduct.variants || []).some((variant) => (variant.stockReservations || []).length)
+        || inventoryLocations.some((location) => (location.stockReservations || []).length
+          || (location.variants || []).some((variant) => (variant.stockReservations || []).length));
+      if (hasInventory || hasReservations) {
+        return res.status(409).json({ message: "Move or reconcile this product's inventory before changing its catalog shop." });
+      }
+      updates.inventoryLocations = [];
     }
     if (updates.shop && !await Shop.exists({ _id: updates.shop })) {
       return res.status(400).json({ message: "Choose an existing shop for this product." });
@@ -370,15 +991,26 @@ router.put("/:id", protect, requireRole("admin"), async (req, res, next) => {
     }
     if (Array.isArray(updates.variants)) {
       for (const currentVariant of currentProduct.variants || []) {
-        if (!(currentVariant.stockReservations || []).length) continue;
+        const hasPrimaryReservations = (currentVariant.stockReservations || []).length > 0;
+        const locationInventory = (currentProduct.inventoryLocations || []).some((location) => {
+          const locationVariant = (location.variants || []).find((entry) => String(entry.variantId) === String(currentVariant._id));
+          return locationVariant && (
+            (locationVariant.stockReservations || []).length
+            || (locationVariant.stock !== undefined && locationVariant.stock !== 0)
+          );
+        });
         const nextVariant = updates.variants.find((variant) => String(variant._id || "") === String(currentVariant._id));
-        if (!nextVariant) return res.status(409).json({ message: `Option "${currentVariant.name}" has an active order reservation and cannot be removed yet.` });
-        if (nextVariant.stock === undefined || nextVariant.stock === null || Number(nextVariant.stock) !== Number(currentVariant.stock)) {
+        if (!hasPrimaryReservations && !locationInventory) continue;
+        if (!nextVariant) return res.status(409).json({ message: `Option "${currentVariant.name}" still has inventory or an active order reservation at a shop and cannot be removed yet.` });
+        if (hasPrimaryReservations && (nextVariant.stock === undefined || nextVariant.stock === null || Number(nextVariant.stock) !== Number(currentVariant.stock))) {
           return res.status(409).json({ message: `Stock for option "${currentVariant.name}" cannot be changed while it has active order reservations.` });
         }
       }
     }
     const candidate = { ...currentProduct.toObject(), ...updates };
+    if (Object.prototype.hasOwnProperty.call(updates, "brandId") || Object.prototype.hasOwnProperty.call(updates, "brand")) {
+      Object.assign(candidate, await resolveProductBrand(candidate.brandId, candidate.brand));
+    }
     if (updates.variants) candidate.variants = updates.variants;
     if (updates.images) candidate.images = updates.images;
     if (submittedFloorId) {
@@ -425,6 +1057,11 @@ router.put("/:id", protect, requireRole("admin"), async (req, res, next) => {
       .map((sku) => String(sku || "").trim().toUpperCase()).filter(Boolean);
     if (nextSkuCodes.length) updates.skuCodes = nextSkuCodes;
     else { delete updates.skuCodes; updates.$unset = { ...(updates.$unset || {}), skuCodes: 1 }; }
+    const updateOperations = {};
+    const setFields = Object.fromEntries(Object.entries(updates).filter(([key]) => !key.startsWith("$")));
+    if (Object.keys(setFields).length) updateOperations.$set = setFields;
+    if (updates.$unset) updateOperations.$unset = updates.$unset;
+    addInventoryHistory(updateOperations, createInventoryChanges(currentProduct, candidate, "admin_adjustment", "product-editor"));
     const productWriteFilter = { _id: req.params.id, updatedAt: currentProduct.updatedAt };
     const stockWriteGuarded = updates.stock !== undefined;
     const variantsWriteGuarded = Array.isArray(updates.variants);
@@ -434,7 +1071,7 @@ router.put("/:id", protect, requireRole("admin"), async (req, res, next) => {
     if (variantsWriteGuarded) {
       productWriteFilter["variants.stockReservations"] = { $not: { $elemMatch: { orderId: { $exists: true } } } };
     }
-    const product = await Product.findOneAndUpdate(productWriteFilter, updates, { new: true, runValidators: true });
+    const product = await Product.findOneAndUpdate(productWriteFilter, updateOperations, { new: true, runValidators: true });
     if (!product) {
       return res.status(409).json({ message: stockWriteGuarded || variantsWriteGuarded
         ? "The product changed or an order reserved its stock while you were editing. No changes were saved; refresh and try again."
@@ -464,9 +1101,16 @@ router.patch("/:id/restore", protect, requireRole("admin"), async (req, res, nex
 
 router.delete("/:id", protect, requireRole("admin"), async (req, res, next) => {
   try {
-    const target = await Product.findById(req.params.id).select("status isActive");
+    const target = await Product.findById(req.params.id).select("status isActive stock variants.stock +inventoryLocations");
     if (!target) return res.status(404).json({ message: "Product not found" });
     if (productStatus(target) !== "archived") return res.status(409).json({ message: "Archive this product before permanently deleting it." });
+    const hasStock = !Number.isInteger(target.stock)
+      || target.stock !== 0
+      || (target.variants || []).some((variant) => !Number.isInteger(variant.stock) || variant.stock !== 0)
+      || (target.inventoryLocations || []).some((location) => !Number.isInteger(location.stock)
+        || location.stock !== 0
+        || (location.variants || []).some((variant) => !Number.isInteger(variant.stock) || variant.stock !== 0));
+    if (hasStock) return res.status(409).json({ message: "Reconcile all shop inventory before permanently deleting this product. Archive it instead." });
     const orderHistory = await require("../models/Order").exists({ "items.product": req.params.id });
     if (orderHistory) return res.status(409).json({ message: "This product has order history and cannot be permanently deleted. Archive it instead." });
     const product = await Product.findOneAndDelete({
@@ -635,6 +1279,8 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
     const skuPlanIssue = validatePlannedSkuUniqueness(plan);
     if (skuPlanIssue) return res.status(400).json({ message: skuPlanIssue });
     const mapped = new Map(mappedEntries.map((entry) => [entry.index, entry]));
+    const managedBrands = await Brand.find().select("_id name").lean();
+    const brandsById = new Map(managedBrands.map((brand) => [String(brand._id), brand]));
     const results = [];
     for (const decision of plan) {
       if (decision.action === "skip") { results.push({ index: decision.index, status: "skipped" }); continue; }
@@ -644,6 +1290,20 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
         const reviewed = normalizeReviewedProduct(decision.product);
         if (reviewed.issues.length) throw Object.assign(new Error("Reviewed product details are invalid."), { statusCode: 400, issues: reviewed.issues });
         const imported = { ...reviewed.product, variants: reviewed.product.variants || [] };
+        if (imported.reorderLevel === null) delete imported.reorderLevel;
+        imported.variants = imported.variants.map((variant) => {
+          if (variant.reorderLevel === null) delete variant.reorderLevel;
+          return variant;
+        });
+        const selectedBrand = imported.brandId ? brandsById.get(String(imported.brandId)) : null;
+        if (imported.brandId && !selectedBrand) {
+          throw Object.assign(new Error("Choose an existing managed brand."), { statusCode: 400 });
+        }
+        if (imported.brand && !selectedBrand) {
+          throw Object.assign(new Error("Map the CSV brand to a managed brand or clear it before importing."), { statusCode: 400 });
+        }
+        imported.brandId = selectedBrand?._id || null;
+        imported.brand = selectedBrand?.name || "";
         if (!decision.floorId || !await Floor.exists({ _id: decision.floorId, isActive: true })) {
           throw Object.assign(new Error("Choose a valid active floor."), { statusCode: 400 });
         }
@@ -667,7 +1327,7 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
         }
         if (decision.action === "overwrite") {
           if (!decision.productId) throw Object.assign(new Error("Choose which existing product to overwrite."), { statusCode: 400 });
-          const existing = await Product.findById(decision.productId);
+          const existing = await Product.findById(decision.productId).select("+inventoryLocations");
           if (!existing) throw Object.assign(new Error("The selected matching product no longer exists."), { statusCode: 409 });
           const skuRegexes = [entry.product.sku, ...(entry.product.variants || []).map((variant) => variant.sku)].filter(Boolean)
             .map((sku) => new RegExp(`^${escapeRegExp(sku)}$`, "i"));
@@ -681,12 +1341,36 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
           if (!await Product.exists({ _id: existing._id, ...matchingQuery })) throw Object.assign(new Error("The selected product no longer matches this import row."), { statusCode: 409 });
           // Preserve existing values when the CSV leaves a field blank.
           const merged = existing.toObject();
-          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brand", "categoryId", "subcategoryId", "category", "subcategory", "shop", "returnEligibility", "badge", "isFlashSale", "purposeTags", "flashSaleEndsAt", "variants"]) {
+          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brandId", "brand", "categoryId", "subcategoryId", "category", "subcategory", "shop", "returnEligibility", "badge", "isFlashSale", "purposeTags", "flashSaleEndsAt", "reorderLevel", "variants"]) {
             const value = imported[key];
             if (key === "variants") {
               merged.variants = mergeImportedVariants(existing.variants || [], imported.variants || []);
+              merged.variants.forEach((variant) => {
+                if (!variant._id) variant._id = new mongoose.Types.ObjectId();
+              });
+              const removedStockedVariant = (existing.inventoryLocations || []).some((location) =>
+                (location.variants || []).some((locationVariant) =>
+                  (locationVariant.stock !== 0 || (locationVariant.stockReservations || []).length > 0)
+                  && !merged.variants.some((variant) => String(variant._id || "") === String(locationVariant.variantId))
+                )
+              );
+              if (removedStockedVariant) {
+                throw Object.assign(new Error("A product option with stock or active reservations at another shop cannot be removed by import."), { statusCode: 409 });
+              }
+              if (existing.inventoryLocations?.length) {
+                merged.inventoryLocations = existing.inventoryLocations.map((location) => {
+                  const locationObject = location.toObject();
+                  const currentVariants = new Map((location.variants || []).map((locationVariant) => [String(locationVariant.variantId), locationVariant]));
+                  locationObject.variants = merged.variants.map((variant) => {
+                    const locationVariant = currentVariants.get(String(variant._id));
+                    return locationVariant ? locationVariant.toObject() : { variantId: variant._id };
+                  });
+                  return locationObject;
+                });
+              }
               continue;
             }
+            if (value === undefined) continue;
             if (key === "sku" && !String(entry.product.sku || "").trim()) continue;
             merged[key] = value;
           }
@@ -695,6 +1379,22 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
               throw Object.assign(new Error("Stock cannot be overwritten while the product has active order reservations."), { statusCode: 409 });
             }
             merged.stock = imported.stock;
+          }
+          if (String(existing.shop) !== String(merged.shop)) {
+            const hasAssignedInventory = !Number.isInteger(existing.stock)
+              || existing.stock !== 0
+              || (existing.variants || []).some((variant) => !Number.isInteger(variant.stock) || variant.stock !== 0)
+              || (existing.inventoryLocations || []).some((location) => !Number.isInteger(location.stock)
+                || location.stock !== 0
+                || (location.variants || []).some((variant) => !Number.isInteger(variant.stock) || variant.stock !== 0));
+            const hasReservations = (existing.stockReservations || []).length > 0
+              || (existing.variants || []).some((variant) => (variant.stockReservations || []).length > 0)
+              || (existing.inventoryLocations || []).some((location) => (location.stockReservations || []).length > 0
+                || (location.variants || []).some((variant) => (variant.stockReservations || []).length > 0));
+            if (hasAssignedInventory || hasReservations) {
+              throw Object.assign(new Error("Reconcile all shop inventory before changing this product's catalog shop in an import."), { statusCode: 409 });
+            }
+            merged.inventoryLocations = [];
           }
           merged.status = targetStatus; merged.isActive = targetStatus === "published";
           merged.archivedAt = null;
@@ -713,16 +1413,18 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
           if (issues.length) throw Object.assign(new Error("This item cannot be published yet"), { statusCode: 400, issues });
           merged.skuCodes = [merged.sku, ...(merged.variants || []).map((variant) => variant.sku)].filter(Boolean).map((sku) => String(sku).trim().toUpperCase());
           const update = {};
-          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brand", "categoryId", "subcategoryId", "category", "subcategory", "shop", "returnEligibility", "badge", "isFlashSale", "purposeTags", "flashSaleEndsAt", "variants", "stock", "status", "isActive", "archivedAt", "skuCodes"]) {
+          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brandId", "brand", "categoryId", "subcategoryId", "category", "subcategory", "shop", "returnEligibility", "badge", "isFlashSale", "purposeTags", "flashSaleEndsAt", "reorderLevel", "variants", "inventoryLocations", "stock", "status", "isActive", "archivedAt", "skuCodes"]) {
             if (merged[key] !== undefined) update[key] = merged[key];
           }
-          if (!merged.skuCodes.length) { delete update.skuCodes; update.$unset = { skuCodes: 1 }; }
+          const updateOperations = { $set: update };
+          if (!merged.skuCodes.length) { delete updateOperations.$set.skuCodes; updateOperations.$unset = { skuCodes: 1 }; }
+          addInventoryHistory(updateOperations, createInventoryChanges(existing, merged, "csv_import", "csv-overwrite"));
           const overwrittenProduct = await Product.findOneAndUpdate({
             _id: existing._id,
             updatedAt: existing.updatedAt,
             stockReservations: { $not: { $elemMatch: { orderId: { $exists: true } } } },
             "variants.stockReservations": { $not: { $elemMatch: { orderId: { $exists: true } } } },
-          }, update, { new: true, runValidators: true });
+          }, updateOperations, { new: true, runValidators: true });
           if (!overwrittenProduct) {
             throw Object.assign(new Error("This product changed or gained an active order reservation while the import was being applied. Nothing was overwritten; refresh the catalog and review the product again."), { statusCode: 409 });
           }
@@ -745,6 +1447,7 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
           await assertUniqueProductSkus(imported);
           const sameName = await Product.findOne({ name: new RegExp(`^${escapeRegExp(imported.name)}$`, "i"), ...(imported.brand ? { brand: new RegExp(`^${escapeRegExp(imported.brand)}$`, "i") } : {}), shop: imported.shop }).select("name");
           if (sameName) throw Object.assign(new Error("A product with this name, brand, and shop already exists. Choose the matching product to overwrite or skip this row."), { statusCode: 409 });
+          imported.inventoryHistory = createInitialInventoryHistory(imported, "initial", "csv-import");
           const created = await Product.create(imported);
           results.push({ index: decision.index, status: "created", productId: created._id, productStatus: targetStatus });
         }
@@ -804,6 +1507,7 @@ router.patch("/bulk-edit", protect, requireRole("admin"), async (req, res, next)
     }
 
     const update = {};
+    let includesShopMove = false;
     if (set && Object.keys(set).length > 0) {
       const allowedFields = new Set(["shop", "categoryId", "subcategoryId", "category", "subcategory", "badge", "isFlashSale", "stock"]);
       const disallowed = Object.keys(set).filter((key) => !allowedFields.has(key));
@@ -857,7 +1561,20 @@ router.patch("/bulk-edit", protect, requireRole("admin"), async (req, res, next)
         return res.status(400).json({ message: "Choose an active shop before moving products." });
       }
       if (set.shop) {
-        const movingProducts = await Product.find({ _id: { $in: productIds } }).select("name brand").lean();
+        const movingProducts = await Product.find({ _id: { $in: productIds } }).select("name brand shop stock stockReservations variants.stock variants.stockReservations +inventoryLocations").lean();
+        includesShopMove = movingProducts.some((product) => String(product.shop) !== String(set.shop));
+        if (includesShopMove && Object.prototype.hasOwnProperty.call(set, "stock")) {
+          return res.status(400).json({ message: "Move products to another catalog shop separately from bulk stock changes." });
+        }
+        const productWithStock = includesShopMove && movingProducts.find((product) => (
+          !Number.isInteger(product.stock)
+          || product.stock !== 0
+          || (product.variants || []).some((variant) => !Number.isInteger(variant.stock) || variant.stock !== 0)
+          || (product.inventoryLocations || []).length > 0
+          || (product.stockReservations || []).length > 0
+          || (product.variants || []).some((variant) => (variant.stockReservations || []).length > 0)
+        ));
+        if (productWithStock) return res.status(409).json({ message: `Reconcile ${productWithStock.name}'s inventory before changing its catalog shop.` });
         const identities = new Set();
         for (const product of movingProducts) {
           const identity = `${String(product.name || "").trim().toLowerCase()}\u0000${String(product.brand || "").trim().toLowerCase()}`;
@@ -951,6 +1668,13 @@ router.patch("/bulk-edit", protect, requireRole("admin"), async (req, res, next)
     }
 
     const bulkFilter = { _id: { $in: productIds } };
+    if (includesShopMove) {
+      bulkFilter.$and = [
+        { stock: 0 },
+        { variants: { $not: { $elemMatch: { stock: { $ne: 0 } } } } },
+        { $or: [{ inventoryLocations: { $size: 0 } }, { inventoryLocations: { $exists: false } }] },
+      ];
+    }
     const changesStock = Boolean(set && Object.prototype.hasOwnProperty.call(set, "stock"));
     if (changesStock) {
       // Keep the guard in the write predicate too, so a reservation created
@@ -967,12 +1691,38 @@ router.patch("/bulk-edit", protect, requireRole("admin"), async (req, res, next)
       const session = await Product.db.startSession();
       try {
         await session.withTransaction(async () => {
-          result = await Product.updateMany(bulkFilter, update, { session });
-          if (result.matchedCount !== productIds.length) {
-            const conflict = new Error("A selected product gained an active order reservation. No bulk changes were saved; refresh the catalog and try again.");
-            conflict.statusCode = 409;
-            throw conflict;
+          let matchedCount = 0;
+          let modifiedCount = 0;
+          for (const productId of productIds) {
+            const current = await Product.findOne({
+              _id: productId,
+              stockReservations: { $not: { $elemMatch: { orderId: { $exists: true } } } },
+            }).select("stock").session(session);
+            if (!current) {
+              const conflict = new Error("A selected product gained an active order reservation. No bulk changes were saved; refresh the catalog and try again.");
+              conflict.statusCode = 409;
+              throw conflict;
+            }
+            const operations = { ...update };
+            const previousStock = Number.isInteger(current.stock) ? current.stock : null;
+            if (previousStock !== (set.stock ?? null)) {
+              addInventoryHistory(operations, [createInventoryMovement("bulk_adjustment", current.stock, set.stock, { source: "bulk-edit" })]);
+            }
+            const writeFilter = {
+              _id: productId,
+              stockReservations: { $not: { $elemMatch: { orderId: { $exists: true } } } },
+              stock: previousStock,
+            };
+            const updated = await Product.updateOne(writeFilter, operations, { session, runValidators: true });
+            if (!updated.matchedCount) {
+              const conflict = new Error("A selected product changed while applying the bulk stock update. No bulk changes were saved; refresh the catalog and try again.");
+              conflict.statusCode = 409;
+              throw conflict;
+            }
+            matchedCount += updated.matchedCount;
+            modifiedCount += updated.modifiedCount;
           }
+          result = { matchedCount, modifiedCount };
         });
       } finally {
         await session.endSession();

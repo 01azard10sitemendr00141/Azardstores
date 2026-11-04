@@ -6,6 +6,7 @@ const orderItemSchema = new Schema(
     product: { type: Schema.Types.ObjectId, ref: "Product" },
     name: { type: String, required: true },
     shopId: { type: Schema.Types.ObjectId, ref: "Shop", default: null, immutable: true },
+    productShopId: { type: Schema.Types.ObjectId, ref: "Shop", default: null, immutable: true },
     shopName: { type: String, default: "", immutable: true },
     shopNumber: { type: Number, default: null, immutable: true },
     // Set only when the ordered item was a specific variant — lets stock
@@ -76,6 +77,8 @@ const returnRequestSchema = new Schema(
     storeBalanceAmount: { type: Number, default: 0, min: 0 },
     storeBalanceClaimStatus: { type: String, enum: ["not_required", "pending", "claimed"], default: "not_required" },
     decisionNote: { type: String, default: "" },
+    inspectionLines: { type: [{ itemIndex: { type: Number, required: true }, restockedQuantity: { type: Number, required: true, min: 0 }, damagedQuantity: { type: Number, required: true, min: 0 }, discardedQuantity: { type: Number, required: true, min: 0 } }], default: [] },
+    inventoryProcessedAt: { type: Date, default: null },
     requestedAt: { type: Date, default: Date.now },
     decidedAt: { type: Date, default: null },
   },

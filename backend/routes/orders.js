@@ -10,7 +10,7 @@ const { sendOrderConfirmationEmail, sendOrderUpdateEmail } = require("../utils/e
 const { isEmailVerificationLive, isPhoneVerificationLive } = require("../config/verification");
 const { normalizePhone } = require("../utils/normalizePhone");
 const { toCsv } = require("../utils/csvExport");
-const { reserveOrderStock, restoreOrderStockOnce, commitOrderStockReservations } = require("../utils/orderStock");
+const { reserveOrderStock, restoreOrderStockOnce, commitOrderStockReservations, hasCommittedInventory } = require("../utils/orderStock");
 const { isPaystackConfigured, isPaystackMpesaConfigured } = require("../utils/paystack");
 const { changeBalance, releaseOrderBalance, creditPaidOrderToStoreBalance, issueStoreBalance, customerStoreBalanceMessage } = require("../utils/storeBalance");
 const { emitOrderEvent, emitOrderCreatedEvent } = require("../utils/orderRealtime");
@@ -18,6 +18,8 @@ const { getCbdDeliveryFee } = require("../utils/deliveryPricing");
 const { orderLimiter, orderLookupLimiter, customerOrderActionLimiter } = require("../middleware/rateLimits");
 const { parseListQuery, queryText, escapeRegex } = require("../utils/listQuery");
 const { customerOrderView } = require("../utils/customerOrderView");
+const { normalizeReturnInspectionLines, applyReturnInspection } = require("../utils/returnInventory");
+const { allocateStock, shopStockEntries } = require("../utils/productInventory");
 
 const router = express.Router();
 
@@ -116,7 +118,7 @@ function orderReviewFlags(order) {
   if (order.status === "expired" && order.paymentStatus === "paid") {
     flags.push(order.storeBalanceCreditedAt ? "Late payment was returned to store balance; do not dispatch" : "Payment arrived after order expiry; issue its value to store balance and do not dispatch");
   }
-  if (["cancelled", "expired", "unavailable"].includes(order.status) && order.stockReservedAt && !order.stockRestoredAt) {
+  if (["cancelled", "expired", "unavailable"].includes(order.status) && order.stockReservedAt && !order.stockRestoredAt && !hasCommittedInventory(order)) {
     flags.push("Order has ended but reserved stock is not recorded as restored");
   }
   const pendingAdditionalPayments = (order.additionalPaymentRefunds || []).filter((payment) => payment.status === "refund_pending").length;
@@ -272,14 +274,13 @@ router.post(
       const activeShopsById = new Map(activeShops.map((shop) => [shop._id.toString(), shop]));
       const products = await Product.find({
         _id: { $in: productIds },
-        shop: { $in: activeShopIds },
         isActive: true,
         $or: [{ status: "published" }, { status: { $exists: false } }],
-      });
+      }).select("+inventoryLocations");
 
       const orderItems = [];
       const priceChanges = [];
-      const requestedStock = new Map();
+      const allocatedStock = new Map();
       for (const item of items) {
         const product = products.find((p) => p._id.toString() === item.productId);
         if (!product) {
@@ -288,14 +289,6 @@ router.post(
             unavailableItems: [{ productId: item.productId, variantId: item.variantId || null }],
           });
         }
-        const shop = activeShopsById.get(product.shop.toString());
-        if (!shop) {
-          return res.status(409).json({
-            message: "This product's shop is no longer available. Review the updated cart before continuing.",
-            unavailableItems: [{ productId: item.productId, variantId: item.variantId || null }],
-          });
-        }
-
         const variant = item.variantId
           ? product.variants.find((v) => v._id.toString() === item.variantId)
           : null;
@@ -307,16 +300,20 @@ router.post(
         }
 
         const stockKey = `${product._id}:${variant?._id || "base"}`;
-        const totalRequested = (requestedStock.get(stockKey) || 0) + item.quantity;
-        requestedStock.set(stockKey, totalRequested);
-        const available = variant ? variant.stock : product.stock;
-        if (!Number.isFinite(available) || available < totalRequested) {
+        if (!allocatedStock.has(stockKey)) allocatedStock.set(stockKey, new Map());
+        const allocations = allocateStock(product, variant?._id || null, item.quantity, activeShops, allocatedStock.get(stockKey));
+        if (!allocations) {
+          const eligibleLocations = shopStockEntries(product, variant?._id || null, activeShopIds);
+          const hasUnconfirmedStock = eligibleLocations.some((location) => !Number.isInteger(location.stock));
+          const knownAvailable = eligibleLocations
+            .filter((location) => Number.isInteger(location.stock))
+            .reduce((sum, location) => sum + location.stock, 0);
           return res.status(409).json({
-            message: Number.isFinite(available)
-              ? `Only ${available} of "${product.name}"${variant ? ` (${variant.name})` : ""} are currently available. Adjust the quantity and try again.`
-              : `Availability for "${product.name}"${variant ? ` (${variant.name})` : ""} has not been confirmed. Please contact Azard Stores before ordering.`,
+            message: hasUnconfirmedStock
+              ? `Availability for "${product.name}"${variant ? ` (${variant.name})` : ""} has not been confirmed at every active shop. Please contact Azard Stores before ordering.`
+              : `Only ${knownAvailable} of "${product.name}"${variant ? ` (${variant.name})` : ""} are currently available across active shops. Adjust the quantity and try again.`,
             stockChanged: true,
-            item: { productId: product._id.toString(), variantId: variant?._id?.toString() || null, availableStock: Number.isFinite(available) ? available : null },
+            item: { productId: product._id.toString(), variantId: variant?._id?.toString() || null, availableStock: hasUnconfirmedStock ? null : knownAvailable },
           });
         }
 
@@ -331,19 +328,24 @@ router.post(
             image: lineImage,
           });
         }
-        orderItems.push({
-          product: product._id,
-          shopId: shop._id,
-          shopName: shop.name,
-          shopNumber: shop.shopNumber,
-          name: product.name,
-          variantId: variant?._id || null,
-          variantName: variant?.name || "",
-          returnEligibility: product.returnEligibility || "standard",
-          price: currentPrice,
-          quantity: item.quantity,
-          image: lineImage,
-        });
+        for (const allocation of allocations) {
+          const shop = allocation.shop || activeShopsById.get(String(product.shop));
+          if (!shop) return res.status(409).json({ message: "Stock is assigned to a shop that is no longer active. Review the cart and try again." });
+          orderItems.push({
+            product: product._id,
+            shopId: shop._id,
+            productShopId: product.shop,
+            shopName: shop.name,
+            shopNumber: shop.shopNumber,
+            name: product.name,
+            variantId: variant?._id || null,
+            variantName: variant?.name || "",
+            returnEligibility: product.returnEligibility || "standard",
+            price: currentPrice,
+            quantity: allocation.quantity,
+            image: lineImage,
+          });
+        }
       }
 
       if (priceChanges.length) {
@@ -1327,34 +1329,52 @@ router.post("/:id/replacement-order", protect, requireRole("admin"), async (req,
     const activeShopsById = new Map(activeShops.map((shop) => [shop._id.toString(), shop]));
     const products = await Product.find({
       _id: { $in: productIds },
-      shop: { $in: activeShopIds },
       isActive: true,
       $or: [{ status: "published" }, { status: { $exists: false } }],
-    });
+    }).select("+inventoryLocations");
     const orderItems = [];
-    const requestedStock = new Map();
+    const allocatedStock = new Map();
     for (const item of req.body.items) {
       const quantity = Number(item.quantity);
       if (!Number.isInteger(quantity) || quantity < 1 || quantity > 99) return res.status(400).json({ message: "Replacement quantities must be between 1 and 99" });
       const product = products.find((entry) => entry._id.toString() === String(item.productId));
       if (!product) return res.status(409).json({ message: "A replacement product is no longer available" });
-      const shop = activeShopsById.get(product.shop.toString());
-      if (!shop) return res.status(409).json({ message: "A replacement product's shop is no longer available" });
       const variant = item.variantId ? product.variants.find((entry) => entry._id.toString() === String(item.variantId)) : null;
       if (item.variantId && !variant) return res.status(409).json({ message: `The selected option for ${product.name} is no longer available` });
       if (!variant && product.variants.length) return res.status(400).json({ message: `Choose an option for ${product.name}` });
       const stockKey = `${product._id}:${variant?._id || "base"}`;
-      const requested = (requestedStock.get(stockKey) || 0) + quantity;
-      requestedStock.set(stockKey, requested);
-      const stock = variant ? variant.stock : product.stock;
-      if (!Number.isFinite(stock) || stock < requested) {
+      if (!allocatedStock.has(stockKey)) allocatedStock.set(stockKey, new Map());
+      const allocations = allocateStock(product, variant?._id || null, quantity, activeShops, allocatedStock.get(stockKey));
+      if (!allocations) {
+        const eligibleLocations = shopStockEntries(product, variant?._id || null, activeShopIds);
+        const hasUnconfirmedStock = eligibleLocations.some((location) => !Number.isInteger(location.stock));
+        const stock = eligibleLocations
+          .filter((location) => Number.isInteger(location.stock))
+          .reduce((sum, location) => sum + location.stock, 0);
         return res.status(409).json({
-          message: Number.isFinite(stock)
-            ? `Only ${stock} of ${product.name}${variant ? ` (${variant.name})` : ""} currently appear available`
-            : `Availability for ${product.name}${variant ? ` (${variant.name})` : ""} has not been confirmed. Please contact Azard Stores before ordering.`,
+          message: hasUnconfirmedStock
+            ? `Availability for ${product.name}${variant ? ` (${variant.name})` : ""} has not been confirmed at every active shop. Please contact Azard Stores before ordering.`
+            : `Only ${stock} of ${product.name}${variant ? ` (${variant.name})` : ""} currently appear available`,
         });
       }
-      orderItems.push({ product: product._id, shopId: shop._id, shopName: shop.name, shopNumber: shop.shopNumber, name: product.name, variantId: variant?._id || null, variantName: variant?.name || "", returnEligibility: product.returnEligibility || "standard", price: variant?.price ?? product.price, quantity, image: variant?.image || product.images[0] || "" });
+      for (const allocation of allocations) {
+        const shop = allocation.shop || activeShopsById.get(String(product.shop));
+        if (!shop) return res.status(409).json({ message: "Replacement stock is assigned to a shop that is no longer active" });
+        orderItems.push({
+          product: product._id,
+          shopId: shop._id,
+          productShopId: product.shop,
+          shopName: shop.name,
+          shopNumber: shop.shopNumber,
+          name: product.name,
+          variantId: variant?._id || null,
+          variantName: variant?.name || "",
+          returnEligibility: product.returnEligibility || "standard",
+          price: variant?.price ?? product.price,
+          quantity: allocation.quantity,
+          image: variant?.image || product.images[0] || "",
+        });
+      }
     }
 
     const subtotal = orderItems.reduce((sum, item) => sum + item.price * item.quantity, 0);
@@ -1838,11 +1858,24 @@ router.put("/:id/returns/:requestId", protect, requireRole("admin"), async (req,
     if (!request) return res.status(404).json({ message: "Return request not found" });
     const allowedNext = { pending: ["approved", "rejected"], approved: ["completed"], rejected: [], completed: [] };
     const isCreditRecovery = request.status === "completed" && status === "completed" && !request.storeBalanceIssuedAt;
-    if (!allowedNext[request.status]?.includes(status) && !isCreditRecovery) return res.status(409).json({ message: `Cannot move a ${request.status} request to ${status}` });
-    const note = String(decisionNote).trim().slice(0, 1000);
+    const isInspectionRecovery = request.status === "completed"
+      && status === "completed"
+      && !request.inventoryProcessedAt
+      && request.inspectionLines?.length > 0;
+    if (!allowedNext[request.status]?.includes(status) && !isCreditRecovery && !isInspectionRecovery) return res.status(409).json({ message: `Cannot move a ${request.status} request to ${status}` });
+    const note = String(decisionNote || (isCreditRecovery || isInspectionRecovery ? request.decisionNote : "")).trim().slice(0, 1000);
     if (!note) return res.status(400).json({ message: status === "approved" ? "Add the customer handover instructions" : status === "rejected" ? "Add a reason for declining this request" : request.type === "exchange" ? "Record where the exchange item was received and inspected" : "Record that the returned item was received and inspected" });
     if (status === "approved" && note.length < 30) return res.status(400).json({ message: "Add complete return instructions: method, exact destination or parcel office, and customer contact details" });
-    if (status === "completed" && note.length < 20) return res.status(400).json({ message: "Record where the item was received and confirm its inspection before completing this request" });
+    if (status === "completed" && !isCreditRecovery && !isInspectionRecovery && note.length < 20) return res.status(400).json({ message: "Record where the item was received and confirm its inspection before completing this request" });
+    if (status === "completed" && order.paymentStatus !== "paid") return res.status(409).json({ message: "Payment is no longer confirmed for this order, so this request cannot be completed or credited." });
+    const returnedLines = request.itemQuantities?.length
+      ? request.itemQuantities
+      : request.itemIndexes.map((itemIndex) => ({ itemIndex, quantity: Number(order.items[itemIndex]?.quantity || 0) }));
+    const inspectionLines = isInspectionRecovery
+      ? request.inspectionLines
+      : status === "completed" && !isCreditRecovery
+        ? normalizeReturnInspectionLines(returnedLines, req.body.inspectionLines)
+        : request.inspectionLines;
     if (["approved", "rejected"].includes(status)) {
       const decisionAt = new Date();
       const claim = await Order.updateOne(
@@ -1855,7 +1888,7 @@ router.put("/:id/returns/:requestId", protect, requireRole("admin"), async (req,
       );
       if (!claim.modifiedCount) return res.status(409).json({ message: "Another admin already updated this request. Refresh the order and review its latest status." });
     }
-    if (status === "completed" && !isCreditRecovery) {
+    if (status === "completed" && !isCreditRecovery && !isInspectionRecovery) {
       if (order.paymentStatus !== "paid") return res.status(409).json({ message: "Payment is no longer confirmed for this order, so this request cannot be completed or credited." });
       const completionClaim = await Order.updateOne(
         {
@@ -1867,6 +1900,7 @@ router.put("/:id/returns/:requestId", protect, requireRole("admin"), async (req,
           "returnRequests.$.status": "completed",
           "returnRequests.$.decisionNote": note,
           "returnRequests.$.decidedAt": new Date(),
+          "returnRequests.$.inspectionLines": inspectionLines,
         } }
       );
       if (!completionClaim.modifiedCount) return res.status(409).json({ message: "Another admin completed this request. Refresh the order to confirm its latest Store Balance status." });
@@ -1875,11 +1909,26 @@ router.put("/:id/returns/:requestId", protect, requireRole("admin"), async (req,
     request.status = status;
     request.decisionNote = note;
     request.decidedAt = new Date();
+    if (inspectionLines?.length) request.inspectionLines = inspectionLines;
+    if (status === "completed" && request.inspectionLines?.length && !request.inventoryProcessedAt) {
+      await applyReturnInspection({ Product, order, request, inspectionLines: request.inspectionLines, inspectionNote: note });
+      const processedAt = new Date();
+      const inventoryClaim = await Order.updateOne(
+        { _id: order._id, returnRequests: { $elemMatch: { _id: request._id, status: "completed", inventoryProcessedAt: null } } },
+        { $set: { "returnRequests.$.inventoryProcessedAt": processedAt } }
+      );
+      if (!inventoryClaim.modifiedCount) {
+        const latest = await Order.findOne({ _id: order._id, returnRequests: { $elemMatch: { _id: request._id, inventoryProcessedAt: { $ne: null } } } })
+          .select("returnRequests")
+          .lean();
+        const processedRequest = latest?.returnRequests?.find((entry) => String(entry._id) === String(request._id));
+        if (!processedRequest?.inventoryProcessedAt) return res.status(409).json({ message: "Inventory inspection could not be confirmed as complete. Refresh the order and retry." });
+        request.inventoryProcessedAt = processedRequest.inventoryProcessedAt;
+      } else {
+        request.inventoryProcessedAt = processedAt;
+      }
+    }
     if (status === "completed" && ["return", "exchange"].includes(request.type)) {
-      if (order.paymentStatus !== "paid") return res.status(409).json({ message: "Payment is no longer confirmed for this order, so this request cannot be completed or credited." });
-      const returnedLines = request.itemQuantities?.length
-        ? request.itemQuantities
-        : request.itemIndexes.map((itemIndex) => ({ itemIndex, quantity: Number(order.items[itemIndex]?.quantity || 0) }));
       request.storeBalanceAmount = Math.round(returnedLines.reduce((sum, line) => {
         const item = order.items[line.itemIndex];
         return sum + (item ? item.price * line.quantity : 0);

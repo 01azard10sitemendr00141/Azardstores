@@ -1,7 +1,8 @@
 const { parseListQuery, queryText, escapeRegex } = require("./listQuery");
 
+const LOW_STOCK_THRESHOLD = 5;
 const PRODUCT_STATUSES = new Set(["all", "published", "draft", "archived"]);
-const INVENTORY_STATUSES = new Set(["all", "in_stock", "low_stock", "out_of_stock"]);
+const INVENTORY_STATUSES = new Set(["all", "in_stock", "low_stock", "out_of_stock", "needs_restock"]);
 
 function simpleProductStock(stockFilter) {
   return {
@@ -17,14 +18,110 @@ function variantProductStock(stockFilter) {
 }
 
 function buildInventoryFilter(inventory) {
+  if (inventory === "needs_restock") {
+    return {
+      $expr: {
+        $or: [
+          {
+            $and: [
+              { $eq: [{ $size: { $ifNull: ["$variants", []] } }, 0] },
+              { $isNumber: "$stock" },
+              { $lte: ["$stock", { $ifNull: ["$reorderLevel", LOW_STOCK_THRESHOLD] }] },
+            ],
+          },
+          {
+            $anyElementTrue: [
+              {
+                $map: {
+                  input: { $ifNull: ["$inventoryLocations", []] },
+                  as: "location",
+                  in: {
+                    $and: [
+                      { $isNumber: "$$location.stock" },
+                      { $lte: ["$$location.stock", { $ifNull: ["$reorderLevel", LOW_STOCK_THRESHOLD] }] },
+                    ],
+                  },
+                },
+              },
+            ],
+          },
+          {
+            $anyElementTrue: [
+              {
+                $map: {
+                  input: { $ifNull: ["$variants", []] },
+                  as: "variant",
+                  in: {
+                    $and: [
+                      { $isNumber: "$$variant.stock" },
+                      { $lte: ["$$variant.stock", { $ifNull: ["$$variant.reorderLevel", LOW_STOCK_THRESHOLD] }] },
+                    ],
+                  },
+                },
+              },
+            ],
+          },
+          {
+            $anyElementTrue: [
+              {
+                $map: {
+                  input: { $ifNull: ["$inventoryLocations", []] },
+                  as: "location",
+                  in: {
+                    $anyElementTrue: [
+                      {
+                        $map: {
+                          input: { $ifNull: ["$$location.variants", []] },
+                          as: "locationVariant",
+                          in: {
+                            $let: {
+                              vars: {
+                                catalogVariant: {
+                                  $arrayElemAt: [
+                                    {
+                                      $filter: {
+                                        input: { $ifNull: ["$variants", []] },
+                                        as: "variant",
+                                        cond: { $eq: ["$$variant._id", "$$locationVariant.variantId"] },
+                                      },
+                                    },
+                                    0,
+                                  ],
+                                },
+                              },
+                              in: {
+                                $and: [
+                                  { $isNumber: "$$locationVariant.stock" },
+                                  {
+                                    $lte: [
+                                      "$$locationVariant.stock",
+                                      { $ifNull: ["$$catalogVariant.reorderLevel", LOW_STOCK_THRESHOLD] },
+                                    ],
+                                  },
+                                ],
+                              },
+                            },
+                          },
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            ],
+          },
+        ],
+      },
+    };
+  }
   if (inventory === "in_stock") {
     return {
       $or: [
-        simpleProductStock({ $gt: 5 }),
+        simpleProductStock({ $gt: LOW_STOCK_THRESHOLD }),
         {
           $and: [
-            variantProductStock({ $gt: 5 }),
-            { variants: { $not: { $elemMatch: { stock: { $gte: 1, $lte: 5 } } } } },
+            variantProductStock({ $gt: LOW_STOCK_THRESHOLD }),
+            { variants: { $not: { $elemMatch: { stock: { $gte: 1, $lte: LOW_STOCK_THRESHOLD } } } } },
             { variants: { $not: { $elemMatch: { stock: { $exists: false } } } } },
           ],
         },
@@ -34,8 +131,8 @@ function buildInventoryFilter(inventory) {
   if (inventory === "low_stock") {
     return {
       $or: [
-        simpleProductStock({ $gte: 1, $lte: 5 }),
-        variantProductStock({ $gte: 1, $lte: 5 }),
+        simpleProductStock({ $gte: 1, $lte: LOW_STOCK_THRESHOLD }),
+        variantProductStock({ $gte: 1, $lte: LOW_STOCK_THRESHOLD }),
       ],
     };
   }
@@ -55,11 +152,13 @@ function buildInventoryFilter(inventory) {
   return null;
 }
 
-function buildAdminProductQuery(input = {}) {
+function buildAdminProductQuery(input = {}, { floorShopIds } = {}) {
   const { search } = parseListQuery(input);
   const status = queryText(input.status, 20) || "all";
   const category = queryText(input.category, 100);
   const inventory = queryText(input.inventory, 20) || "all";
+  const floor = queryText(input.floor, 64);
+  const shop = queryText(input.shop, 64);
   if (!PRODUCT_STATUSES.has(status)) {
     const error = new Error("Choose a valid product status filter.");
     error.statusCode = 400;
@@ -69,6 +168,13 @@ function buildAdminProductQuery(input = {}) {
     const error = new Error("Choose a valid product inventory filter.");
     error.statusCode = 400;
     throw error;
+  }
+  for (const [label, value] of [["floor", floor], ["shop", shop]]) {
+    if (value && !/^[0-9a-f]{24}$/i.test(value)) {
+      const error = new Error(`Choose a valid ${label}.`);
+      error.statusCode = 400;
+      throw error;
+    }
   }
 
   const clauses = [];
@@ -81,6 +187,8 @@ function buildAdminProductQuery(input = {}) {
   }
 
   if (category) clauses.push({ category: new RegExp(`^${escapeRegex(category)}$`, "i") });
+  if (floor) clauses.push({ $or: [{ shop: { $in: floorShopIds || [] } }, { "inventoryLocations.shop": { $in: floorShopIds || [] } }] });
+  if (shop) clauses.push({ $or: [{ shop }, { "inventoryLocations.shop": shop }] });
   const inventoryClause = buildInventoryFilter(inventory);
   if (inventoryClause) clauses.push(inventoryClause);
   if (search) {
@@ -99,6 +207,8 @@ function buildAdminProductQuery(input = {}) {
     status,
     category,
     inventory,
+    floor,
+    shop,
   };
 }
 
@@ -112,4 +222,4 @@ function matchesExpectedProductCount(expectedCount, matchingCount) {
     && matchingCount === expectedCount;
 }
 
-module.exports = { buildAdminProductQuery, isValidExpectedProductCount, matchesExpectedProductCount };
+module.exports = { LOW_STOCK_THRESHOLD, buildAdminProductQuery, isValidExpectedProductCount, matchesExpectedProductCount };

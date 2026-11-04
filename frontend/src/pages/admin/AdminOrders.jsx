@@ -380,11 +380,11 @@ export default function AdminOrders() {
     } finally { setUpdating(null); }
   }
 
-  async function updateReturnRequest(order, request, status, decisionNote) {
+  async function updateReturnRequest(order, request, status, decisionNote, inspectionLines) {
     setUpdating(order._id);
     setActionError("");
     try {
-      const res = await api.put(`/orders/${order._id}/returns/${request._id}`, { status, decisionNote });
+      const res = await api.put(`/orders/${order._id}/returns/${request._id}`, { status, decisionNote, ...(inspectionLines ? { inspectionLines } : {}) });
       setOrders((prev) => prev.map((o) => o._id === order._id ? res.data : o));
       setReturnDecision(null);
     } catch (err) {
@@ -638,6 +638,17 @@ export default function AdminOrders() {
                     {order.deliveryRoute?.serviceType === "direct" && <p className="text-cream/45 text-xs">Direct delivery address: {order.deliveryAddress}</p>}
                     {order.deliveryConfirmation?.confirmedAt && <p className="text-cream/45 text-xs">Handover recorded: {new Date(order.deliveryConfirmation.confirmedAt).toLocaleString("en-KE")} · {order.deliveryConfirmation.recipientName}{Number(order.deliveryConfirmation.paymentCollectedAmount) > 0 ? ` · COD cash KSh ${Number(order.deliveryConfirmation.paymentCollectedAmount).toLocaleString()}` : ""}{order.deliveryConfirmation.note ? ` · ${order.deliveryConfirmation.note}` : ""}</p>}
                     {order.cancellationReason && <p className="text-red-300/70 text-xs">Cancellation: {order.cancellationReason}</p>}
+                    <p className="text-xs text-cream/45">Inventory: {order.stockRestoredAt
+                      ? `reservation released ${new Date(order.stockRestoredAt).toLocaleString("en-KE")}`
+                      : order.stockReservationCommittedAt
+                        || ["shipped", "ready_for_collection", "collected", "delivered"].includes(order.status)
+                        || order.events?.some((event) => ["status_shipped", "status_ready_for_collection", "status_collected", "status_delivered"].includes(event.type))
+                        ? "committed to fulfillment; only restock received and inspected returns"
+                        : order.stockReservedAt
+                          ? "reserved for this order"
+                          : order.stockNeedsReservation
+                            ? "not reserved yet · awaiting availability confirmation"
+                            : "no active reservation record"}</p>
                     {order.events?.length > 0 && <div className="border-l border-cream/15 pl-3 space-y-2">{[...order.events].reverse().map((event, index) => <div key={`${event.type}-${index}`}><p className="text-xs text-cream/70 capitalize">{orderEventLabel(event)}</p>{orderEventNote(event) && <p className="text-[11px] text-cream/40">{orderEventNote(event)}</p>}<p className="text-[10px] text-cream/25">{new Date(event.createdAt).toLocaleString("en-KE")}</p></div>)}</div>}
                     {order.cancellationRequests?.map((request) => (
                       <div key={request._id} className="rounded-xl border border-amber-300/20 bg-amber-300/5 p-3 text-xs space-y-2">
@@ -662,8 +673,9 @@ export default function AdminOrders() {
                         <p className="text-cream/50">{request.reason}</p>
                         <p className="text-cream/35">Unused, original packaging confirmed by customer</p>
                         {request.decisionNote && <p className="text-cream/45">Latest update: {request.decisionNote}</p>}
+                        {request.inspectionLines?.length > 0 && <div className="rounded-lg bg-cream/5 p-2 text-cream/55"><p className="font-medium text-cream/70">Inspection disposition</p>{request.inspectionLines.map((line) => <p key={line.itemIndex}>{order.items?.[line.itemIndex]?.name || `Item ${line.itemIndex + 1}`}: {line.restockedQuantity} sellable, {line.damagedQuantity} damaged, {line.discardedQuantity} discarded{line.restockedQuantity > 0 && !request.inventoryProcessedAt ? " · stock update pending" : ""}</p>)}{request.inventoryProcessedAt && <p className="mt-1 text-emerald-200">Inventory history updated</p>}</div>}
                         {!request.storeBalanceIssuedAt && ["pending", "approved"].includes(request.status) && Number(request.storeBalanceAmount) > 0 && <p className="text-cream/45">Estimated Store Balance after inspection: KSh {Number(request.storeBalanceAmount).toLocaleString()} for item value. Delivery charges are excluded.</p>}
-                        {request.status === "completed" && !request.storeBalanceIssuedAt && Number(request.storeBalanceAmount) > 0 && <div className="rounded-lg border border-amber-300/15 bg-amber-300/5 p-3"><p className="text-amber-100">Completed inspection, but no Store Balance credit is recorded yet · KSh {Number(request.storeBalanceAmount).toLocaleString()}.</p>{order.paymentStatus === "paid" ? <button type="button" disabled={updating === order._id} onClick={() => retryReturnBalanceCredit(order, request)} className="mt-2 rounded-lg border border-amber-200/25 px-3 py-2 text-xs text-amber-100 disabled:opacity-50">{updating === order._id ? "Checking credit…" : "Retry Store Balance credit"}</button> : <p className="mt-2 text-amber-100/65">Payment is not confirmed, so this credit cannot be retried yet.</p>}</div>}
+                        {request.status === "completed" && ((request.inspectionLines?.length > 0 && !request.inventoryProcessedAt) || (!request.storeBalanceIssuedAt && Number(request.storeBalanceAmount) > 0)) && <div className="rounded-lg border border-amber-300/15 bg-amber-300/5 p-3"><p className="text-amber-100">{request.inspectionLines?.length > 0 && !request.inventoryProcessedAt ? "Inspection saved, but inventory processing is not confirmed." : `Completed inspection, but no Store Balance credit is recorded yet · KSh ${Number(request.storeBalanceAmount).toLocaleString()}.`}</p>{order.paymentStatus === "paid" ? <button type="button" disabled={updating === order._id} onClick={() => retryReturnBalanceCredit(order, request)} className="mt-2 rounded-lg border border-amber-200/25 px-3 py-2 text-xs text-amber-100 disabled:opacity-50">{updating === order._id ? "Retrying…" : request.inspectionLines?.length > 0 && !request.inventoryProcessedAt ? "Retry inspection processing" : "Retry Store Balance credit"}</button> : <p className="mt-2 text-amber-100/65">Payment is not confirmed, so this credit cannot be retried yet.</p>}</div>}
                         {request.storeBalanceIssuedAt && <p className="text-emerald-200">KSh {Number(request.storeBalanceAmount).toLocaleString()} added for {request.type === "exchange" ? "exchanged" : "returned"} item value{!order.user && request.storeBalanceClaimStatus === "pending" ? " · guest claim pending" : !order.user && request.storeBalanceClaimStatus === "claimed" ? " · credited to verified account" : ""}. Delivery charges excluded.</p>}
                         {request.status === "pending" && <div className="flex gap-3"><button disabled={updating === order._id} onClick={() => setReturnDecision({ order, request, status: "approved" })} className="text-emerald-300 disabled:opacity-50">Approve with handover instructions</button><button disabled={updating === order._id} onClick={() => setReturnDecision({ order, request, status: "rejected" })} className="text-red-300 disabled:opacity-50">Decline with reason</button></div>}
                         {request.status === "approved" && <button disabled={updating === order._id} onClick={() => setReturnDecision({ order, request, status: "completed" })} className="text-mall-accent disabled:opacity-50">Record received & inspected · issue Store Balance</button>}
@@ -753,7 +765,7 @@ export default function AdminOrders() {
           </section>
         </div>
       )}
-      {returnDecision && <ReturnDecisionForm order={returnDecision.order} request={returnDecision.request} status={returnDecision.status} submitting={updating === returnDecision.order._id} onClose={() => setReturnDecision(null)} onSubmit={(note) => updateReturnRequest(returnDecision.order, returnDecision.request, returnDecision.status, note)} />}
+      {returnDecision && <ReturnDecisionForm order={returnDecision.order} request={returnDecision.request} status={returnDecision.status} submitting={updating === returnDecision.order._id} onClose={() => setReturnDecision(null)} onSubmit={(note, lines) => updateReturnRequest(returnDecision.order, returnDecision.request, returnDecision.status, note, lines)} />}
       {parcelStatusDialog && <ParcelStatusForm order={parcelStatusDialog.order} status={parcelStatusDialog.status} submitting={updating === parcelStatusDialog.order._id} onClose={() => setParcelStatusDialog(null)} onSubmit={submitParcelStatus} />}
       {deliveryCompletionDialog && <DeliveryCompletionForm order={deliveryCompletionDialog.order} status={deliveryCompletionDialog.status} submitting={updating === deliveryCompletionDialog.order._id} onClose={() => setDeliveryCompletionDialog(null)} onSubmit={submitDeliveryCompletion} />}
       {deliveryIssueDecision && <DeliveryIssueDecisionForm order={deliveryIssueDecision.order} issue={deliveryIssueDecision.issue} status={deliveryIssueDecision.status} submitting={updating === deliveryIssueDecision.order._id} restoreFocusRef={ordersHeadingRef} onClose={() => setDeliveryIssueDecision(null)} onSubmit={(note) => updateDeliveryIssue(deliveryIssueDecision.order, deliveryIssueDecision.issue, deliveryIssueDecision.status, note)} />}

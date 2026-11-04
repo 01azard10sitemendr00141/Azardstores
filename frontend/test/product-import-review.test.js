@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { getImportCounts, getImportReviewStatus, prepareImportProduct, validateImportItem } from "../src/utils/productImportReview.js";
+import { buildImportSkuIndex, getImportCounts, getImportReviewStatus, prepareImportProduct, validateImportItem } from "../src/utils/productImportReview.js";
 
 test("import review prepares every editable catalog field and preserves variants", () => {
   const product = prepareImportProduct({
@@ -18,13 +18,23 @@ test("import review prepares every editable catalog field and preserves variants
     purposeTags: ["travel"],
     flashSaleEndsAt: "2026-10-28T15:00:00.000Z",
     stock: 12,
-    variants: [{ name: "Blue", sku: "mug-blue", price: 1800, stock: 5, image: "https://cdn.example.com/blue.jpg" }],
+    reorderLevel: 8,
+    variants: [{ name: "Blue", sku: "mug-blue", price: 1800, stock: 5, reorderLevel: 2, image: "https://cdn.example.com/blue.jpg" }],
   });
   assert.equal(product.longDescription, "Long details");
+  assert.equal(product.brandId, "");
   assert.equal(product.badge, "new");
   assert.equal(product.isFlashSale, true);
   assert.equal(product.variants[0].stock, 5);
+  assert.equal(product.reorderLevel, 8);
+  assert.equal(product.variants[0].reorderLevel, 2);
   assert.equal(product.images[0], "https://cdn.example.com/mug.jpg");
+});
+
+test("import review leaves absent reorder levels blank to preserve existing values on overwrite", () => {
+  const product = prepareImportProduct({ variants: [{ name: "Blue" }] });
+  assert.equal(product.reorderLevel, "");
+  assert.equal(product.variants[0].reorderLevel, "");
 });
 
 test("import review counts create, overwrite, skip, draft, and publish decisions", () => {
@@ -48,6 +58,33 @@ test("import validation catches SKU conflicts and allows an explicit skip", () =
   const errors = validateImportItem(item, [item, duplicate], []);
   assert.ok(errors.some((error) => error.includes("SKU also appears")));
   assert.deepEqual(validateImportItem({ ...item, action: "skip" }, [item], []), []);
+});
+
+test("import review indexes active SKUs once across rows", () => {
+  const rows = [
+    { index: 0, action: "create", product: prepareImportProduct({ sku: " SKU-1 " }) },
+    { index: 1, action: "skip", product: prepareImportProduct({ sku: "SKU-1" }) },
+    { index: 2, action: "overwrite", product: prepareImportProduct({ variants: [{ sku: "sku-1" }] }) },
+  ];
+  assert.deepEqual(buildImportSkuIndex(rows).get("SKU-1"), [0, 2]);
+});
+
+test("import review requires brands to map to managed IDs", () => {
+  const item = {
+    index: 0,
+    action: "create",
+    status: "draft",
+    floorId: "floor-1",
+    shopId: "shop-1",
+    candidates: [],
+    product: prepareImportProduct({ name: "Mug", brand: "Field Goods" }),
+  };
+  const brands = [{ _id: "brand-1", name: "Field Goods" }];
+  assert.ok(validateImportItem(item, [item], [], [{ _id: "shop-1", floor: "floor-1" }], brands)
+    .some((issue) => issue.includes("managed brand")));
+  const linked = { ...item, product: { ...item.product, brandId: "brand-1" } };
+  assert.equal(validateImportItem(linked, [linked], [], [{ _id: "shop-1", floor: "floor-1" }], brands)
+    .some((issue) => issue.includes("brand")), false);
 });
 
 test("published CSV rows require a floor-aligned shop and managed taxonomy IDs", () => {

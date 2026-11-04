@@ -13,6 +13,7 @@ export function prepareImportProduct(product = {}) {
     price: product.price ?? "",
     compareAtPrice: product.compareAtPrice ?? "",
     images: Array.isArray(product.images) ? product.images : [],
+    brandId: product.brandId || "",
     brand: product.brand || "",
     returnEligibility: product.returnEligibility || "standard",
     badge: product.badge || "",
@@ -20,15 +21,33 @@ export function prepareImportProduct(product = {}) {
     purposeTags: Array.isArray(product.purposeTags) ? product.purposeTags : [],
     flashSaleEndsAt: localDate,
     stock: product.stock ?? "",
+    reorderLevel: product.reorderLevel ?? "",
     variants: Array.isArray(product.variants) ? product.variants.map((variant) => ({
       name: variant.name || "",
       sku: variant.sku || "",
       price: variant.price ?? "",
       compareAtPrice: variant.compareAtPrice ?? "",
       stock: variant.stock ?? "",
+      reorderLevel: variant.reorderLevel ?? "",
       image: variant.image || "",
     })) : [],
   };
+}
+
+export function buildImportSkuIndex(items) {
+  const index = new Map();
+  for (const item of items) {
+    if (item.action === "skip" || !item.product) continue;
+    const skus = [item.product.sku, ...(item.product.variants || []).map((variant) => variant.sku)];
+    for (const value of skus) {
+      const sku = String(value || "").trim().toUpperCase();
+      if (!sku) continue;
+      const rows = index.get(sku) || [];
+      rows.push(item.index);
+      index.set(sku, rows);
+    }
+  }
+  return index;
 }
 
 function validHttpsImage(value) {
@@ -48,7 +67,7 @@ function validOptionalNumber(value, label, issues, integer = false) {
   return number;
 }
 
-export function validateImportItem(item, items, categories, shops = []) {
+export function validateImportItem(item, items, categories, shops = [], brands = [], skuIndex = null) {
   if (item.action === "skip" || !item.product) return [];
   const product = item.product;
   const issues = [];
@@ -58,6 +77,8 @@ export function validateImportItem(item, items, categories, shops = []) {
   if (product.description.length > 5000) issues.push("Short description must be 5,000 characters or fewer.");
   if (product.longDescription.length > 50000) issues.push("Long description must be 50,000 characters or fewer.");
   if (product.brand.length > 160) issues.push("Brand must be 160 characters or fewer.");
+  if (product.brandId && !brands.some((brand) => String(brand._id) === String(product.brandId))) issues.push("Choose an existing managed brand.");
+  if (product.brand && !product.brandId) issues.push("Map this brand to a managed brand or clear the brand value.");
   if (product.badge.length > 80) issues.push("Badge must be 80 characters or fewer.");
   if (!item.floorId) issues.push("Choose a floor.");
   if (!item.shopId) issues.push("Choose a shop.");
@@ -72,6 +93,8 @@ export function validateImportItem(item, items, categories, shops = []) {
   const price = validOptionalNumber(product.price, "Price", issues);
   const compareAt = validOptionalNumber(product.compareAtPrice, "Compare-at price", issues);
   validOptionalNumber(product.stock, "Stock", issues, true);
+  const reorderLevel = validOptionalNumber(product.reorderLevel, "Reorder level", issues, true);
+  if (reorderLevel !== null && reorderLevel > 1000000) issues.push("Reorder level must be 1,000,000 or less.");
   if (compareAt !== null && price !== null && compareAt > 0 && compareAt <= price) issues.push("Compare-at price must be higher than its selling price.");
   if (!["standard", "final_sale", "perishable", "digital_product"].includes(product.returnEligibility)) issues.push("Choose a valid return eligibility option.");
   if (!Array.isArray(product.purposeTags) || product.purposeTags.length > 20) issues.push("Purpose tags must contain up to 20 values.");
@@ -99,6 +122,8 @@ export function validateImportItem(item, items, categories, shops = []) {
       const variantPrice = validOptionalNumber(variant.price, `${label} price`, issues);
       const variantCompareAt = validOptionalNumber(variant.compareAtPrice, `${label} compare-at price`, issues);
       validOptionalNumber(variant.stock, `${label} stock`, issues, true);
+      const variantReorderLevel = validOptionalNumber(variant.reorderLevel, `${label} reorder level`, issues, true);
+      if (variantReorderLevel !== null && variantReorderLevel > 1000000) issues.push(`${label}: reorder level must be 1,000,000 or less.`);
       if (variant.image && !validHttpsImage(variant.image)) issues.push(`${label} image must be a valid HTTPS URL or blank.`);
       if (item.status === "published") {
         if (!variant.name.trim()) issues.push(`${label}: add a customer-facing option name.`);
@@ -116,9 +141,14 @@ export function validateImportItem(item, items, categories, shops = []) {
 
   const skus = [product.sku, ...product.variants.map((variant) => variant.sku)].map((sku) => sku.trim().toUpperCase()).filter(Boolean);
   if (new Set(skus).size !== skus.length) issues.push("SKU codes must be unique across this product and its options.");
-  const duplicateRow = items.find((other) => other.index !== item.index && other.action !== "skip" && other.product
-    && [other.product.sku, ...other.product.variants.map((variant) => variant.sku)]
-      .some((sku) => sku && skus.includes(sku.trim().toUpperCase())));
+  const duplicateIndex = skuIndex
+    ? skus.map((sku) => (skuIndex.get(sku) || []).find((index) => index !== item.index)).find((index) => index !== undefined)
+    : undefined;
+  const duplicateRow = duplicateIndex !== undefined
+    ? items.find((other) => other.index === duplicateIndex)
+    : skuIndex ? null : items.find((other) => other.index !== item.index && other.action !== "skip" && other.product
+      && [other.product.sku, ...(other.product.variants || []).map((variant) => variant.sku)]
+        .some((sku) => sku && skus.includes(sku.trim().toUpperCase())));
   if (duplicateRow) issues.push(`SKU also appears on CSV row ${duplicateRow.index + 1}; skip or edit one of these rows.`);
   if (item.action === "create" && item.candidates?.some((candidate) => {
     const sameShopName = candidate.matchedByName && String(candidate.shop?.id || "") === String(item.shopId || "");

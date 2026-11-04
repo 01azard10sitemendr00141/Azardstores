@@ -112,6 +112,7 @@ app.use("/api/floors", floorRoutes);
 app.use("/api/shops", shopRoutes);
 app.use("/api/products", productRoutes);
 app.use("/api/orders", orderRoutes);
+app.use("/api/purchase-orders", require("./routes/purchaseOrders"));
 app.use("/api/webhooks", webhookRoutes);
 app.use("/api/contact", contactRoutes);
 app.use("/api/categories", categoriesRoutes);
