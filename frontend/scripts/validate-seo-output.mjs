@@ -57,10 +57,11 @@ async function validateBundledEntrypoint(page, url) {
   const script = page.match(/<script\b(?=[^>]*\btype="module")(?=[^>]*\bsrc="([^"]+\.js)")[^>]*>/i);
   if (!script) throw new Error(`Generated page is missing its bundled JavaScript entrypoint: ${url}`);
   const assetUrl = new URL(script[1], expectedOrigin);
-  if (assetUrl.origin !== expectedOrigin || !assetUrl.pathname.startsWith("/assets/")) {
+  const assetsPath = assetUrl.pathname.indexOf("/assets/");
+  if (assetUrl.origin !== expectedOrigin || assetsPath < 0) {
     throw new Error(`Generated page points to a non-production JavaScript entrypoint: ${url}`);
   }
-  const assetPath = resolve(distDir, `.${decodeURIComponent(assetUrl.pathname)}`);
+  const assetPath = resolve(distDir, `.${decodeURIComponent(assetUrl.pathname.slice(assetsPath))}`);
   if (!assetPath.startsWith(`${distDir}${sep}`)) throw new Error(`Unsafe JavaScript asset path in generated page: ${url}`);
   await stat(assetPath).catch(() => {
     throw new Error(`Generated page references a missing JavaScript asset: ${url}`);

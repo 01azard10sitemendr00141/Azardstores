@@ -350,7 +350,7 @@ async function generateProductPages(siteUrl) {
   if (!template.includes("<!-- PAGE_METADATA_START -->") || !template.includes("<!-- PAGE_METADATA_END -->")) {
     throw new Error("The built dist/index.html is missing the page metadata insertion markers");
   }
-  if (!/<script\b(?=[^>]*\btype="module")(?=[^>]*\bsrc="\/assets\/[^\"]+\.js")[^>]*>/i.test(template)) {
+  if (!/<script\b(?=[^>]*\btype="module")(?=[^>]*\bsrc="(?:[^\"]*\/)?assets\/[^\"]+\.js")[^>]*>/i.test(template)) {
     throw new Error("The built dist/index.html is missing its bundled JavaScript entrypoint");
   }
 
