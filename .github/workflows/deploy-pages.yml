@@ -32,6 +32,9 @@ jobs:
       - name: Build website
         working-directory: frontend
         run: npm run build
+        env:
+          VITE_SITE_URL: https://ianeyan.github.io
+          SEO_ALLOW_EMPTY_CATALOG: "true"
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
