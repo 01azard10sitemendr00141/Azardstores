@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getProductSeoDescription } from "../src/utils/productSeo.js";
 
 const siteUrl = String(process.env.VITE_SITE_URL || "").trim().replace(/\/+$/, "");
 const apiUrl = String(process.env.VITE_API_URL || "").trim().replace(/\/+$/, "");
@@ -124,8 +125,7 @@ function absoluteAssetUrl(value, siteUrl) {
 
 function productDocument(template, product, siteUrl) {
   const name = textOnly(product.name) || "Product";
-  const description = textOnly(product.description).slice(0, 300)
-    || `Shop ${name} at Azard Stores, Kenya's digital mall.`;
+  const description = getProductSeoDescription({ ...product, name });
   const url = `${siteUrl}/product/${encodeURIComponent(product.slug)}`;
   const image = absoluteAssetUrl(product.images?.[0], siteUrl) || `${siteUrl}/pics/azard-stores-banner.png`;
   const returnPolicyCategory = product.returnEligibility === "final_sale" || product.returnEligibility === "perishable" || product.returnEligibility === "digital_product"

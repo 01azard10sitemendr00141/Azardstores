@@ -28,6 +28,7 @@ const {
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB cap
 const MAX_BULK_EDIT_PRODUCTS = 500;
+const IMPORT_MATCH_BATCH_SIZE = 25;
 
 async function buildAdminQuery(input) {
   const floor = queryText(input?.floor, 64);
@@ -715,10 +716,20 @@ router.get("/admin/:id/inventory-history", protect, requireRole("admin"), async 
   try {
     const product = await Product.findById(req.params.id)
       .select("name +inventoryHistory")
-      .populate("inventoryHistory.shopId", "name shopNumber")
       .lean();
     if (!product) return res.status(404).json({ message: "Product not found" });
-    const entries = (product.inventoryHistory || []).slice().sort((left, right) => new Date(right.changedAt) - new Date(left.changedAt));
+    const history = product.inventoryHistory || [];
+    const shopIds = [...new Set(history.map((entry) => entry.shopId?.toString()).filter(Boolean))];
+    const shops = shopIds.length
+      ? await Shop.find({ _id: { $in: shopIds } }).select("name shopNumber").lean()
+      : [];
+    const shopsById = new Map(shops.map((shop) => [String(shop._id), shop]));
+    const entries = history
+      .map((entry) => ({
+        ...entry,
+        shopId: entry.shopId ? shopsById.get(String(entry.shopId)) || null : null,
+      }))
+      .sort((left, right) => new Date(right.changedAt) - new Date(left.changedAt));
     res.json({ product: { _id: product._id, name: product.name }, entries });
   } catch (err) { next(err); }
 });
@@ -1151,6 +1162,54 @@ router.post("/bulk-import/preview", protect, requireRole("admin"), upload.single
       ? [entry.product.sku, ...(entry.product.variants || []).map((variant) => variant.sku)]
         .map((sku) => String(sku || "").trim().toUpperCase()).filter(Boolean)
       : []));
+    const candidateProductsByEntry = new Map();
+    const candidateEntries = mapped.filter((entry) => entry.product);
+    for (let offset = 0; offset < candidateEntries.length; offset += IMPORT_MATCH_BATCH_SIZE) {
+      const batch = candidateEntries.slice(offset, offset + IMPORT_MATCH_BATCH_SIZE);
+      const batchSkus = [...new Set(batch.flatMap(({ product }) => [
+        product.sku,
+        ...(product.variants || []).map((variant) => variant.sku),
+      ]).map((sku) => String(sku || "").trim()).filter(Boolean))];
+      const regexes = batchSkus.map((sku) => new RegExp(`^${escapeRegExp(sku)}$`, "i"));
+      const candidateConditions = [];
+      if (regexes.length) candidateConditions.push(
+        { sku: { $in: regexes } },
+        { "variants.sku": { $in: regexes } },
+        { skuCodes: { $in: batchSkus.map((sku) => sku.toUpperCase()) } },
+      );
+      const names = new Map();
+      for (const { product } of batch) {
+        if (!product.name) continue;
+        const key = `${product.name.toLowerCase()}\u0000${String(product.brand || "").toLowerCase()}`;
+        if (!names.has(key)) {
+          names.set(key, {
+            name: new RegExp(`^${escapeRegExp(product.name)}$`, "i"),
+            ...(product.brand ? { brand: new RegExp(`^${escapeRegExp(product.brand)}$`, "i") } : {}),
+          });
+        }
+      }
+      candidateConditions.push(...names.values());
+      if (!candidateConditions.length) continue;
+      const matchingProducts = await Product.find({ $or: candidateConditions })
+        .select("name sku skuCodes brand shop variants.sku variants.name status isActive")
+        .populate({ path: "shop", select: "name shopNumber floor", populate: { path: "floor", select: "name floorNumber" } })
+        .lean();
+      for (const entry of batch) {
+        const product = entry.product;
+        const sourceSkus = new Set([product.sku, ...(product.variants || []).map((variant) => variant.sku)]
+          .map((sku) => String(sku || "").trim().toUpperCase()).filter(Boolean));
+        const sourceName = String(product.name || "").trim().toLowerCase();
+        const sourceBrand = String(product.brand || "").trim().toLowerCase();
+        candidateProductsByEntry.set(entry.index, matchingProducts.filter((candidate) => {
+          const candidateSkus = [candidate.sku, ...(candidate.variants || []).map((variant) => variant.sku), ...(candidate.skuCodes || [])]
+            .map((sku) => String(sku || "").trim().toUpperCase()).filter(Boolean);
+          const matchesSku = candidateSkus.some((sku) => sourceSkus.has(sku));
+          const matchesName = String(candidate.name || "").trim().toLowerCase() === sourceName
+            && (!product.brand || String(candidate.brand || "").trim().toLowerCase() === sourceBrand);
+          return matchesSku || matchesName;
+        }).slice(0, 10));
+      }
+    }
     for (const entry of mapped) {
       if (!entry.product) {
         items.push({ index: entry.index, product: null, errors: [entry.reason || "This row could not be imported."], candidates: [] });
@@ -1159,21 +1218,7 @@ router.post("/bulk-import/preview", protect, requireRole("admin"), upload.single
       const p = entry.product;
       const placementSuggestion = suggestImportPlacement(p.sourcePlacement, floors, shopsOnActiveFloors);
       const skus = [p.sku, ...(p.variants || []).map((variant) => variant.sku)].filter(Boolean).map((sku) => String(sku).trim());
-      const regexes = skus.map((sku) => new RegExp(`^${escapeRegExp(sku)}$`, "i"));
-      const candidateConditions = [];
-      if (regexes.length) candidateConditions.push(
-        { sku: { $in: regexes } },
-        { "variants.sku": { $in: regexes } },
-        { skuCodes: { $in: skus.map((sku) => sku.toUpperCase()) } },
-      );
-      if (p.name) candidateConditions.push({
-        name: new RegExp(`^${escapeRegExp(p.name)}$`, "i"),
-        ...(p.brand ? { brand: new RegExp(`^${escapeRegExp(p.brand)}$`, "i") } : {}),
-      });
-      const candidates = candidateConditions.length
-        ? await Product.find({ $or: candidateConditions })
-          .select("name sku brand shop variants.sku variants.name status isActive").populate({ path: "shop", select: "name shopNumber floor", populate: { path: "floor", select: "name floorNumber" } }).limit(10)
-        : [];
+      const candidates = candidateProductsByEntry.get(entry.index) || [];
       const generatedSkus = { product: false, variants: [] };
       if (!candidates.length) {
         if (p.variants?.length) {

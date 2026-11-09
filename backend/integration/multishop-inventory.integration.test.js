@@ -41,7 +41,7 @@ function routeHandler(path) {
   return route.stack.at(-1).handle;
 }
 
-async function invokeAdminRoute(path, params, body) {
+async function invokeAdminRoute(path, params, body, file) {
   const response = {
     statusCode: 200,
     body: null,
@@ -55,7 +55,7 @@ async function invokeAdminRoute(path, params, body) {
     },
   };
   let forwardedError;
-  await routeHandler(path)({ params, body }, response, (error) => {
+  await routeHandler(path)({ params, body, file }, response, (error) => {
     forwardedError = error;
   });
   if (forwardedError) throw forwardedError;
@@ -65,6 +65,68 @@ async function invokeAdminRoute(path, params, body) {
 async function loadInventory(productId) {
   return Product.findById(productId).select("+inventoryLocations +inventoryHistory");
 }
+
+test("inventory history returns shop details without colliding projections", async () => {
+  const product = await Product.create({
+    name: "Inventory History Product",
+    shop: primaryShop._id,
+    stock: 5,
+    inventoryHistory: [{
+      type: "restock",
+      delta: 2,
+      previousStock: 3,
+      stock: 5,
+      shopId: secondShop._id,
+      changedAt: new Date("2026-01-02T00:00:00.000Z"),
+    }],
+  });
+
+  const response = await invokeAdminRoute("/admin/:id/inventory-history", { id: String(product._id) }, {});
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.product.name, "Inventory History Product");
+  assert.equal(response.body.entries.length, 1);
+  assert.equal(String(response.body.entries[0].shopId._id), String(secondShop._id));
+  assert.equal(response.body.entries[0].shopId.name, "Second Shop");
+  assert.equal(response.body.entries[0].shopId.shopNumber, secondShop.shopNumber);
+});
+
+test("CSV preview batches existing-product matching instead of querying once per row", async () => {
+  await Product.create([
+    { name: "Preview Product One", sku: "PREVIEW-001", shop: primaryShop._id, stock: 5 },
+    { name: "Preview Product Two", sku: "PREVIEW-002", shop: secondShop._id, stock: 7 },
+  ]);
+  const csv = [
+    "Name,SKU,Type,Regular price,Stock,Categories,Images",
+    "Preview Product One,PREVIEW-001,simple,100,5,Furniture,https://example.com/one.jpg",
+    "Preview Product Two,PREVIEW-002,simple,200,7,Kitchen,https://example.com/two.jpg",
+  ].join("\n");
+  const originalFind = Product.find;
+  let productFindCount = 0;
+  Product.find = function (...args) {
+    productFindCount += 1;
+    return originalFind.apply(this, args);
+  };
+  let response;
+  try {
+    response = await invokeAdminRoute(
+      "/bulk-import/preview",
+      {},
+      {},
+      { buffer: Buffer.from(csv) },
+    );
+  } finally {
+    Product.find = originalFind;
+  }
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.items.length, 2);
+  assert.deepEqual(response.body.items.map((item) => item.candidates.map((candidate) => candidate.name)), [
+    ["Preview Product One"],
+    ["Preview Product Two"],
+  ]);
+  assert.equal(productFindCount, 1);
+});
 
 test("shop transfer atomically moves stock, records both movements, and safely retries", async () => {
   const product = await Product.create({

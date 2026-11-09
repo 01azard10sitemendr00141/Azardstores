@@ -12,6 +12,7 @@ import StripProductCard from "../components/StripProductCard";
 import Breadcrumbs from "../components/Breadcrumbs";
 import { getStartingPrice } from "../utils/productPricing";
 import { productImageUrl } from "../utils/productImageUrl";
+import { getProductSeoDescription } from "../utils/productSeo";
 import { recordRecentlyViewed } from "../utils/recentlyViewed";
 
 function WhatsAppIcon({ size = 16 }) {
@@ -106,8 +107,7 @@ export default function Product() {
     if (!product) return;
     const title = `${product.name} | Azard Stores`;
     document.querySelector('meta[name="robots"]')?.remove();
-    const description = String(product.description || product.longDescription || `Shop ${product.name} at Azard Stores, Kenya's digital mall.`)
-      .replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+    const description = getProductSeoDescription(product);
     const canonicalUrl = `${window.location.origin}/product/${encodeURIComponent(product.slug || slug)}`;
     const image = productImageUrl(product.images?.[0], { width: 1200, quality: 82 }) || `${window.location.origin}/pics/azard-stores-banner.png`;
     document.title = title;

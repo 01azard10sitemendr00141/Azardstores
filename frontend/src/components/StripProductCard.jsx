@@ -18,7 +18,7 @@ function WhatsAppIcon({ size = 13 }) {
 }
 
 // ─── Wishlist helpers ─────────────────────────────────────────────────────────
-export default function StripProductCard({ product, size = "default" }) {
+export default function StripProductCard({ product, size = "default", priority = false }) {
   const isLarge = size === "large";
   const navigate = useNavigate();
   const { addItem, items } = useCart();
@@ -84,7 +84,17 @@ export default function StripProductCard({ product, size = "default" }) {
       <div className="aspect-square overflow-hidden bg-mall-700 relative">
         <Link to={`/product/${product.slug}`} aria-label={`View ${product.name}`} className="absolute inset-0 z-0">
           {product.images?.[0] && !imageFailed ? (
-          <img src={productImageUrl(product.images[0], { width: isLarge ? 640 : 480, quality: 76 })} alt="" loading="lazy" decoding="async" onError={() => setImageFailed(true)} className="w-full h-full object-cover group-hover:scale-105 transition duration-500" />
+          <img
+            src={productImageUrl(product.images[0], { width: isLarge ? 480 : 320, quality: 72 })}
+            alt=""
+            width={isLarge ? 480 : 320}
+            height={isLarge ? 480 : 320}
+            loading={priority ? "eager" : "lazy"}
+            fetchPriority={priority ? "high" : "auto"}
+            decoding="async"
+            onError={() => setImageFailed(true)}
+            className="w-full h-full object-cover group-hover:scale-105 transition duration-500"
+          />
           ) : (
             <div className="w-full h-full flex items-center justify-center">
               <ShoppingBasket size={28} className="text-cream/20" />

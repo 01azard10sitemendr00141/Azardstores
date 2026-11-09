@@ -149,8 +149,8 @@ function ProductInventoryHistory({ product }) {
   }
 
   return <>
-    <button type="button" aria-expanded={open} aria-label={`View stock history for ${product.name}`} onClick={toggle} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-mall-accent sm:w-11 sm:flex-none sm:px-0">
-      <History size={13} /><span className="text-[11px] sm:hidden">History</span>
+    <button type="button" aria-expanded={open} aria-label={`View stock history for ${product.name}`} onClick={toggle} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-mall-accent xl:w-11 xl:flex-none xl:px-0">
+      <History size={13} /><span className="text-[11px] xl:hidden">History</span>
     </button>
     {open && <section className="mt-2 rounded-xl border border-cream/10 bg-mall-900/50 p-3" aria-label={`Stock history for ${product.name}`}>
       <h3 className="text-xs font-semibold text-cream">Inventory history</h3>
@@ -1258,7 +1258,7 @@ export default function AdminProducts() {
                     <ProductForm initial={product} floors={floors} shops={shops} categories={categories} brands={brands} onSave={(form) => handleEdit(product._id, form)} onCancel={() => setEditId(null)} />
                   </div>
                 ) : (
-                  <div className="grid grid-cols-[auto_auto_minmax(0,1fr)] items-center gap-x-3 gap-y-3 rounded-xl border border-cream/10 bg-mall-900/35 p-3 transition-colors hover:bg-mall-900/55 sm:grid-cols-[auto_auto_minmax(0,1.35fr)_minmax(10rem,0.8fr)_minmax(9rem,0.75fr)_auto] sm:gap-4 sm:p-4">
+                  <div className="grid grid-cols-[auto_auto_minmax(0,1fr)] items-center gap-x-3 gap-y-3 rounded-xl border border-cream/10 bg-mall-900/35 p-3 transition-colors hover:bg-mall-900/55 xl:grid-cols-[auto_auto_minmax(0,1.35fr)_minmax(10rem,0.8fr)_minmax(9rem,0.75fr)_auto] xl:gap-4 xl:p-4">
                     <label className="flex h-11 w-11 shrink-0 items-center justify-center sm:h-5 sm:w-5">
                       <input
                         type="checkbox"
@@ -1284,7 +1284,7 @@ export default function AdminProducts() {
                       <p className="w-full break-words text-cream text-[15px] font-semibold leading-snug">{product.name}</p>
                       <p className="mt-1 break-words font-mono-tag text-[11px] tracking-wide text-cream/65">{product.sku || "SKU not set"}</p>
                     </div>
-                    <div className="col-span-3 grid min-w-0 grid-cols-2 gap-3 border-t border-cream/10 pt-2.5 sm:col-span-1 sm:block sm:border-t-0 sm:pt-0">
+                    <div className="col-span-3 grid min-w-0 grid-cols-2 gap-3 border-t border-cream/10 pt-2.5 xl:col-span-1 xl:block xl:border-t-0 xl:pt-0">
                       <div className="min-w-0">
                         <p className="font-mono-tag text-[10px] uppercase tracking-widest text-cream/60">Price</p>
                         <p className="font-display mt-0.5 break-words text-base text-cream/90">{getStartingPrice(product) ? `${product.variants?.length ? "From " : ""}KSh ${getStartingPrice(product).toLocaleString()}` : "Price not set"}</p>
@@ -1295,7 +1295,7 @@ export default function AdminProducts() {
                         {getLowStockWarning(product) && <p className="mt-1 text-[10px] font-medium text-amber-200" role="status">{getLowStockWarning(product)}</p>}
                       </div>
                     </div>
-                    <div className="col-span-3 min-w-0 border-t border-cream/10 pt-2.5 sm:col-span-1 sm:border-t-0 sm:pt-0">
+                    <div className="col-span-3 min-w-0 border-t border-cream/10 pt-2.5 xl:col-span-1 xl:border-t-0 xl:pt-0">
                       <span className={`inline-flex rounded-full border px-2.5 py-1 text-[9px] font-semibold uppercase tracking-wide ${product.status === "published" ? "border-emerald-300/20 bg-emerald-500/10 text-emerald-300" : product.status === "archived" ? "border-red-300/30 bg-red-400/15 text-red-200" : "border-amber-300/20 bg-amber-500/10 text-amber-200"}`}>{product.status === "archived" ? "Archived" : (product.status || (product.isActive ? "published" : "draft"))}</span>
                       {product.shop && <p className="mt-0.5 break-words text-cream/60 text-[11px]">Shop #{product.shop.shopNumber} · {product.shop.name}</p>}
                       {product.shop?.isActive === false && <p className="mt-0.5 text-amber-200/80 text-[10px]">Shop inactive · hidden from storefront and new checkout</p>}
@@ -1304,20 +1304,20 @@ export default function AdminProducts() {
                       {product.catalogReview?.duplicateSiblings?.length > 0 && <details className="mt-1"><summary className="cursor-pointer text-[10px] text-amber-200">Possible duplicate · {product.catalogReview.duplicateSiblings.length} match{product.catalogReview.duplicateSiblings.length === 1 ? "" : "es"}</summary><ul className="mt-1 list-disc space-y-0.5 pl-4">{product.catalogReview.duplicateSiblings.map((sibling) => <li key={sibling._id} className="text-[10px] text-amber-100/70">{sibling.name}{sibling.brand ? ` · ${sibling.brand}` : ""} · same shop</li>)}</ul></details>}
                       {product.catalogReview?.archiveReview && <p className="mt-1 text-[10px] text-amber-100/75">Review: {product.catalogReview.archiveReview}</p>}
                     </div>
-                    <div className="col-span-3 flex w-full items-center justify-end gap-2 border-t border-cream/10 pt-2.5 sm:col-auto sm:ml-0 sm:w-auto sm:border-t-0 sm:pt-0">
-                      <button type="button" aria-label={`Restock ${product.name}`} title="Record stock received" onClick={() => setRestockTarget(product)} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-mall-accent sm:w-11 sm:flex-none sm:px-0"><Plus size={13} /><span className="text-[11px] sm:hidden">Restock</span></button>
+                    <div className="col-span-3 flex w-full items-center justify-end gap-2 border-t border-cream/10 pt-2.5 xl:col-auto xl:ml-0 xl:w-auto xl:border-t-0 xl:pt-0">
+                      <button type="button" aria-label={`Restock ${product.name}`} title="Record stock received" onClick={() => setRestockTarget(product)} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-mall-accent xl:w-11 xl:flex-none xl:px-0"><Plus size={13} /><span className="text-[11px] xl:hidden">Restock</span></button>
                       <ProductInventoryHistory product={product} />
                       <button type="button" aria-label={`Edit ${product.name}`} title={`Edit ${product.name}`} onClick={() => { setEditId(product._id); setShowAdd(false); }} disabled={metadataLoading || Boolean(metadataError)}
-                        className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-cream disabled:opacity-30 disabled:cursor-not-allowed sm:min-h-11 sm:w-11 sm:flex-none sm:px-0">
-                        <Pencil size={13} /><span className="text-[11px] sm:hidden">Edit</span>
+                        className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-cream disabled:opacity-30 disabled:cursor-not-allowed xl:min-h-11 xl:w-11 xl:flex-none xl:px-0">
+                        <Pencil size={13} /><span className="text-[11px] xl:hidden">Edit</span>
                       </button>
                       {product.status === "archived" ? (
                         <>
-                          <button type="button" aria-label={`Restore ${product.name} as draft`} title="Restore as draft" onClick={() => handleRestore(product)} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-emerald-300 sm:w-11 sm:flex-none sm:px-0"><ArchiveRestore size={13} /><span className="text-[11px] sm:hidden">Restore</span></button>
-                          <button type="button" aria-label={`Permanently delete ${product.name}`} title="Permanently delete" onClick={() => { setDeleteError(""); setDeleteTarget(product); }} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-red-400 sm:w-11 sm:flex-none sm:px-0"><Trash2 size={13} /><span className="text-[11px] sm:hidden">Delete</span></button>
+                          <button type="button" aria-label={`Restore ${product.name} as draft`} title="Restore as draft" onClick={() => handleRestore(product)} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-emerald-300 xl:w-11 xl:flex-none xl:px-0"><ArchiveRestore size={13} /><span className="text-[11px] xl:hidden">Restore</span></button>
+                          <button type="button" aria-label={`Permanently delete ${product.name}`} title="Permanently delete" onClick={() => { setDeleteError(""); setDeleteTarget(product); }} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-red-400 xl:w-11 xl:flex-none xl:px-0"><Trash2 size={13} /><span className="text-[11px] xl:hidden">Delete</span></button>
                         </>
                       ) : (
-                        <button type="button" aria-label={`Archive ${product.name}`} title="Archive product" onClick={() => handleArchive(product)} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-amber-300 sm:w-11 sm:flex-none sm:px-0"><Archive size={13} /><span className="text-[11px] sm:hidden">Archive</span></button>
+                        <button type="button" aria-label={`Archive ${product.name}`} title="Archive product" onClick={() => handleArchive(product)} className="flex min-h-11 flex-1 items-center justify-center gap-1.5 rounded-lg bg-mall-800 px-2 text-cream/65 transition hover:text-amber-300 xl:w-11 xl:flex-none xl:px-0"><Archive size={13} /><span className="text-[11px] xl:hidden">Archive</span></button>
                       )}
                     </div>
                   </div>

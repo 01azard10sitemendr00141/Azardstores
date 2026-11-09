@@ -7,12 +7,13 @@ import {
   TrendingUp, Lock, Store, Target,
   Briefcase, Gamepad2, Plane, Activity,
   Award, Heart, Tag, Gift, Crown, ThumbsUp, ShoppingBag,
-  CreditCard, ClipboardCheck, MapPin, Truck, Clock3,
+  MapPin, Truck, Clock3,
 } from "lucide-react";
 import api from "../api/client";
 import StripProductCard from "../components/StripProductCard";
 import { getHomeCache, setHomeCache } from "../utils/homeCache";
 import { normalizeHomepageContent } from "../utils/homepageContent";
+import { organizeHomepageSections } from "../utils/homepageProducts";
 import { productImageUrl } from "../utils/productImageUrl";
 import {
   readRecentlyViewed,
@@ -36,11 +37,36 @@ const HOME_REQUEST_TIMEOUT_MS = 15_000;
 // hover-preview thumbnails, not the real clips, which is why they look
 // blurry and play back looking sped up. Download the real file from the
 // clip's page on mixkit.co and host it yourself.
-function ZoneBg({ src, type = "video", poster, overlay = "bg-mall-900/60", alt = "", mobileSrc = "", mediumSrc = "" }) {
+function ZoneBg({ src, type = "video", poster, overlay = "bg-mall-900/60", alt = "", mobileSrc = "", mediumSrc = "", deferMedia = false }) {
+  const containerRef = useRef(null);
   const videoRef = useRef(null);
   const [reducedMotion, setReducedMotion] = useState(false);
   const [mediaFailed, setMediaFailed] = useState(false);
+  const [mediaReady, setMediaReady] = useState(!deferMedia);
   const mediaFitClass = "object-cover";
+
+  useEffect(() => {
+    if (!deferMedia) {
+      setMediaReady(true);
+      return;
+    }
+
+    const container = containerRef.current;
+    if (!container) return;
+    if (!("IntersectionObserver" in window)) {
+      setMediaReady(true);
+      return;
+    }
+
+    const observer = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) {
+        setMediaReady(true);
+        observer.disconnect();
+      }
+    }, { rootMargin: "0px 0px 120px 0px" });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [deferMedia]);
 
   useEffect(() => {
     const preference = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -52,15 +78,15 @@ function ZoneBg({ src, type = "video", poster, overlay = "bg-mall-900/60", alt =
   useEffect(() => {
     setMediaFailed(false);
     const video = videoRef.current;
-    if (!video || type !== "video") return;
+    if (!video || type !== "video" || !mediaReady) return;
     video.playbackRate = 1;
     if (reducedMotion) video.pause();
     else video.play().catch(() => {});
-  }, [src, type, reducedMotion]);
+  }, [src, type, reducedMotion, mediaReady]);
 
   return (
-    <div className="absolute inset-0 z-0 overflow-hidden">
-      {type === "image" ? (
+    <div ref={containerRef} className="absolute inset-0 z-0 overflow-hidden">
+      {mediaReady && type === "image" ? (
         src && !mediaFailed && (
           (mobileSrc || mediumSrc) ? (
             <picture className="absolute inset-0 h-full w-full">
@@ -74,31 +100,20 @@ function ZoneBg({ src, type = "video", poster, overlay = "bg-mall-900/60", alt =
             </picture>
           )
         )
-      ) : (
+      ) : mediaReady ? (
         <>
           {poster && <img src={poster} alt="" onError={(e) => e.currentTarget.remove()} className={`absolute inset-0 w-full h-full ${mediaFitClass}`} />}
           {src && !mediaFailed && <video ref={videoRef} autoPlay={!reducedMotion} muted loop playsInline preload={reducedMotion ? "none" : "metadata"} onError={() => setMediaFailed(true)} className={`absolute inset-0 w-full h-full ${mediaFitClass}`}>
             <source src={src} type="video/mp4" />
           </video>}
         </>
-      )}
+      ) : null}
       <div className={`absolute inset-0 ${overlay}`} />
     </div>
   );
 }
 
 // ─── Still-photo accent background ─────────────────────────────────────────────
-// A quiet, non-moving alternative to ZoneBg — for a section that deserves a
-// photographic moment without adding another layer of motion to the page.
-function PhotoBg({ src, overlay = "bg-mall-900/75" }) {
-  return (
-    <div className="absolute inset-0 -z-[1] overflow-hidden rounded-2xl bg-gradient-to-br from-mall-800 to-mall-900">
-      {src && <img src={src} alt="" onError={(e) => e.currentTarget.remove()} className="w-full h-full object-cover" loading="lazy" />}
-      <div className={`absolute inset-0 ${overlay}`} />
-    </div>
-  );
-}
-
 // ─── Floor icons ──────────────────────────────────────────────────────────────
 const FLOOR_ICONS = {
   1: Shirt, 2: Cpu, 3: Sparkles, 4: ShoppingBasket,
@@ -106,7 +121,7 @@ const FLOOR_ICONS = {
 };
 
 // ─── Product strip ────────────────────────────────────────────────────────────
-function ProductStrip({ products, cardSize }) {
+function ProductStrip({ products, cardSize, priorityCount = 0 }) {
   const ref = useRef(null);
   const scroll = (dir) => ref.current?.scrollBy({ left: dir * (cardSize === "large" ? 280 : 200), behavior: "smooth" });
   if (!products.length) return null;
@@ -118,7 +133,7 @@ function ProductStrip({ products, cardSize }) {
       </button>
       <div ref={ref} className={`flex ${cardSize === "large" ? "gap-3.5 sm:gap-4" : "gap-2.5 sm:gap-3"} overflow-x-auto px-4 sm:px-0 pb-3`}
         style={{ scrollbarWidth: "none", msOverflowStyle: "none", WebkitOverflowScrolling: "touch" }}>
-        {products.map((p) => <StripProductCard key={p._id} product={p} size={cardSize} />)}
+        {products.map((p, index) => <StripProductCard key={p._id} product={p} size={cardSize} priority={index < priorityCount} />)}
         <div className="shrink-0 w-2 sm:hidden" />
       </div>
       <button onClick={() => scroll(1)} aria-label="Scroll right"
@@ -164,13 +179,7 @@ function HomeSectionBlock({ section, homepageContent }) {
             linkTo={section.shop ? `/shop/${section.shop.slug}` : undefined}
             linkLabel={homepageContent.featuredShopLinkLabel}
           />
-          <div className="relative rounded-2xl p-3 sm:p-5">
-            <PhotoBg
-              src={homepageContent.featuredShopBackdropUrl}
-              overlay="bg-mall-900/78"
-            />
-            <FeaturedShop shop={section.shop} products={section.products} linkLabel={homepageContent.featuredShopLinkLabel} />
-          </div>
+          <FeaturedShop shop={section.shop} products={section.products} />
         </div>
       </section>
     );
@@ -234,17 +243,7 @@ function RecentlyViewedSection({ products }) {
               className="group flex min-h-[88px] w-[min(76vw,280px)] shrink-0 items-center gap-3 rounded-xl border border-cream/10 bg-mall-900/70 p-2.5 transition hover:border-mall-accent/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-mall-accent sm:w-[280px]"
             >
               <div className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-mall-800">
-                {product.image ? (
-                  <img
-                    src={productImageUrl(product.image, { width: 192, quality: 72 })}
-                    alt=""
-                    loading="lazy"
-                    decoding="async"
-                    className="h-full w-full object-cover transition duration-300 group-hover:scale-105 motion-reduce:transition-none"
-                  />
-                ) : (
-                  <Package size={22} aria-hidden="true" className="text-cream/30" />
-                )}
+                <ProductThumbnail image={product.image} width={160} quality={68} />
               </div>
               <span className="min-w-0 flex-1">
                 <span className="line-clamp-2 block text-sm font-medium leading-snug text-cream">{product.name}</span>
@@ -260,38 +259,61 @@ function RecentlyViewedSection({ products }) {
   );
 }
 
+function ProductThumbnail({ image, width, quality, alt = "", className = "h-full w-full object-cover" }) {
+  const [imageFailed, setImageFailed] = useState(false);
+  useEffect(() => setImageFailed(false), [image]);
+
+  if (!image || imageFailed) {
+    return (
+      <span className="flex h-full w-full items-center justify-center" aria-hidden="true">
+        <Package size={22} className="text-cream/30" />
+      </span>
+    );
+  }
+
+  return (
+    <img
+      src={productImageUrl(image, { width, quality })}
+      alt={alt}
+      width={width}
+      height={width}
+      loading="lazy"
+      decoding="async"
+      onError={() => setImageFailed(true)}
+      className={className}
+    />
+  );
+}
+
 // ─── Floor card ───────────────────────────────────────────────────────────────
-function FloorCard({ floor, variant = "normal" }) {
+function FloorCard({ floor }) {
   const Icon = FLOOR_ICONS[floor.floorNumber] || Cpu;
   const [imageFailed, setImageFailed] = useState(false);
   useEffect(() => setImageFailed(false), [floor.image]);
-  const aspectClass = {
-    hero: "aspect-[16/9] sm:aspect-[21/9]",
-    normal: "aspect-[4/3]",
-    wide: "aspect-[16/9] sm:aspect-[2/1]",
-  }[variant];
   const hasImage = Boolean(floor.image && !imageFailed);
   return (
     <Link to={`/floor/${floor.slug}`}
-      className={`group relative rounded-xl sm:rounded-2xl overflow-hidden bg-mall-800/80 backdrop-blur-sm hover:ring-2 hover:ring-mall-accent transition block w-full ${hasImage ? "" : aspectClass}`}>
+      className="group relative block aspect-[4/3] w-full overflow-hidden rounded-xl border border-cream/10 bg-mall-800/80 transition hover:border-mall-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-mall-accent focus-visible:ring-offset-2 focus-visible:ring-offset-mall-900">
       {hasImage ? (
-        <img src={floor.image} alt={floor.name} loading={variant === "hero" ? "eager" : "lazy"} decoding="async" onError={() => setImageFailed(true)} className="relative z-0 block h-auto w-full" />
+        <img src={floor.image} alt="" loading="lazy" decoding="async" sizes="(min-width: 1536px) 20vw, (min-width: 1024px) 25vw, (min-width: 640px) 33vw, 50vw" onError={() => setImageFailed(true)} className="absolute inset-0 h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]" />
       ) : (
-        <div className="absolute inset-0 bg-gradient-to-br from-mall-800 to-mall-700" />
-      )}
-      <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/10 to-transparent" />
-      <div className="absolute bottom-0 left-0 right-0 p-3 sm:p-4">
-        <div className="flex items-center gap-1.5 mb-0.5">
-          <span className="w-5 h-5 rounded-md bg-mall-accent/20 flex items-center justify-center shrink-0">
-            <Icon size={10} className="text-mall-accent" />
-          </span>
-          <span className="font-mono-tag text-[9px] text-mall-orange uppercase tracking-widest">Floor {floor.floorNumber}</span>
+        <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-mall-800 to-mall-700">
+          <Icon size={34} strokeWidth={1.2} className="text-cream/15" aria-hidden="true" />
         </div>
-        <h3 className={`font-display text-cream leading-tight ${variant === "hero" ? "text-base sm:text-xl md:text-2xl" : variant === "wide" ? "text-base sm:text-lg" : "text-sm sm:text-base"}`}>{floor.name}</h3>
-        <p className="text-cream/50 text-[10px] mt-0.5 font-mono-tag">{floor.shopCount} {floor.shopCount === 1 ? "shop" : "shops"}</p>
+      )}
+      <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/20 to-black/5" />
+      <div className="absolute inset-x-0 bottom-0 p-2.5 sm:p-3">
+        <div className="mb-1 flex items-center gap-1.5">
+          <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-mall-900/70 text-mall-accent">
+            <Icon size={11} aria-hidden="true" />
+          </span>
+          <span className="font-mono-tag text-[9px] uppercase tracking-widest text-mall-orange">Floor {floor.floorNumber}</span>
+        </div>
+        <h3 className="line-clamp-1 font-display text-sm leading-tight text-cream sm:text-base">{floor.name}</h3>
+        <p className="mt-0.5 font-mono-tag text-[10px] text-cream/70">{floor.shopCount} {floor.shopCount === 1 ? "shop" : "shops"} open</p>
       </div>
-      <div className="absolute top-2 right-2 w-7 h-7 rounded-full bg-black/0 group-hover:bg-black/20 flex items-center justify-center transition">
-        <ArrowRight size={12} className="text-cream/0 group-hover:text-cream transition" />
+      <div aria-hidden="true" className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-full bg-black/30 text-cream/80 transition group-hover:bg-mall-accent group-hover:text-mall-900">
+        <ArrowRight size={12} />
       </div>
     </Link>
   );
@@ -300,23 +322,9 @@ function FloorCard({ floor, variant = "normal" }) {
 function FloorShowcase({ floors, shopsByFloor }) {
   const activeFloors = floors.map((f) => ({ ...f, shopCount: (shopsByFloor[f._id] || []).filter((shop) => shop.status !== "closed").length })).filter((f) => f.shopCount > 0);
   if (activeFloors.length === 0) return null;
-  const [hero, ...rest] = activeFloors;
-  const hasOrphan = rest.length % 2 === 1;
   return (
-    <div className="space-y-2.5 sm:space-y-3">
-      <FloorCard floor={hero} variant="hero" />
-      {rest.length > 0 && (
-        <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2 sm:gap-3">
-          {rest.map((floor, index) => {
-            const isOrphan = hasOrphan && index === rest.length - 1;
-            return (
-              <div key={floor._id} className={isOrphan ? "sm:col-span-2" : undefined}>
-                <FloorCard floor={floor} variant={isOrphan ? "wide" : "normal"} />
-              </div>
-            );
-          })}
-        </div>
-      )}
+    <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 sm:gap-3 lg:grid-cols-4 2xl:grid-cols-5">
+      {activeFloors.map((floor) => <FloorCard key={floor._id} floor={floor} />)}
     </div>
   );
 }
@@ -366,12 +374,54 @@ function PurposeTile({ purpose }) {
 }
 
 // ─── Featured shop ────────────────────────────────────────────────────────────
-function FeaturedShop({ shop, products, linkLabel = "Visit Shop" }) {
+function FeaturedShop({ shop, products = [] }) {
+  const productsRailRef = useRef(null);
+  const [productsRailState, setProductsRailState] = useState({
+    hasOverflow: false,
+    canScrollLeft: false,
+    canScrollRight: false,
+  });
+  useEffect(() => {
+    const rail = productsRailRef.current;
+    if (!rail) return undefined;
+
+    const updateScrollState = () => {
+      const maxScrollLeft = rail.scrollWidth - rail.clientWidth;
+      const nextState = {
+        hasOverflow: maxScrollLeft > 1,
+        canScrollLeft: rail.scrollLeft > 1,
+        canScrollRight: rail.scrollLeft < maxScrollLeft - 1,
+      };
+      setProductsRailState((current) => (
+        current.hasOverflow === nextState.hasOverflow
+          && current.canScrollLeft === nextState.canScrollLeft
+          && current.canScrollRight === nextState.canScrollRight
+          ? current
+          : nextState
+      ));
+    };
+
+    updateScrollState();
+    rail.addEventListener("scroll", updateScrollState, { passive: true });
+    const observer = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(updateScrollState);
+    observer?.observe(rail);
+    window.addEventListener("resize", updateScrollState);
+    return () => {
+      rail.removeEventListener("scroll", updateScrollState);
+      observer?.disconnect();
+      window.removeEventListener("resize", updateScrollState);
+    };
+  }, [products.length, shop?._id]);
   if (!shop) return null;
   const Icon = FLOOR_ICONS[shop.floor?.floorNumber] || Store;
+  const scrollProducts = (direction) => {
+    productsRailRef.current?.scrollBy({ left: direction * 180, behavior: "smooth" });
+  };
   return (
-    <div className="bg-mall-900/70 backdrop-blur-sm rounded-2xl overflow-hidden border border-cream/10">
-      <div className="relative h-32 sm:h-44 overflow-hidden bg-mall-700">
+    <article className="overflow-hidden rounded-2xl border border-cream/10 bg-mall-900/80">
+      <div className="relative h-24 overflow-hidden bg-mall-700 sm:h-32">
         {shop.banner ? (
           <img src={shop.banner} alt={shop.name} loading="lazy" decoding="async" onError={(e) => e.currentTarget.remove()} className="w-full h-full object-cover" />
         ) : (
@@ -380,35 +430,66 @@ function FeaturedShop({ shop, products, linkLabel = "Visit Shop" }) {
           </div>
         )}
         <div className="absolute inset-0 bg-gradient-to-t from-mall-900/80 via-transparent to-transparent" />
-        <div className="absolute bottom-3 left-4 flex items-center gap-2">
-          <span className="font-mono-tag text-[9px] bg-mall-orange text-mall-900 px-2 py-0.5 rounded-full uppercase font-semibold">Shop #{shop.shopNumber}</span>
-          <span className="font-mono-tag text-[9px] text-cream/60 uppercase"><Icon size={9} className="inline mr-1" />Floor {shop.floor?.floorNumber}</span>
+        <div className="absolute bottom-2.5 left-4 flex items-center gap-2 font-mono-tag text-[10px] uppercase tracking-wide text-cream/80 sm:bottom-3 sm:left-5">
+          <span>Shop #{shop.shopNumber}</span>
+          <span aria-hidden="true" className="text-cream/40">/</span>
+          <span><Icon size={10} className="mr-1 inline" />Floor {shop.floor?.floorNumber}</span>
         </div>
       </div>
       <div className="p-4 sm:p-5">
-        <div className="flex items-start justify-between gap-3 mb-3">
-          <div>
-            <h3 className="font-display text-cream text-lg sm:text-xl">{shop.name}</h3>
-            <p className="text-cream/50 text-xs mt-0.5 line-clamp-1">{shop.description}</p>
-          </div>
-          <Link to={`/shop/${shop.slug}`} className="shrink-0 flex items-center gap-1.5 bg-mall-accent text-mall-900 text-xs font-semibold px-3 py-2 rounded-full hover:bg-mall-accentDark transition whitespace-nowrap">
-            {linkLabel} <ArrowRight size={12} />
-          </Link>
+        <div className="mb-4">
+          <h3 className="font-display text-lg text-cream sm:text-xl">{shop.name}</h3>
+          {shop.description && <p className="mt-1 line-clamp-2 max-w-3xl text-xs leading-relaxed text-cream/65 sm:text-sm">{shop.description}</p>}
         </div>
         {products.length > 0 && (
-          <div className="flex gap-2 overflow-x-auto pb-1" style={{ scrollbarWidth: "none" }}>
-            {products.slice(0, 6).map((p) => (
-              <Link key={p._id} to={`/product/${p.slug}`} className="shrink-0 w-16 sm:w-20 rounded-lg overflow-hidden bg-mall-700 hover:ring-1 hover:ring-mall-accent transition">
-                <div className="aspect-square overflow-hidden">
-                  {p.images?.[0] ? <img src={p.images[0]} alt={p.name} loading="lazy" decoding="async" onError={(e) => e.currentTarget.remove()} className="w-full h-full object-cover" /> : <div className="w-full h-full flex items-center justify-center"><Package size={14} className="text-cream/20" /></div>}
-                </div>
-                <p className="text-cream/70 text-[9px] px-1 py-1 line-clamp-1">{p.name}</p>
-              </Link>
-            ))}
+          <div className="relative -mx-4 sm:-mx-5">
+            <div
+              ref={productsRailRef}
+              role="region"
+              aria-label={`${shop.name} featured products`}
+              tabIndex={0}
+              className="flex snap-x snap-mandatory gap-2.5 overflow-x-auto overscroll-x-contain px-4 pb-2 sm:gap-3 sm:px-5 md:px-10"
+              style={{ scrollbarWidth: "none", msOverflowStyle: "none", WebkitOverflowScrolling: "touch" }}
+            >
+              {products.slice(0, 6).map((p) => (
+                <Link
+                  key={p._id}
+                  to={`/product/${p.slug}`}
+                  className="group w-24 shrink-0 snap-start overflow-hidden rounded-lg border border-cream/10 bg-mall-800/70 transition-colors hover:border-mall-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-mall-accent sm:w-28"
+                >
+                  <div className="aspect-square overflow-hidden bg-mall-700">
+                    <ProductThumbnail image={p.images?.[0]} width={160} quality={72} alt={p.name} className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]" />
+                  </div>
+                  <p className="break-words px-2 py-2 text-[11px] leading-snug text-cream/80">{p.name}</p>
+                </Link>
+              ))}
+            </div>
+            {productsRailState.hasOverflow && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => scrollProducts(-1)}
+                  aria-label="Scroll featured products left"
+                  disabled={!productsRailState.canScrollLeft}
+                  className="absolute left-1 top-[40%] z-10 hidden h-8 w-8 items-center justify-center rounded-full border border-cream/10 bg-mall-900/90 text-cream shadow-md transition hover:bg-mall-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-mall-accent disabled:cursor-not-allowed disabled:opacity-40 md:flex"
+                >
+                  <ChevronLeft size={16} aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => scrollProducts(1)}
+                  aria-label="Scroll featured products right"
+                  disabled={!productsRailState.canScrollRight}
+                  className="absolute right-1 top-[40%] z-10 hidden h-8 w-8 items-center justify-center rounded-full border border-cream/10 bg-mall-900/90 text-cream shadow-md transition hover:bg-mall-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-mall-accent disabled:cursor-not-allowed disabled:opacity-40 md:flex"
+                >
+                  <ArrowRight size={16} aria-hidden="true" />
+                </button>
+              </>
+            )}
           </div>
         )}
       </div>
-    </div>
+    </article>
   );
 }
 
@@ -538,6 +619,7 @@ export default function Home() {
   const [recentlyViewed, setRecentlyViewed] = useState(() => readRecentlyViewed());
   const [loading, setLoading] = useState(() => !getHomeCache());
   const [loadError, setLoadError] = useState(false);
+  const trendingSection = homeSections.find((section) => section.type === "badge" && section.badge?.slug === "trending");
 
   useEffect(() => {
     const refreshRecentlyViewed = () => setRecentlyViewed(readRecentlyViewed());
@@ -555,7 +637,7 @@ export default function Home() {
     setFloors(bundle.floors);
     setShopsByFloor(bundle.shopsByFloor);
     setFlashSale(bundle.flashSale);
-    setHomeSections(bundle.homeSections || []);
+    setHomeSections(organizeHomepageSections(bundle.homeSections, bundle.flashSale));
     setHeroSlides(bundle.heroSlides || []);
     setHomepageContent(normalizeHomepageContent(bundle.homepageContent || HOME_CONTENT_FALLBACK));
   }
@@ -695,162 +777,111 @@ export default function Home() {
       </section>
 
       <div className="relative bg-mall-900">
-        <section aria-labelledby="shopping-essentials-title" className="relative isolate overflow-hidden border-y border-cream/10 bg-gradient-to-br from-mall-800/70 via-mall-900 to-mall-800/40 py-8 sm:py-10 lg:py-14">
-          <div aria-hidden="true" className="pointer-events-none absolute -left-28 -top-36 -z-10 size-80 rounded-full bg-mall-accent/[0.06] blur-3xl" />
-          <div className={`${si} mx-auto max-w-7xl`}>
-            <header className="mb-5 sm:mb-7">
-              <div>
-                <p className="mb-2 font-mono-tag text-[10px] uppercase tracking-[0.2em] text-mall-orange sm:text-[11px]">A smoother shop, start to finish</p>
-                <h2 id="shopping-essentials-title" className="sr-only">Shopping essentials</h2>
-              </div>
-            </header>
-            <div className="grid grid-cols-1 gap-3.5 sm:gap-4 md:grid-cols-2 lg:grid-cols-3 lg:gap-5">
-              {[
-                {
-                  title: "How to pay",
-                  body: "Online options vary by location and availability. Cash on delivery is only available for eligible Nairobi CBD addresses; checkout shows the options for your location.",
-                  Icon: CreditCard,
-                  iconColor: "text-mall-orange",
-                  glow: "bg-mall-orange/[0.07]",
-                },
-                {
-                  title: "Delivery",
-                  body: "See available delivery options and fees before you place your order.",
-                  Icon: Truck,
-                  iconColor: "text-mall-accent",
-                  glow: "bg-mall-accent/[0.07]",
-                },
-                {
-                  title: "Updates",
-                  body: "Follow your order in Track My Order or your dashboard.",
-                  Icon: ClipboardCheck,
-                  iconColor: "text-mall-orange",
-                  glow: "bg-mall-orange/[0.07]",
-                },
-              ].map(({ title, body, Icon, iconColor, glow }) => (
-                <article key={title} className="group relative min-w-0 overflow-hidden rounded-2xl border border-cream/[0.12] bg-gradient-to-br from-mall-800/90 via-mall-900/95 to-mall-900 p-5 shadow-[0_16px_40px_rgba(0,0,0,0.16)] transition duration-300 hover:-translate-y-1 hover:border-cream/20 hover:shadow-[0_22px_48px_rgba(0,0,0,0.24)] sm:p-6">
-                  <div aria-hidden="true" className={`pointer-events-none absolute -right-12 -top-14 size-44 rounded-full blur-3xl ${glow}`} />
-                  <div aria-hidden="true" className="relative mb-5 flex min-h-[76px] items-start sm:mb-6">
-                    <Icon size={52} strokeWidth={1.45} className={`shrink-0 ${iconColor}`} />
-                  </div>
-                  <h3 className="font-display text-xl leading-tight text-cream sm:text-[22px]">{title}</h3>
-                  <p className="mt-2.5 max-w-[38ch] text-sm leading-[1.7] text-cream/65 sm:mt-3">{body}</p>
-                </article>
-              ))}
-            </div>
-          </div>
-        </section>
-
         {/* Flash Sale */}
         {!loading && flashSale.length > 0 && (
           <section className="relative z-10 overflow-hidden border-b border-cream/5 py-6 sm:py-8">
             <div className={`${si} mb-4 sm:mb-5`}>
-              <div className="flex items-end justify-between gap-4">
-                <div className="relative min-w-0 pl-4 sm:pl-5">
-                  <span aria-hidden="true" className="absolute bottom-0 left-0 top-0 w-px bg-gradient-to-b from-mall-orange via-mall-accent/70 to-transparent" />
-                  <div className="mb-2 flex items-center gap-2">
-                    <span className="flex h-6 w-6 shrink-0 items-center justify-center border border-mall-accent/25 bg-mall-accent/5">
-                      <Zap size={14} className="text-mall-accent" />
-                    </span>
-                    {homepageContent.flashSaleTag && <span className="font-mono-tag text-[10px] uppercase tracking-widest text-mall-orange">{homepageContent.flashSaleTag}</span>}
-                  </div>
-                  <h2 className="font-display text-2xl leading-tight text-cream sm:text-3xl md:text-4xl">{homepageContent.flashSaleHeading}</h2>
-                </div>
-                <Link to="/search?flashSale=true" className="mb-1 flex shrink-0 items-center gap-1.5 text-xs text-cream/55 transition hover:text-mall-accent sm:text-sm">
-                  {homepageContent.sectionLinkLabel || "See all"} <ArrowRight size={14} />
-                </Link>
-              </div>
+              <SectionHeading
+                icon={Zap}
+                label={homepageContent.flashSaleHeading}
+                tag={homepageContent.flashSaleTag}
+                linkTo="/search?flashSale=true"
+                linkLabel={homepageContent.sectionLinkLabel || "See all"}
+              />
             </div>
-            <div className={si}><ProductStrip products={flashSale} cardSize="large" /></div>
+            <div className={si}><ProductStrip products={flashSale} cardSize="large" priorityCount={2} /></div>
           </section>
         )}
       </div>
 
       {/* ══════════════════════════════════════════════════════════════
           ZONE 2 — THE CORRIDORS (no video — calm content zone)
-          Covers: Shop by Purpose + Explore Floors
+          Covers: Shop by Purpose + Trending Now + Explore Floors
       ══════════════════════════════════════════════════════════════ */}
       <div className="relative">
         {/* Shop by Purpose */}
         {(homepageContent.purposeTiles || []).length > 0 && <section className="pt-7 pb-1 sm:pt-9 sm:pb-2 relative z-10">
           <div className={si}>
-              <SectionHeading icon={Target} label={homepageContent.purposeHeading} tag={homepageContent.purposeTagline} linkTo="/search" linkLabel={homepageContent.sectionLinkLabel} />
+            <SectionHeading icon={Target} label={homepageContent.purposeHeading} tag={homepageContent.purposeTagline} linkTo="/search" linkLabel={homepageContent.sectionLinkLabel} />
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2.5 sm:gap-3">
               {(homepageContent.purposeTiles || []).map((purpose) => <PurposeTile key={purpose.purposeTag} purpose={purpose} />)}
             </div>
           </div>
         </section>}
 
+        {!loading && trendingSection?.products?.length > 0 && (
+          <HomeSectionBlock section={trendingSection} homepageContent={homepageContent} />
+        )}
+
         {/* Explore Floors */}
         {!loading && activeFloorCount > 0 && (
-          <section className="pt-4 pb-8 sm:pt-5 sm:pb-10 relative z-10">
+          <section className="relative z-10 pt-5 pb-6 sm:pt-7 sm:pb-8">
             <div className={si}>
-              <div className="relative rounded-2xl px-4 py-5 sm:px-6 sm:py-6 mb-3 sm:mb-4 flex items-start justify-between overflow-hidden">
-                <PhotoBg
-                  src={homepageContent.exploreBackdropUrl}
-                  overlay="bg-mall-900/72"
-                />
-                <div>
-                  <p className="font-mono-tag text-[10px] uppercase text-mall-orange tracking-widest mb-0.5">{activeFloorCount} of {floors.length} floors open</p>
-                  <h2 className="font-display text-lg sm:text-xl md:text-2xl text-cream">{homepageContent.exploreHeading}</h2>
-                </div>
-                <Link to="/directory" className="flex items-center gap-1 text-xs text-cream/50 hover:text-mall-accent transition shrink-0 ml-3 mt-1">
-                  {homepageContent.exploreLinkLabel} <ArrowRight size={12} />
-                </Link>
+              <div className="mb-3 flex items-center gap-3 font-mono-tag text-[9px] uppercase tracking-[0.18em] text-cream/45 sm:mb-4">
+                <span className="h-px flex-1 bg-cream/10" />
+                <span>Browse by floor</span>
+                <span className="h-px flex-1 bg-cream/10" />
               </div>
+              <SectionHeading
+                icon={Store}
+                label={homepageContent.exploreHeading}
+                tag={`${activeFloorCount} of ${floors.length} floors open`}
+                linkTo="/directory"
+                linkLabel={homepageContent.exploreLinkLabel}
+              />
               <FloorShowcase floors={floors} shopsByFloor={shopsByFloor} />
             </div>
           </section>
         )}
 
-        {/* Compact summary with a link to the complete shopping guide. */}
-        <section aria-labelledby="shopping-steps-heading" className="relative overflow-hidden border-y border-cream/5 bg-mall-800/25 py-6 sm:py-7">
-          <div aria-hidden="true" className="pointer-events-none absolute -right-24 top-0 h-56 w-56 rounded-full bg-mall-accent/5 blur-3xl" />
-          <div className={`${si} relative`}>
-            <div className="mb-4 flex items-end justify-between gap-4">
-              <div>
-                <p className="mb-1 font-mono-tag text-[9px] uppercase tracking-[0.2em] text-mall-orange">One mall, one easy journey</p>
-                <h2 id="shopping-steps-heading" className="font-display text-xl text-cream sm:text-2xl">How shopping works</h2>
-              </div>
-              <Link to="/how-it-works" className="inline-flex min-h-10 shrink-0 items-center gap-1.5 text-xs font-medium text-mall-accent transition hover:text-cream focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-mall-accent sm:text-sm">
-                Full guide <ArrowRight size={14} aria-hidden="true" />
-              </Link>
-            </div>
-            <div className="flex snap-x snap-proximity flex-nowrap gap-3 overflow-x-auto overscroll-x-contain pb-2 sm:gap-4" style={{ scrollbarWidth: "thin", WebkitOverflowScrolling: "touch" }}>
-              {[
-                { number: "01", icon: MapPin, title: "Browse the mall", body: "Explore products across floors and shops to find what fits your day." },
-                { number: "02", icon: ShoppingBasket, title: "Bring it all together", body: "Add items from different shops to one cart. See available delivery and payment options at checkout." },
-                { number: "03", icon: Truck, title: "Follow your order", body: "Check order status online, and review collection details when your delivery option requires it." },
-              ].map(({ number, icon: Icon, title, body }) => (
-                <article key={number} className="flex min-h-[112px] w-[min(78vw,300px)] shrink-0 snap-start gap-3 rounded-xl border border-cream/10 bg-mall-900/65 p-3.5 sm:w-[min(32vw,360px)] sm:p-4">
-                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-mall-accent/20 bg-mall-accent/10 text-mall-accent">
-                    <Icon size={19} aria-hidden="true" />
-                  </div>
-                  <div className="min-w-0">
-                    <p className="mb-1 font-mono-tag text-[9px] uppercase tracking-[0.18em] text-mall-orange">Step {number}</p>
-                    <h3 className="font-display text-base leading-tight text-cream">{title}</h3>
-                    <p className="mt-1 text-xs leading-relaxed text-cream/55">{body}</p>
-                  </div>
-                </article>
-              ))}
-            </div>
-          </div>
-        </section>
       </div>
 
       {/* ══════════════════════════════════════════════════════════════
           ZONE 3 — INSIDE THE SHOPS (no video — calm content zone)
-          Every homepage section (AdminHomeSections.jsx) renders here, in
-          admin-set order — badge sections, the featured shop, and featured
-          categories are all just entries in one unified, reorderable list.
+          Remaining homepage sections (AdminHomeSections.jsx) render here in
+          admin-set order; Trending Now is placed earlier in the home flow.
       ══════════════════════════════════════════════════════════════ */}
       <div className="relative">
-        {!loading && homeSections.map((section) => (
+        {!loading && homeSections.filter((section) => section !== trendingSection).map((section) => (
           <HomeSectionBlock key={section._id} section={section} homepageContent={homepageContent} />
         ))}
       </div>
 
       <RecentlyViewedSection products={recentlyViewed} />
+
+      {/* Compact summary with a link to the complete shopping guide. */}
+      <section aria-labelledby="shopping-steps-heading" className="relative overflow-hidden border-y border-cream/5 bg-mall-800/25 py-6 sm:py-7">
+        <div aria-hidden="true" className="pointer-events-none absolute -right-24 top-0 h-56 w-56 rounded-full bg-mall-accent/5 blur-3xl" />
+        <div className={`${si} relative`}>
+          <div className="mb-4 flex items-end justify-between gap-4">
+            <div>
+              <p className="mb-1 font-mono-tag text-[9px] uppercase tracking-[0.2em] text-mall-orange">One mall, one easy journey</p>
+              <h2 id="shopping-steps-heading" className="font-display text-xl text-cream sm:text-2xl">How shopping works</h2>
+            </div>
+            <Link to="/how-it-works" className="inline-flex min-h-10 shrink-0 items-center gap-1.5 text-xs font-medium text-mall-accent transition hover:text-cream focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-mall-accent sm:text-sm">
+              Full guide <ArrowRight size={14} aria-hidden="true" />
+            </Link>
+          </div>
+          <div className="flex snap-x snap-proximity flex-nowrap gap-3 overflow-x-auto overscroll-x-contain pb-2 sm:gap-4" style={{ scrollbarWidth: "thin", WebkitOverflowScrolling: "touch" }}>
+            {[
+              { number: "01", icon: MapPin, title: "Browse the mall", body: "Explore products across floors and shops to find what fits your day." },
+              { number: "02", icon: ShoppingBasket, title: "Bring it all together", body: "Add items from different shops to one cart. See available delivery and payment options at checkout." },
+              { number: "03", icon: Truck, title: "Follow your order", body: "Check order status online, and review collection details when your delivery option requires it." },
+            ].map(({ number, icon: Icon, title, body }) => (
+              <article key={number} className="flex min-h-[112px] w-[min(78vw,300px)] shrink-0 snap-start gap-3 rounded-xl border border-cream/10 bg-mall-900/65 p-3.5 sm:w-[min(32vw,360px)] sm:p-4">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-mall-accent/20 bg-mall-accent/10 text-mall-accent">
+                  <Icon size={19} aria-hidden="true" />
+                </div>
+                <div className="min-w-0">
+                  <p className="mb-1 font-mono-tag text-[9px] uppercase tracking-[0.18em] text-mall-orange">Step {number}</p>
+                  <h3 className="font-display text-base leading-tight text-cream">{title}</h3>
+                  <p className="mt-1 text-xs leading-relaxed text-cream/55">{body}</p>
+                </div>
+              </article>
+            ))}
+          </div>
+        </div>
+      </section>
 
       {/* ══════════════════════════════════════════════════════════════
           ZONE 5 — THE FINALE
@@ -864,6 +895,7 @@ export default function Home() {
           poster={homepageContent.closingPosterUrl}
           alt={homepageContent.closingEyebrow}
           overlay="bg-mall-900/60"
+          deferMedia
         />
 
         {/* Closing statement */}
