@@ -22,5 +22,5 @@ export function organizeHomepageSections(sections, flashSaleProducts) {
 
       return { ...section, products };
     })
-    .filter((section) => section.products.length > 0);
+    .filter((section) => section.products.length > 0 || section.productsLoading);
 }

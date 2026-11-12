@@ -126,7 +126,7 @@ function ProductStrip({ products, cardSize, priorityCount = 0, loading = false }
   const scroll = (dir) => ref.current?.scrollBy({ left: dir * (cardSize === "large" ? 280 : 200), behavior: "smooth" });
   if (!products.length && !loading) return null;
   return (
-    <div className="relative -mx-4 sm:mx-0">
+    <div className="relative -mx-4 sm:mx-0" aria-busy={loading}>
       <button onClick={() => scroll(-1)} aria-label="Scroll left"
         className="hidden md:flex absolute left-0 top-1/2 -translate-y-1/2 -translate-x-3 z-10 w-9 h-9 rounded-full bg-mall-900/80 text-cream border border-cream/10 shadow-lg items-center justify-center hover:bg-mall-900 transition">
         <ChevronLeft size={18} />
@@ -176,7 +176,7 @@ function SectionHeading({ icon: Icon, label, tag, linkTo, linkLabel = "See all" 
 function HomeSectionBlock({ section, homepageContent }) {
   if (section.type === "featured-shop") {
     return (
-      <section className="py-6 sm:py-8 relative z-10">
+      <section aria-busy={section.productsLoading || undefined} className="py-6 sm:py-8 relative z-10">
         <div className={SECTION_PADDING}>
           <SectionHeading
             icon={Store}
@@ -193,7 +193,7 @@ function HomeSectionBlock({ section, homepageContent }) {
 
   if (section.type === "featured-category") {
     return (
-      <section className="py-6 sm:py-8 relative z-10">
+      <section aria-busy={section.productsLoading || undefined} className="py-6 sm:py-8 relative z-10">
         <div className={SECTION_PADDING}>
           <SectionHeading
             icon={Tag}
@@ -211,7 +211,7 @@ function HomeSectionBlock({ section, homepageContent }) {
   // type === "badge"
   const Icon = BADGE_ICON_BY_NAME[section.badge?.icon] || Tag;
   return (
-    <section className="py-6 sm:py-8 relative z-10">
+    <section aria-busy={section.productsLoading || undefined} className="py-6 sm:py-8 relative z-10">
       <div className={SECTION_PADDING}>
         <SectionHeading
           icon={Icon}
@@ -625,6 +625,9 @@ export default function Home() {
   const [floors, setFloors] = useState(() => initialCache?.floors || []);
   const [shopsByFloor, setShopsByFloor] = useState(() => initialCache?.shopsByFloor || {});
   const [flashSale, setFlashSale] = useState(() => initialCache?.flashSale || []);
+  const [flashSaleLoading, setFlashSaleLoading] = useState(() => !initialCache);
+  const flashSaleRef = useRef(flashSale);
+  flashSaleRef.current = flashSale;
   const [homeSections, setHomeSections] = useState(() => organizeHomepageSections(initialCache?.homeSections || [], initialCache?.flashSale || []));
   const [heroSlides, setHeroSlides] = useState(() => initialCache?.heroSlides || []);
   const [activeHeroSlide, setActiveHeroSlide] = useState(null);
@@ -650,7 +653,6 @@ export default function Home() {
     setFloors(bundle.floors);
     setShopsByFloor(bundle.shopsByFloor);
     setFlashSale(bundle.flashSale);
-    setHomeSections(organizeHomepageSections(bundle.homeSections, bundle.flashSale));
     setHeroSlides(bundle.heroSlides || []);
     setHomepageContent(normalizeHomepageContent(bundle.homepageContent || HOME_CONTENT_FALLBACK));
   }
@@ -664,14 +666,13 @@ export default function Home() {
 
     let active = true;
     setLoadError(false);
-    Promise.all([
-      api.get("/home-sections", { timeout: HOME_REQUEST_TIMEOUT_MS }).catch(() => ({ data: [] })),
+    const corePromise = Promise.all([
       api.get("/floors", { timeout: HOME_REQUEST_TIMEOUT_MS }),
       api.get("/shops", { params: { includeCounts: false }, timeout: HOME_REQUEST_TIMEOUT_MS }),
-      api.get("/products", { params: { flashSale: true, limit: 12 }, timeout: HOME_REQUEST_TIMEOUT_MS }),
+      api.get("/products", { params: { flashSale: true, limit: 12, includeTotal: false }, timeout: HOME_REQUEST_TIMEOUT_MS }),
       api.get("/hero-slides", { timeout: HOME_REQUEST_TIMEOUT_MS }).catch(() => ({ data: [] })),
       api.get("/homepage-content", { timeout: HOME_REQUEST_TIMEOUT_MS }).catch(() => ({ data: null })),
-    ]).then(async ([sectionsRes, floorsRes, shopsRes, flashRes, heroRes, contentRes]) => {
+    ]).then(([floorsRes, shopsRes, flashRes, heroRes, contentRes]) => {
       if (!active) return;
 
       const grouped = {};
@@ -681,11 +682,6 @@ export default function Home() {
         grouped[floorId].push(shop);
       });
 
-      const sectionConfigs = (sectionsRes.data || []).filter((section) =>
-        (section.type === "badge" && section.badge) ||
-        (section.type === "featured-shop" && section.shop && section.shop.isActive !== false) ||
-        (section.type === "featured-category" && section.category)
-      );
       const flashSaleProducts = flashRes.data.products || [];
       const coreBundle = {
         floors: floorsRes.data,
@@ -693,31 +689,70 @@ export default function Home() {
         flashSale: flashSaleProducts,
         heroSlides: heroRes.data || [],
         homepageContent: contentRes.data || HOME_CONTENT_FALLBACK,
-        homeSections: cached?.homeSections || [],
       };
 
       applyData(coreBundle);
-      setHomeCache({ ...coreBundle, sectionsPending: true });
+      setFlashSaleLoading(false);
+      setHomeCache({ ...coreBundle, homeSections: cached?.homeSections || [], sectionsPending: true });
       setLoadError(false);
+      return coreBundle;
+    });
 
-      const sectionResults = await Promise.all(sectionConfigs.map((section) => {
-        const request = section.type === "badge"
-          ? api.get("/products", { params: { badge: section.badge?.slug, limit: 12 }, timeout: HOME_REQUEST_TIMEOUT_MS })
-          : section.type === "featured-shop"
-            ? api.get("/products", { params: { shop: section.shop?._id, limit: 12 }, timeout: HOME_REQUEST_TIMEOUT_MS })
-            : api.get("/products", { params: { category: section.category, limit: 12 }, timeout: HOME_REQUEST_TIMEOUT_MS });
-        return request.catch(() => ({ data: { products: [] } }));
-      }));
+    const sectionsPromise = api.get("/home-sections", { timeout: HOME_REQUEST_TIMEOUT_MS })
+      .then(async (sectionsRes) => {
+        const sectionConfigs = (sectionsRes.data || []).filter((section) =>
+          (section.type === "badge" && section.badge) ||
+          (section.type === "featured-shop" && section.shop && section.shop.isActive !== false) ||
+          (section.type === "featured-category" && section.category)
+        );
+        if (!active) return [];
 
-      if (!active) return;
-      const homeSectionsResult = sectionConfigs
-        .map((section, index) => ({ ...section, products: sectionResults[index].data.products || [] }))
-        .filter((section) => section.products.length > 0);
-      const bundle = { ...coreBundle, homeSections: homeSectionsResult };
-      setHomeSections(organizeHomepageSections(homeSectionsResult, flashSaleProducts));
-      setHomeCache(bundle);
+        const previousSections = new Map(homeSections.map((section) => [String(section._id), section]));
+        const loadingSections = sectionConfigs.map((section) => {
+          const previous = previousSections.get(String(section._id));
+          return { ...section, products: previous?.products || [], productsLoading: true };
+        });
+        setHomeSections(organizeHomepageSections(loadingSections, flashSaleRef.current));
+
+        const sectionResults = await Promise.all(sectionConfigs.map(async (section) => {
+          const request = section.type === "badge"
+            ? api.get("/products", { params: { badge: section.badge?.slug, limit: 12, includeTotal: false }, timeout: HOME_REQUEST_TIMEOUT_MS })
+            : section.type === "featured-shop"
+              ? api.get("/products", { params: { shop: section.shop?._id, limit: 12, includeTotal: false }, timeout: HOME_REQUEST_TIMEOUT_MS })
+              : api.get("/products", { params: { category: section.category, limit: 12, includeTotal: false }, timeout: HOME_REQUEST_TIMEOUT_MS });
+          const response = await request.catch(() => ({ data: { products: [] } }));
+          const loadedSection = { ...section, products: response.data.products || [], productsLoading: false };
+
+          if (active) {
+            setHomeSections((current) => organizeHomepageSections(
+              current.map((item) => String(item._id) === String(section._id) ? loadedSection : item),
+              flashSaleRef.current,
+            ));
+          }
+          return loadedSection;
+        }));
+
+        const loadedSections = organizeHomepageSections(sectionResults, flashSaleRef.current);
+        if (active) setHomeSections(loadedSections);
+        return loadedSections;
+      })
+      .catch(() => {
+        if (active) {
+          setHomeSections((current) => current.map((section) => ({ ...section, productsLoading: false })));
+          setLoadError(true);
+        }
+        return cached?.homeSections || [];
+      });
+
+    Promise.all([corePromise, sectionsPromise]).then(([coreBundle, loadedSections]) => {
+      if (active && coreBundle) {
+        setHomeCache({ ...coreBundle, homeSections: loadedSections, sectionsPending: false });
+      }
     }).catch(() => {
-      if (active) setLoadError(true);
+      if (active) {
+        setFlashSaleLoading(false);
+        setLoadError(true);
+      }
     });
 
     return () => { active = false; };
@@ -763,7 +798,7 @@ export default function Home() {
 
       <div className="relative bg-mall-900">
         {/* Flash Sale */}
-        {flashSale.length > 0 && (
+        {(flashSale.length > 0 || flashSaleLoading) && (
           <section className="relative z-10 overflow-hidden border-b border-cream/5 py-6 sm:py-8">
             <div className={`${si} mb-4 sm:mb-5`}>
               <SectionHeading
@@ -774,7 +809,7 @@ export default function Home() {
                 linkLabel={homepageContent.sectionLinkLabel || "See all"}
               />
             </div>
-            <div className={si}><ProductStrip products={flashSale} cardSize="large" priorityCount={2} /></div>
+            <div className={si}><ProductStrip products={flashSale} cardSize="large" priorityCount={2} loading={flashSaleLoading} /></div>
           </section>
         )}
       </div>

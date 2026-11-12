@@ -35,6 +35,12 @@ test("homepage product rails preserve products without IDs and ignore empty entr
   ]);
 });
 
+test("homepage product rails keep configured sections visible while their products load", () => {
+  const pending = { _id: "section-pending", type: "badge", products: [], productsLoading: true };
+  const organized = organizeHomepageSections([pending], []);
+  assert.deepEqual(organized, [pending]);
+});
+
 test("flash-sale products can appear in each matching badge section as additional placements", () => {
   const sharedProduct = { _id: "shared", name: "Popular mug" };
   const flashProduct = { _id: "flash", name: "Flash item", badges: ["trending", "best-seller", "new-arrival"] };

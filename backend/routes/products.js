@@ -287,6 +287,7 @@ router.get("/", async (req, res, next) => {
     const subcategory = queryText(req.query.subcategory, 100);
     const sort = queryText(req.query.sort, 20);
     const order = queryText(req.query.order, 10);
+    const includeTotal = queryText(req.query.includeTotal, 5) !== "false";
     const { search, page: pageNumber, limit: pageSize } = parseListQuery(req.query);
     const allActiveShopIds = await Shop.find({ isActive: true }).distinct("_id");
     let availableShopIds = allActiveShopIds.slice();
@@ -333,17 +334,20 @@ router.get("/", async (req, res, next) => {
     const sortDirection = order === "asc" ? 1 : -1;
     const sortObj = { [sortField]: sortDirection };
 
-    const [products, total] = await Promise.all([
-      Product.find(filter)
-        .select("+inventoryLocations")
-        .populate({ path: "shop", select: "name shopNumber slug floor", populate: { path: "floor", select: "name floorNumber slug" } })
-        .skip(skip)
-        .limit(pageSize)
-        .sort(sortObj),
-      Product.countDocuments(filter),
-    ]);
+    const productsQuery = Product.find(filter)
+      .select("+inventoryLocations")
+      .populate({ path: "shop", select: "name shopNumber slug floor", populate: { path: "floor", select: "name floorNumber slug" } })
+      .skip(skip)
+      .limit(pageSize)
+      .sort(sortObj);
+    const [products, total] = includeTotal
+      ? await Promise.all([productsQuery, Product.countDocuments(filter)])
+      : [await productsQuery, null];
 
-    res.json({ products: products.map((product) => serializeAvailableInventory(product, activeInventoryShopIds)), total, page: pageNumber, pages: Math.ceil(total / pageSize) });
+    res.json({
+      products: products.map((product) => serializeAvailableInventory(product, activeInventoryShopIds)),
+      ...(includeTotal ? { total, page: pageNumber, pages: Math.ceil(total / pageSize) } : {}),
+    });
   } catch (err) {
     next(err);
   }
