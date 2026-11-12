@@ -7,6 +7,8 @@ import { getStartingPrice } from "../utils/productPricing";
 import { getWishlist, subscribeToWishlist, toggleWishlist } from "../utils/wishlist";
 import { useAuth } from "../context/AuthContext";
 import { productImageUrl } from "../utils/productImageUrl";
+import { getProductBadges } from "../utils/productBadges";
+import { useBadges } from "../context/BadgesContext";
 
 function WhatsAppIcon({ size = 13 }) {
   return (
@@ -23,8 +25,10 @@ export default function StripProductCard({ product, size = "default", priority =
   const navigate = useNavigate();
   const { addItem, items } = useCart();
   const { settings } = useSettings();
+  const { badgesBySlug } = useBadges();
   const { user, loading: authLoading, wishlistError, wishlistLoading } = useAuth();
   const WHATSAPP_NUMBER = settings.whatsappNumber;
+  const productBadges = getProductBadges(product);
   const hasVariants = product.variants?.length > 0;
   const displayPrice = getStartingPrice(product);
   const stockValues = hasVariants ? product.variants.map((variant) => variant.stock) : [product.stock];
@@ -103,10 +107,19 @@ export default function StripProductCard({ product, size = "default", priority =
         </Link>
 
         {/* Badge — top left */}
-        {product.badge && (
-          <span className="absolute top-2 left-2 font-mono-tag text-[9px] uppercase bg-mall-accent text-mall-900 px-1.5 py-0.5 rounded-full font-semibold z-10">
-            {product.badge.replace(/-/g, " ")}
-          </span>
+        {productBadges.length > 0 && (
+          <div className="absolute top-2 left-2 z-10 flex max-w-[calc(100%-2.5rem)] flex-wrap gap-1">
+            {productBadges.slice(0, 2).map((badge) => (
+              <span key={badge} className="rounded-full bg-mall-accent px-1.5 py-0.5 font-mono-tag text-[9px] font-semibold uppercase text-mall-900">
+                {badgesBySlug[badge]?.chipLabel || badge.replace(/-/g, " ")}
+              </span>
+            ))}
+            {productBadges.length > 2 && (
+              <span className="rounded-full bg-mall-900/90 px-1.5 py-0.5 font-mono-tag text-[9px] text-cream">
+                +{productBadges.length - 2}
+              </span>
+            )}
+          </div>
         )}
 
         {/* Wishlist heart — top right */}

@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { Plus, Pencil, Trash2, X, Check, Package, Upload, CheckCircle2, AlertCircle, FileSpreadsheet, Download, Archive, ArchiveRestore, Eye, ArrowUp, ArrowDown, History } from "lucide-react";
+import { Link } from "react-router-dom";
 import api from "../../api/client";
 import AdminPagination from "../../components/AdminPagination";
 import AdminConfirmDialog from "../../components/admin/AdminConfirmDialog";
@@ -10,11 +11,12 @@ import { useBadges } from "../../context/BadgesContext";
 import { getStartingPrice } from "../../utils/productPricing";
 import { clearHomeCache } from "../../utils/homeCache";
 import { productImageUrl } from "../../utils/productImageUrl";
+import { getProductBadges, MAX_PRODUCT_BADGES } from "../../utils/productBadges";
 import useModalAccessibility from "../../hooks/useModalAccessibility";
 
 const PURPOSES = ["work", "gaming", "travel", "home", "fitness"];
 const DEFAULT_REORDER_LEVEL = 5;
-const EMPTY = { name: "", sku: "", description: "", longDescription: "", price: "", compareAtPrice: "", images: "", shop: "", categoryId: "", subcategoryId: "", category: "", subcategory: "", brandId: "", brand: "", stock: "", reorderLevel: DEFAULT_REORDER_LEVEL, badge: "", returnEligibility: "standard", isFlashSale: false, purposeTags: [], variants: [], status: "draft" };
+const EMPTY = { name: "", sku: "", description: "", longDescription: "", price: "", compareAtPrice: "", images: "", shop: "", categoryId: "", subcategoryId: "", category: "", subcategory: "", brandId: "", brand: "", stock: "", reorderLevel: DEFAULT_REORDER_LEVEL, badge: "", badges: [], returnEligibility: "standard", isFlashSale: false, purposeTags: [], variants: [], status: "draft" };
 
 async function loadAllAdminShops() {
   const first = await api.get("/shops/admin/list", { params: { page: 1, limit: 100 } });
@@ -187,11 +189,11 @@ function ProductInventoryHistory({ product }) {
 }
 
 function ProductForm({ initial, floors, shops, categories, brands, onSave, onCancel }) {
-  const { badges } = useBadges();
+  const { badges, loading: badgesLoading, error: badgesError, retry: retryBadges } = useBadges();
   const formId = useId().replace(/:/g, "");
   const fieldId = (name) => `${formId}-${name}`;
   const [form, setForm] = useState(initial
-    ? { ...initial, reorderLevel: initial.reorderLevel ?? DEFAULT_REORDER_LEVEL, images: initial.images?.join(", ") || "", purposeTags: initial.purposeTags || [], variants: (initial.variants || []).map((variant) => ({ ...variant, reorderLevel: variant.reorderLevel ?? DEFAULT_REORDER_LEVEL })) }
+    ? { ...initial, badges: Array.isArray(initial.badges) && initial.badges.length ? initial.badges : initial.badge ? [initial.badge] : [], reorderLevel: initial.reorderLevel ?? DEFAULT_REORDER_LEVEL, images: initial.images?.join(", ") || "", purposeTags: initial.purposeTags || [], variants: (initial.variants || []).map((variant) => ({ ...variant, reorderLevel: variant.reorderLevel ?? DEFAULT_REORDER_LEVEL })) }
     : EMPTY);
   const [floorId, setFloorId] = useState(String(initial?.shop?.floor?._id || initial?.shop?.floor || ""));
   const [saving, setSaving] = useState(false);
@@ -261,6 +263,16 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
       ...f,
       purposeTags: f.purposeTags.includes(tag) ? f.purposeTags.filter((t) => t !== tag) : [...f.purposeTags, tag],
     }));
+  }
+  function toggleBadge(slug) {
+    setForm((current) => {
+      const currentBadges = current.badges || [];
+      if (!currentBadges.includes(slug) && currentBadges.length >= MAX_PRODUCT_BADGES) return current;
+      const badges = currentBadges.includes(slug)
+        ? currentBadges.filter((badge) => badge !== slug)
+        : [...currentBadges, slug];
+      return { ...current, badges, badge: badges[0] || "" };
+    });
   }
 
   function addVariant() {
@@ -354,7 +366,9 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
         if (saveForm.stock === "" || saveForm.stock === undefined || !Number.isInteger(Number(saveForm.stock)) || Number(saveForm.stock) < 0) issues.push("Confirm a whole-number stock quantity (zero is allowed).");
       }
       if (saveForm.reorderLevel === "" || !Number.isInteger(Number(saveForm.reorderLevel)) || Number(saveForm.reorderLevel) < 0 || Number(saveForm.reorderLevel) > 1000000) issues.push("Set a whole-number reorder level from 0 to 1,000,000.");
+      if ((saveForm.badges || []).length > MAX_PRODUCT_BADGES) issues.push(`Choose no more than ${MAX_PRODUCT_BADGES} badges.`);
       setPublishIssues(issues);
+      if ((saveForm.badges || []).length > MAX_PRODUCT_BADGES) return;
       if (requestedStatus === "published" && issues.length) return;
       const payload = {
         ...saveForm,
@@ -367,6 +381,8 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
         subcategoryId: selectedSubcategory?._id || "",
         category: selectedCategory?.name || saveForm.category,
         subcategory: selectedSubcategory?.name || saveForm.subcategory,
+        badges: saveForm.badges || [],
+        badge: saveForm.badges?.[0] || "",
         images: saveForm.images ? saveForm.images.split(",").map((s) => s.trim()).filter(Boolean) : [],
         price: saveForm.price === "" || saveForm.price === undefined ? null : Number(saveForm.price),
         compareAtPrice: saveForm.compareAtPrice ? Number(saveForm.compareAtPrice) : null,
@@ -508,13 +524,24 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
             <option value="digital_product">Digital product or gift card · no return or exchange</option>
           </select>
         </div>
-        <div>
-          <label htmlFor={fieldId("badge")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Badge</label>
-          <select id={fieldId("badge")} value={form.badge} onChange={(e) => set("badge", e.target.value)} className={inputClass}>
-            <option value="">None</option>
-            {badges.map((b) => <option key={b._id} value={b.slug}>{b.chipLabel}</option>)}
-          </select>
-        </div>
+        <fieldset className="sm:col-span-2">
+          <legend className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest mb-1.5">Badges</legend>
+          <div className="grid gap-2 rounded-xl border border-cream/10 bg-mall-900/40 p-3 sm:grid-cols-2 lg:grid-cols-3">
+            {badgesLoading && <p className="text-xs text-cream/45">Loading badges…</p>}
+            {!badgesLoading && badgesError && <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-red-200">
+              <span>{badgesError}</span>
+              <button type="button" onClick={retryBadges} className="min-h-8 rounded-md border border-red-200/20 px-2 text-red-100 hover:bg-red-200/5">Retry</button>
+            </div>}
+            {!badgesLoading && !badgesError && badges.map((badge) => (
+              <label key={badge._id} className="flex min-h-9 items-center gap-2 text-sm text-cream/75">
+                <input type="checkbox" checked={(form.badges || []).includes(badge.slug)} disabled={!(form.badges || []).includes(badge.slug) && (form.badges || []).length >= MAX_PRODUCT_BADGES} onChange={() => toggleBadge(badge.slug)} className="h-4 w-4 accent-mall-accent disabled:opacity-40" />
+                <span>{badge.chipLabel}</span>
+              </label>
+            ))}
+            {!badgesLoading && !badgesError && !badges.length && <p className="text-xs text-cream/55">No badges yet. <Link to="/admin/badges" className="text-mall-accent underline underline-offset-2 hover:text-cream">Create one in Badge management</Link>.</p>}
+          </div>
+          <p className="mt-1 text-[10px] text-cream/45">Select up to {MAX_PRODUCT_BADGES} badges. Flash Sale is managed separately.</p>
+        </fieldset>
         <div>
           <label htmlFor={fieldId("category")} className="font-mono-tag text-[10px] uppercase text-cream/65 tracking-widest block mb-1.5">Category</label>
           <select
@@ -716,12 +743,13 @@ function ProductForm({ initial, floors, shops, categories, brands, onSave, onCan
 // file, then review each row's floor, shop, and managed category assignment
 // before any products are written.
 function BulkEditPanel({ count, floors, shops, categories, brands, selectionHasVariants, onApply, onCancel }) {
-  const { badges } = useBadges();
+  const { badges, loading: badgesLoading, error: badgesError, retry: retryBadges } = useBadges();
   const [shop, setShop] = useState("");
   const [floorId, setFloorId] = useState("");
   const [category, setCategory] = useState("");
   const [subcategory, setSubcategory] = useState("");
-  const [badge, setBadge] = useState("");
+  const [badgesSelected, setBadgesSelected] = useState([]);
+  const [badgesTouched, setBadgesTouched] = useState(false);
   const [stock, setStock] = useState("");
   const [priceType, setPriceType] = useState("");
   const [priceValue, setPriceValue] = useState("");
@@ -746,7 +774,14 @@ function BulkEditPanel({ count, floors, shops, categories, brands, selectionHasV
       set.categoryId = category;
       set.subcategoryId = subcategory;
     }
-    if (badge) set.badge = badge;
+    if (badgesTouched) {
+      if (badgesSelected.length > MAX_PRODUCT_BADGES) {
+        setError(`Choose no more than ${MAX_PRODUCT_BADGES} badges.`);
+        return;
+      }
+      set.badges = badgesSelected;
+      set.badge = badgesSelected[0] || "";
+    }
     if (stock !== "") set.stock = Number(stock);
 
     const priceAdjustment = priceType && priceValue !== "" ? { type: priceType, value: priceValue } : null;
@@ -805,13 +840,27 @@ function BulkEditPanel({ count, floors, shops, categories, brands, selectionHasV
               {(selectedCategory?.subcategories || []).map((entry) => <option key={entry._id} value={entry._id}>{entry.name}</option>)}
             </select>
           </div>
-          <div>
-            <label className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Set Badge</label>
-            <select value={badge} onChange={(e) => setBadge(e.target.value)} className={inputClass}>
-              <option value="">Don't change</option>
-              {badges.map((b) => <option key={b._id} value={b.slug}>{b.chipLabel}</option>)}
-            </select>
-          </div>
+          <fieldset>
+            <legend className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest mb-1.5">Set Badges</legend>
+            <div className="grid max-h-36 gap-1 overflow-y-auto rounded-xl border border-cream/10 p-2 sm:grid-cols-2">
+              {badgesLoading && <p className="text-xs text-cream/45">Loading badges…</p>}
+              {!badgesLoading && badgesError && <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-red-200">
+                <span>{badgesError}</span>
+                <button type="button" onClick={retryBadges} className="min-h-8 rounded-md border border-red-200/20 px-2 text-red-100 hover:bg-red-200/5">Retry</button>
+              </div>}
+              {!badgesLoading && !badgesError && badges.map((badge) => (
+                <label key={badge._id} className="flex items-center gap-2 py-1 text-xs text-cream/70">
+                  <input type="checkbox" checked={badgesSelected.includes(badge.slug)} disabled={!badgesSelected.includes(badge.slug) && badgesSelected.length >= MAX_PRODUCT_BADGES} onChange={() => {
+                    setBadgesTouched(true);
+                    setBadgesSelected((current) => current.includes(badge.slug) ? current.filter((value) => value !== badge.slug) : [...current, badge.slug]);
+                  }} className="h-4 w-4 accent-mall-accent disabled:opacity-40" />
+                  <span>{badge.chipLabel}</span>
+                </label>
+              ))}
+            </div>
+            {!badgesLoading && !badgesError && !badges.length && <p className="mt-1 text-xs text-cream/55">No badges yet. <Link to="/admin/badges" className="text-mall-accent underline underline-offset-2">Create one in Badge management</Link>.</p>}
+            <p className="mt-1 text-[10px] text-cream/40">{badgesTouched ? `Selected badges will replace the current set (${badgesSelected.length}/${MAX_PRODUCT_BADGES}).` : `Select up to ${MAX_PRODUCT_BADGES} badges to replace the current set.`}</p>
+          </fieldset>
           <div>
             <label className="font-mono-tag text-[9px] uppercase text-cream/40 tracking-widest block mb-1.5">Set Stock</label>
             <input type="number" min="0" step="1" value={stock} onChange={(e) => setStock(e.target.value)} placeholder={selectionHasVariants ? "Edit variants individually" : "Don't change"} disabled={selectionHasVariants} className={`${inputClass} disabled:opacity-40 disabled:cursor-not-allowed`} />
@@ -854,6 +903,7 @@ function BulkEditPanel({ count, floors, shops, categories, brands, selectionHasV
 }
 
 export default function AdminProducts() {
+  const { badgesBySlug } = useBadges();
   const [products, setProducts] = useState([]);
   const [floors, setFloors] = useState([]);
   const [shops, setShops] = useState([]);
@@ -1279,7 +1329,8 @@ export default function AdminProducts() {
                     <div className="min-w-0">
                       <div className="flex items-center gap-2 mb-0.5 flex-wrap">
                         {product.brand && <p className="font-mono-tag text-[9px] uppercase text-mall-accent tracking-widest">{product.brand}</p>}
-                        {product.badge && <span className="font-mono-tag text-[9px] uppercase text-cream/30">{product.badge}</span>}
+                        {getProductBadges(product).slice(0, 2).map((badge) => <span key={badge} className="font-mono-tag text-[9px] uppercase text-cream/30">{badgesBySlug[badge]?.chipLabel || badge}</span>)}
+                        {getProductBadges(product).length > 2 && <span className="font-mono-tag text-[9px] uppercase text-cream/30">+{getProductBadges(product).length - 2}</span>}
                       </div>
                       <p className="w-full break-words text-cream text-[15px] font-semibold leading-snug">{product.name}</p>
                       <p className="mt-1 break-words font-mono-tag text-[11px] tracking-wide text-cream/65">{product.sku || "SKU not set"}</p>

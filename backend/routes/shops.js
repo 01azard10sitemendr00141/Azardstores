@@ -8,7 +8,7 @@ const { parseListQuery, queryText, escapeRegex } = require("../utils/listQuery")
 const router = express.Router();
 
 // GET /api/shops - mall directory; optionally filter by floor
-//   ?floor=<floorId or slug>
+//   ?floor=<floorId or slug>&includeCounts=false to skip the product-count aggregation
 router.get("/", async (req, res, next) => {
   try {
     const filter = { isActive: true };
@@ -23,6 +23,7 @@ router.get("/", async (req, res, next) => {
     }
 
     const shops = await Shop.find(filter).populate("floor", "name floorNumber slug").sort({ shopNumber: 1 });
+    if (req.query.includeCounts === "false") return res.json(shops);
 
     // productCount is the true count across ALL of a shop's active products,
     // not an approximation from a capped/paginated product fetch — the

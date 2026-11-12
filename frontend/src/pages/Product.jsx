@@ -14,6 +14,8 @@ import { getStartingPrice } from "../utils/productPricing";
 import { productImageUrl } from "../utils/productImageUrl";
 import { getProductSeoDescription } from "../utils/productSeo";
 import { recordRecentlyViewed } from "../utils/recentlyViewed";
+import { getProductBadges } from "../utils/productBadges";
+import { useBadges } from "../context/BadgesContext";
 
 function WhatsAppIcon({ size = 16 }) {
   return (
@@ -90,6 +92,7 @@ export default function Product() {
   const { slug } = useParams();
   const { items, addItem } = useCart();
   const { settings } = useSettings();
+  const { badgesBySlug } = useBadges();
   const WHATSAPP_NUMBER = settings.whatsappNumber;
   const [product, setProduct] = useState(null);
   const [shopProducts, setShopProducts] = useState([]);
@@ -317,9 +320,14 @@ export default function Product() {
                   {product.brand}
                 </Link>
               )}
-              {product.badge && (
-                <span className="font-mono-tag text-[10px] uppercase bg-mall-accent text-mall-900 px-2.5 py-1 rounded-full font-semibold">
-                  {product.badge.replace(/-/g, " ")}
+              {getProductBadges(product).slice(0, 2).map((badge) => (
+                <span key={badge} className="rounded-full bg-mall-accent px-2.5 py-1 font-mono-tag text-[10px] font-semibold uppercase text-mall-900">
+                  {badgesBySlug[badge]?.chipLabel || badge.replace(/-/g, " ")}
+                </span>
+              ))}
+              {getProductBadges(product).length > 2 && (
+                <span className="rounded-full border border-cream/15 px-2.5 py-1 font-mono-tag text-[10px] uppercase text-cream/70">
+                  +{getProductBadges(product).length - 2} more
                 </span>
               )}
             </div>

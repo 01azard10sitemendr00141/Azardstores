@@ -14,16 +14,28 @@
     <meta name="twitter:title" content="Azard Stores | Shop the digital mall" />
     <meta name="twitter:description" content="Browse shops and products at Azard Stores, Kenya's digital mall." />
     <!-- PAGE_METADATA_END -->
-    <link rel="icon" type="image/png" href="/pics/azard-stores-logo.png" />
+    <link rel="icon" type="image/webp" href="/pics/azard-stores-logo.webp" />
     <title>Azard Stores | Shop the digital mall</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link
       href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500&display=swap"
       rel="stylesheet"
+      media="print"
+      onload="this.media='all'"
     />
+    <noscript>
+      <link
+        href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500&display=swap"
+        rel="stylesheet"
+      />
+    </noscript>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div role="status" aria-label="Loading Azard Stores" style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#15130f">
+        <img src="/pics/azard-stores-wordmark.webp" alt="Azard Stores" width="640" height="320" fetchpriority="high" decoding="async" style="width:min(70vw,280px);height:auto;object-fit:contain" />
+      </div>
+    </div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

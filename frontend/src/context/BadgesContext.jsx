@@ -1,28 +1,30 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import api from "../api/client";
 
-// Fetched once and shared app-wide, same pattern as SettingsContext — Badge
-// chips render inside every product card across the site, so this avoids
-// each one making its own request. If the fetch hasn't resolved yet (or
-// fails), badgesBySlug is just empty and consumers fall back to showing
-// the raw slug — never a crash, never a blocked render.
-const BadgesContext = createContext({ badges: [], badgesBySlug: {}, loading: true });
+// Fetched once and shared app-wide, same pattern as SettingsContext. Product
+// cards can still render from raw slugs while the managed badge list loads.
+const BadgesContext = createContext({ badges: [], badgesBySlug: {}, loading: true, error: "", retry: () => {} });
 
 export function BadgesProvider({ children }) {
   const [badges, setBadges] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [retryCount, setRetryCount] = useState(0);
 
   useEffect(() => {
+    setLoading(true);
+    setError("");
     api.get("/badges")
       .then((res) => setBadges(res.data || []))
-      .catch(() => {}) // keep the empty list on failure — never block rendering on this
+      .catch(() => setError("Could not load badges. Check your connection and try again."))
       .finally(() => setLoading(false));
-  }, []);
+  }, [retryCount]);
 
   const badgesBySlug = Object.fromEntries(badges.map((b) => [b.slug, b]));
+  const retry = () => setRetryCount((count) => count + 1);
 
   return (
-    <BadgesContext.Provider value={{ badges, badgesBySlug, loading }}>
+    <BadgesContext.Provider value={{ badges, badgesBySlug, loading, error, retry }}>
       {children}
     </BadgesContext.Provider>
   );

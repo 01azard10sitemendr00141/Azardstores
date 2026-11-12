@@ -17,7 +17,7 @@ export default function Footer() {
         <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8 sm:py-10">
           <div className="max-w-xs">
             <Link to="/" className="flex items-center gap-2 mb-3">
-              <img src="/pics/azard-stores.png" alt="Azard Stores" className="h-20 p-5 pt-4 rounded-lg object-contain" />
+              <img src="/pics/azard-stores-wordmark.webp" alt="Azard Stores" width="640" height="320" loading="lazy" decoding="async" className="h-20 p-5 pt-4 rounded-lg object-contain" />
             </Link>
             <p className="text-cream/50 text-sm leading-relaxed">
               Browse products from multiple shops in one catalog and checkout.

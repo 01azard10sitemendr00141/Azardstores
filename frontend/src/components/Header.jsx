@@ -36,7 +36,7 @@ export default function Header() {
       <div className="max-w-6xl mx-auto px-4 h-16 flex items-center gap-4">
         {/* Logo - compact mark + wordmark, wordmark hides on small screens */}
         <Link to="/" className="flex items-center gap-2 shrink-0">
-          <img src="/pics/azard-stores-logo.png" alt="Azard Stores" className="w-16 h-16 object-contain rounded-lg" />
+          <img src="/pics/azard-stores-logo.webp" alt="Azard Stores" width="256" height="171" fetchPriority="high" decoding="async" className="w-16 h-16 object-contain rounded-lg" />
         </Link>
 
         {/* Browse - looks like search, is actually just a link to the Directory */}

@@ -14,6 +14,7 @@ test("import review prepares every editable catalog field and preserves variants
     brand: "Field Goods",
     returnEligibility: "final_sale",
     badge: "new",
+    badges: ["new", "trending"],
     isFlashSale: true,
     purposeTags: ["travel"],
     flashSaleEndsAt: "2026-10-28T15:00:00.000Z",
@@ -24,6 +25,7 @@ test("import review prepares every editable catalog field and preserves variants
   assert.equal(product.longDescription, "Long details");
   assert.equal(product.brandId, "");
   assert.equal(product.badge, "new");
+  assert.deepEqual(product.badges, ["new", "trending"]);
   assert.equal(product.isFlashSale, true);
   assert.equal(product.variants[0].stock, 5);
   assert.equal(product.reorderLevel, 8);
@@ -35,6 +37,18 @@ test("import review leaves absent reorder levels blank to preserve existing valu
   const product = prepareImportProduct({ variants: [{ name: "Blue" }] });
   assert.equal(product.reorderLevel, "");
   assert.equal(product.variants[0].reorderLevel, "");
+});
+
+test("import review rejects more than three product badges", () => {
+  const item = {
+    index: 0,
+    action: "create",
+    status: "draft",
+    floorId: "floor-1",
+    shopId: "shop-1",
+    product: prepareImportProduct({ name: "Mug", badges: ["trending", "new", "sale", "featured"] }),
+  };
+  assert.ok(validateImportItem(item, [item], []).some((issue) => /up to 3 badges/.test(issue)));
 });
 
 test("import review counts create, overwrite, skip, draft, and publish decisions", () => {

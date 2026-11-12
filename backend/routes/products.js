@@ -15,6 +15,7 @@ const { parseListQuery, queryText, escapeRegex } = require("../utils/listQuery")
 const { buildAdminProductQuery, isValidExpectedProductCount, matchesExpectedProductCount } = require("../utils/adminProductQuery");
 const { normalizeReviewedProduct, validateImportPlan, validatePlannedSkuUniqueness } = require("../utils/productImportReview");
 const { suggestUniqueProductSku } = require("../utils/productSku");
+const { normalizeProductBadges } = require("../utils/productBadges");
 const { serializeAvailableInventory } = require("../utils/productInventory");
 const { createOperationConflict, runInventoryOperation } = require("../utils/inventoryOperation");
 const {
@@ -312,7 +313,7 @@ router.get("/", async (req, res, next) => {
       $and: [{ $or: [{ shop: { $in: availableShopIds } }, { "inventoryLocations.shop": { $in: availableShopIds } }] }],
     };
     if (purpose) filter.purposeTags = purpose;
-    if (badge) filter.badge = badge;
+    if (badge) filter.$and.push({ $or: [{ badge }, { badges: badge }] });
     if (flashSale === "true") filter.isFlashSale = true;
     if (search) filter.$text = { $search: search };
     // Exact (case-insensitive) match, not a substring search — brand/category
@@ -790,6 +791,7 @@ router.get("/export", protect, requireRole("admin"), async (req, res, next) => {
       { label: "Status", value: (p) => productStatus(p) },
       { label: "Variants", value: (p) => JSON.stringify((p.variants || []).map((variant) => ({ name: variant.name, sku: variant.sku, price: variant.price, compareAtPrice: variant.compareAtPrice, stock: variant.stock, reorderLevel: variant.reorderLevel ?? 5, image: variant.image }))) },
       { label: "Badge", value: "badge" },
+      { label: "Badges", value: (product) => (product.badges?.length ? product.badges : product.badge ? [product.badge] : []).join("; ") },
       { label: "Return Eligibility", value: (p) => p.returnEligibility || "standard" },
       { label: "Shop", value: (p) => p.shop ? `#${p.shop.shopNumber} ${p.shop.name}` : "" },
       { label: "Active", value: (p) => (p.isActive ? "yes" : "no") },
@@ -828,10 +830,13 @@ router.post("/", protect, requireRole("admin"), async (req, res, next) => {
     const body = req.body || {};
     const createFields = new Set([
       "name", "sku", "description", "longDescription", "price", "compareAtPrice", "images", "imageUrls", "shop",
-      "floorId", "categoryId", "subcategoryId", "category", "subcategory", "brandId", "brand", "returnEligibility", "stock", "reorderLevel", "badge", "isFlashSale",
+      "floorId", "categoryId", "subcategoryId", "category", "subcategory", "brandId", "brand", "returnEligibility", "stock", "reorderLevel", "badge", "badges", "isFlashSale",
       "purposeTags", "variants", "flashSaleEndsAt", "status", "publish",
     ]);
     const safeBody = Object.fromEntries(Object.entries(body).filter(([key]) => createFields.has(key)));
+    const badgeFields = normalizeProductBadges(safeBody);
+    if (badgeFields.error) return res.status(400).json({ message: badgeFields.error });
+    Object.assign(safeBody, badgeFields);
     if (safeBody.reorderLevel !== undefined && !isValidReorderLevel(safeBody.reorderLevel)) {
       return res.status(400).json({ message: "Reorder level must be a whole number from 0 to 1,000,000." });
     }
@@ -902,10 +907,15 @@ router.put("/:id", protect, requireRole("admin"), async (req, res, next) => {
     }
     const editableFields = new Set([
       "name", "sku", "description", "longDescription", "price", "compareAtPrice", "images", "imageUrls", "shop",
-      "floorId", "categoryId", "subcategoryId", "category", "subcategory", "brandId", "brand", "returnEligibility", "stock", "reorderLevel", "badge", "isFlashSale",
+      "floorId", "categoryId", "subcategoryId", "category", "subcategory", "brandId", "brand", "returnEligibility", "stock", "reorderLevel", "badge", "badges", "isFlashSale",
       "purposeTags", "variants", "flashSaleEndsAt", "status", "isActive", "publish",
     ]);
     const updates = Object.fromEntries(Object.entries(req.body).filter(([key]) => editableFields.has(key)));
+    if (updates.badge !== undefined || updates.badges !== undefined) {
+      const badgeFields = normalizeProductBadges(updates);
+      if (badgeFields.error) return res.status(400).json({ message: badgeFields.error });
+      Object.assign(updates, badgeFields);
+    }
     if (updates.reorderLevel !== undefined && !isValidReorderLevel(updates.reorderLevel)) {
       return res.status(400).json({ message: "Reorder level must be a whole number from 0 to 1,000,000." });
     }
@@ -1386,7 +1396,7 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
           if (!await Product.exists({ _id: existing._id, ...matchingQuery })) throw Object.assign(new Error("The selected product no longer matches this import row."), { statusCode: 409 });
           // Preserve existing values when the CSV leaves a field blank.
           const merged = existing.toObject();
-          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brandId", "brand", "categoryId", "subcategoryId", "category", "subcategory", "shop", "returnEligibility", "badge", "isFlashSale", "purposeTags", "flashSaleEndsAt", "reorderLevel", "variants"]) {
+          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brandId", "brand", "categoryId", "subcategoryId", "category", "subcategory", "shop", "returnEligibility", "badge", "badges", "isFlashSale", "purposeTags", "flashSaleEndsAt", "reorderLevel", "variants"]) {
             const value = imported[key];
             if (key === "variants") {
               merged.variants = mergeImportedVariants(existing.variants || [], imported.variants || []);
@@ -1458,7 +1468,7 @@ router.post("/bulk-import", protect, requireRole("admin"), upload.single("csv"),
           if (issues.length) throw Object.assign(new Error("This item cannot be published yet"), { statusCode: 400, issues });
           merged.skuCodes = [merged.sku, ...(merged.variants || []).map((variant) => variant.sku)].filter(Boolean).map((sku) => String(sku).trim().toUpperCase());
           const update = {};
-          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brandId", "brand", "categoryId", "subcategoryId", "category", "subcategory", "shop", "returnEligibility", "badge", "isFlashSale", "purposeTags", "flashSaleEndsAt", "reorderLevel", "variants", "inventoryLocations", "stock", "status", "isActive", "archivedAt", "skuCodes"]) {
+          for (const key of ["name", "sku", "price", "compareAtPrice", "description", "longDescription", "images", "brandId", "brand", "categoryId", "subcategoryId", "category", "subcategory", "shop", "returnEligibility", "badge", "badges", "isFlashSale", "purposeTags", "flashSaleEndsAt", "reorderLevel", "variants", "inventoryLocations", "stock", "status", "isActive", "archivedAt", "skuCodes"]) {
             if (merged[key] !== undefined) update[key] = merged[key];
           }
           const updateOperations = { $set: update };
@@ -1554,7 +1564,7 @@ router.patch("/bulk-edit", protect, requireRole("admin"), async (req, res, next)
     const update = {};
     let includesShopMove = false;
     if (set && Object.keys(set).length > 0) {
-      const allowedFields = new Set(["shop", "categoryId", "subcategoryId", "category", "subcategory", "badge", "isFlashSale", "stock"]);
+      const allowedFields = new Set(["shop", "categoryId", "subcategoryId", "category", "subcategory", "badge", "badges", "isFlashSale", "stock"]);
       const disallowed = Object.keys(set).filter((key) => !allowedFields.has(key));
       if (disallowed.length) return res.status(400).json({ message: `Bulk edit cannot change: ${disallowed.join(", ")}. Use the product editor for publishing and SKU changes.` });
       if (Object.prototype.hasOwnProperty.call(set, "shop")) {
@@ -1562,13 +1572,18 @@ router.patch("/bulk-edit", protect, requireRole("admin"), async (req, res, next)
           return res.status(400).json({ message: "Choose a valid active shop before moving products." });
         }
       }
-      for (const field of ["category", "subcategory", "badge"]) {
+      for (const field of ["category", "subcategory"]) {
         if (Object.prototype.hasOwnProperty.call(set, field)) {
           if (typeof set[field] !== "string" || set[field].trim().length > 100) {
             return res.status(400).json({ message: `${field} must be text with no more than 100 characters.` });
           }
           set[field] = set[field].trim();
         }
+      }
+      if (set.badge !== undefined || set.badges !== undefined) {
+        const badgeFields = normalizeProductBadges(set);
+        if (badgeFields.error) return res.status(400).json({ message: badgeFields.error });
+        Object.assign(set, badgeFields);
       }
       const hasTaxonomyChange = ["categoryId", "subcategoryId", "category", "subcategory"].some((field) => Object.prototype.hasOwnProperty.call(set, field));
       if (hasTaxonomyChange && (set.categoryId || set.subcategoryId)) {

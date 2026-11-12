@@ -49,6 +49,23 @@ test("reviewed product normalizes and preserves all editable catalog details", (
   assert.equal(product.variants[0].image, "https://cdn.example.com/mug-blue.jpg");
 });
 
+test("reviewed product accepts multiple badges and keeps the first as a legacy alias", () => {
+  const { product, issues } = normalizeReviewedProduct(reviewedProduct({
+    badge: "trending",
+    badges: ["trending", "best-seller", "trending"],
+  }));
+  assert.deepEqual(issues, []);
+  assert.deepEqual(product.badges, ["trending", "best-seller"]);
+  assert.equal(product.badge, "trending");
+});
+
+test("reviewed product rejects more than three badges", () => {
+  const { issues } = normalizeReviewedProduct(reviewedProduct({
+    badges: ["trending", "best-seller", "new-arrival", "clearance"],
+  }));
+  assert.ok(issues.some((issue) => /up to 3/.test(issue)));
+});
+
 test("reviewed product accepts blank reorder levels so imports can preserve existing settings", () => {
   const { product, issues } = normalizeReviewedProduct(reviewedProduct({
     reorderLevel: "",

@@ -5,7 +5,7 @@ import ScrollToTop from "./components/ScrollToTop";
 import MaintenancePage from "./components/MaintenancePage";
 import PageMetadata from "./components/PageMetadata";
 import { useSettings } from "./context/SettingsContext";
-const Home = lazy(() => import("./pages/Home"));
+import Home from "./pages/Home";
 const Directory = lazy(() => import("./pages/Directory"));
 const Floor = lazy(() => import("./pages/Floor"));
 const Shop = lazy(() => import("./pages/Shop"));

@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import api from "../api/client";
 import StripProductCard from "../components/StripProductCard";
-import { getHomeCache, setHomeCache } from "../utils/homeCache";
+import { getHomeCache, isHomeCacheFresh, setHomeCache } from "../utils/homeCache";
 import { normalizeHomepageContent } from "../utils/homepageContent";
 import { organizeHomepageSections } from "../utils/homepageProducts";
 import { productImageUrl } from "../utils/productImageUrl";
@@ -92,17 +92,17 @@ function ZoneBg({ src, type = "video", poster, overlay = "bg-mall-900/60", alt =
             <picture className="absolute inset-0 h-full w-full">
               {mediumSrc && <source media="(min-width: 640px) and (max-width: 1023px)" srcSet={mediumSrc} />}
               {mobileSrc && <source media="(max-width: 639px)" srcSet={mobileSrc} />}
-              <img src={src} alt={alt} onError={() => setMediaFailed(true)} className={`h-full w-full ${mediaFitClass}`} />
+              <img src={src} alt={alt} loading={deferMedia ? "lazy" : "eager"} fetchPriority={deferMedia ? "low" : "high"} decoding="async" onError={() => setMediaFailed(true)} className={`h-full w-full ${mediaFitClass}`} />
             </picture>
           ) : (
             <picture className="absolute inset-0 h-full w-full">
-              <img src={src} alt={alt} onError={() => setMediaFailed(true)} className={`h-full w-full ${mediaFitClass}`} />
+              <img src={src} alt={alt} loading={deferMedia ? "lazy" : "eager"} fetchPriority={deferMedia ? "low" : "high"} decoding="async" onError={() => setMediaFailed(true)} className={`h-full w-full ${mediaFitClass}`} />
             </picture>
           )
         )
       ) : mediaReady ? (
         <>
-          {poster && <img src={poster} alt="" onError={(e) => e.currentTarget.remove()} className={`absolute inset-0 w-full h-full ${mediaFitClass}`} />}
+          {poster && <img src={poster} alt="" loading={deferMedia ? "lazy" : "eager"} fetchPriority={deferMedia ? "low" : "high"} decoding="async" onError={(e) => e.currentTarget.remove()} className={`absolute inset-0 w-full h-full ${mediaFitClass}`} />}
           {src && !mediaFailed && <video ref={videoRef} autoPlay={!reducedMotion} muted loop playsInline preload={reducedMotion ? "none" : "metadata"} onError={() => setMediaFailed(true)} className={`absolute inset-0 w-full h-full ${mediaFitClass}`}>
             <source src={src} type="video/mp4" />
           </video>}
@@ -121,10 +121,10 @@ const FLOOR_ICONS = {
 };
 
 // ─── Product strip ────────────────────────────────────────────────────────────
-function ProductStrip({ products, cardSize, priorityCount = 0 }) {
+function ProductStrip({ products, cardSize, priorityCount = 0, loading = false }) {
   const ref = useRef(null);
   const scroll = (dir) => ref.current?.scrollBy({ left: dir * (cardSize === "large" ? 280 : 200), behavior: "smooth" });
-  if (!products.length) return null;
+  if (!products.length && !loading) return null;
   return (
     <div className="relative -mx-4 sm:mx-0">
       <button onClick={() => scroll(-1)} aria-label="Scroll left"
@@ -134,6 +134,12 @@ function ProductStrip({ products, cardSize, priorityCount = 0 }) {
       <div ref={ref} className={`flex ${cardSize === "large" ? "gap-3.5 sm:gap-4" : "gap-2.5 sm:gap-3"} overflow-x-auto px-4 sm:px-0 pb-3`}
         style={{ scrollbarWidth: "none", msOverflowStyle: "none", WebkitOverflowScrolling: "touch" }}>
         {products.map((p, index) => <StripProductCard key={p._id} product={p} size={cardSize} priority={index < priorityCount} />)}
+        {loading && Array.from({ length: 4 }, (_, index) => (
+          <div key={`loading-${index}`} aria-hidden="true" className={`shrink-0 animate-pulse overflow-hidden rounded-xl bg-mall-800 ${cardSize === "large" ? "w-[76vw] max-w-[19rem] sm:w-64 md:w-72" : "w-36 sm:w-40 md:w-44"}`}>
+            <div className="aspect-square bg-cream/5" />
+            <div className="space-y-2 p-3"><div className="h-3 w-4/5 rounded bg-cream/10" /><div className="h-3 w-2/5 rounded bg-cream/10" /></div>
+          </div>
+        ))}
         <div className="shrink-0 w-2 sm:hidden" />
       </div>
       <button onClick={() => scroll(1)} aria-label="Scroll right"
@@ -179,7 +185,7 @@ function HomeSectionBlock({ section, homepageContent }) {
             linkTo={section.shop ? `/shop/${section.shop.slug}` : undefined}
             linkLabel={homepageContent.featuredShopLinkLabel}
           />
-          <FeaturedShop shop={section.shop} products={section.products} />
+          <FeaturedShop shop={section.shop} products={section.products} productsLoading={section.productsLoading} />
         </div>
       </section>
     );
@@ -197,7 +203,7 @@ function HomeSectionBlock({ section, homepageContent }) {
             linkLabel={homepageContent.sectionLinkLabel}
           />
         </div>
-        <div className={SECTION_PADDING}><ProductStrip products={section.products} cardSize="large" /></div>
+        <div className={SECTION_PADDING}><ProductStrip products={section.products} cardSize="large" loading={section.productsLoading} /></div>
       </section>
     );
   }
@@ -215,7 +221,7 @@ function HomeSectionBlock({ section, homepageContent }) {
             linkLabel={homepageContent.sectionLinkLabel}
         />
       </div>
-      <div className={SECTION_PADDING}><ProductStrip products={section.products} cardSize="large" /></div>
+      <div className={SECTION_PADDING}><ProductStrip products={section.products} cardSize="large" loading={section.productsLoading} /></div>
     </section>
   );
 }
@@ -374,7 +380,7 @@ function PurposeTile({ purpose }) {
 }
 
 // ─── Featured shop ────────────────────────────────────────────────────────────
-function FeaturedShop({ shop, products = [] }) {
+function FeaturedShop({ shop, products = [], productsLoading = false }) {
   const productsRailRef = useRef(null);
   const [productsRailState, setProductsRailState] = useState({
     hasOverflow: false,
@@ -441,7 +447,7 @@ function FeaturedShop({ shop, products = [] }) {
           <h3 className="font-display text-lg text-cream sm:text-xl">{shop.name}</h3>
           {shop.description && <p className="mt-1 line-clamp-2 max-w-3xl text-xs leading-relaxed text-cream/65 sm:text-sm">{shop.description}</p>}
         </div>
-        {products.length > 0 && (
+        {(products.length > 0 || productsLoading) && (
           <div className="relative -mx-4 sm:-mx-5">
             <div
               ref={productsRailRef}
@@ -462,6 +468,12 @@ function FeaturedShop({ shop, products = [] }) {
                   </div>
                   <p className="break-words px-2 py-2 text-[11px] leading-snug text-cream/80">{p.name}</p>
                 </Link>
+              ))}
+              {productsLoading && Array.from({ length: 4 }, (_, index) => (
+                <div key={`loading-${index}`} aria-hidden="true" className="w-24 shrink-0 snap-start animate-pulse overflow-hidden rounded-lg border border-cream/10 bg-mall-800/70 sm:w-28">
+                  <div className="aspect-square bg-cream/5" />
+                  <div className="space-y-2 p-2"><div className="h-2 w-4/5 rounded bg-cream/10" /><div className="h-2 w-2/5 rounded bg-cream/10" /></div>
+                </div>
               ))}
             </div>
             {productsRailState.hasOverflow && (
@@ -608,17 +620,18 @@ function HeroSlideshow({ heroSlides, fallbackSlide, onSlideChange, containerRef 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 export default function Home() {
   const { settings } = useSettings();
+  const [initialCache] = useState(() => getHomeCache());
   const heroContainerRef = useRef(null);
-  const [floors, setFloors] = useState([]);
-  const [shopsByFloor, setShopsByFloor] = useState({});
-  const [flashSale, setFlashSale] = useState([]);
-  const [homeSections, setHomeSections] = useState([]);
-  const [heroSlides, setHeroSlides] = useState([]);
+  const [floors, setFloors] = useState(() => initialCache?.floors || []);
+  const [shopsByFloor, setShopsByFloor] = useState(() => initialCache?.shopsByFloor || {});
+  const [flashSale, setFlashSale] = useState(() => initialCache?.flashSale || []);
+  const [homeSections, setHomeSections] = useState(() => organizeHomepageSections(initialCache?.homeSections || [], initialCache?.flashSale || []));
+  const [heroSlides, setHeroSlides] = useState(() => initialCache?.heroSlides || []);
   const [activeHeroSlide, setActiveHeroSlide] = useState(null);
-  const [homepageContent, setHomepageContent] = useState(HOME_CONTENT_FALLBACK);
+  const [homepageContent, setHomepageContent] = useState(() => normalizeHomepageContent(initialCache?.homepageContent || HOME_CONTENT_FALLBACK));
   const [recentlyViewed, setRecentlyViewed] = useState(() => readRecentlyViewed());
-  const [loading, setLoading] = useState(() => !getHomeCache());
   const [loadError, setLoadError] = useState(false);
+  const [refreshAttempt, setRefreshAttempt] = useState(0);
   const trendingSection = homeSections.find((section) => section.type === "badge" && section.badge?.slug === "trending");
 
   useEffect(() => {
@@ -643,117 +656,89 @@ export default function Home() {
   }
 
   useEffect(() => {
-    // Already fetched once this session — render immediately, no spinner,
-    // no refetch. This is what makes navigating back to Home instant.
     const cached = getHomeCache();
     if (cached) {
       applyData(cached);
-      setLoading(false);
-      return;
+      if (isHomeCacheFresh()) return;
     }
 
-    // Homepage layout is fully admin-managed now (see AdminHomeSections.jsx)
-    // — fetch the section list first, since we need to know each one's
-    // type and reference before we know which product fetch it needs.
-    api.get("/home-sections", { timeout: HOME_REQUEST_TIMEOUT_MS }).catch(() => ({ data: [] })).then((sectionsRes) => {
-      // A section can outlive what it points to — its badge, shop, or
-      // category may have been deleted since. Drop those here rather than
-      // let a missing reference turn into an unfiltered "all products"
-      // fetch below (undefined badge/shop/category params match everything).
-      const sectionConfigs = sectionsRes.data.filter((s) =>
-        (s.type === "badge" && s.badge) ||
-        (s.type === "featured-shop" && s.shop && s.shop.isActive !== false) ||
-        (s.type === "featured-category" && s.category)
-      );
+    let active = true;
+    setLoadError(false);
+    Promise.all([
+      api.get("/home-sections", { timeout: HOME_REQUEST_TIMEOUT_MS }).catch(() => ({ data: [] })),
+      api.get("/floors", { timeout: HOME_REQUEST_TIMEOUT_MS }),
+      api.get("/shops", { params: { includeCounts: false }, timeout: HOME_REQUEST_TIMEOUT_MS }),
+      api.get("/products", { params: { flashSale: true, limit: 12 }, timeout: HOME_REQUEST_TIMEOUT_MS }),
+      api.get("/hero-slides", { timeout: HOME_REQUEST_TIMEOUT_MS }).catch(() => ({ data: [] })),
+      api.get("/homepage-content", { timeout: HOME_REQUEST_TIMEOUT_MS }).catch(() => ({ data: null })),
+    ]).then(async ([sectionsRes, floorsRes, shopsRes, flashRes, heroRes, contentRes]) => {
+      if (!active) return;
 
-      return Promise.all([
-        api.get("/floors", { timeout: HOME_REQUEST_TIMEOUT_MS }),
-        api.get("/shops", { timeout: HOME_REQUEST_TIMEOUT_MS }),
-        api.get("/products", { params: { flashSale: true, limit: 12 }, timeout: HOME_REQUEST_TIMEOUT_MS }),
-        api.get("/hero-slides", { timeout: HOME_REQUEST_TIMEOUT_MS }).catch(() => ({ data: [] })),
-        api.get("/homepage-content", { timeout: HOME_REQUEST_TIMEOUT_MS }).catch(() => ({ data: null })),
-        ...sectionConfigs.map((s) => {
-          const request = s.type === "badge"
-            ? api.get("/products", { params: { badge: s.badge?.slug, limit: 12 }, timeout: HOME_REQUEST_TIMEOUT_MS })
-            : s.type === "featured-shop"
-              ? api.get("/products", { params: { shop: s.shop?._id, limit: 12 }, timeout: HOME_REQUEST_TIMEOUT_MS })
-              : api.get("/products", { params: { category: s.category, limit: 12 }, timeout: HOME_REQUEST_TIMEOUT_MS });
-          return request.catch(() => ({ data: { products: [] } }));
-        }),
-      ]).then(([floorsRes, shopsRes, flashRes, heroRes, contentRes, ...sectionResults]) => {
-        const grouped = {};
-        shopsRes.data.forEach((shop) => { const fid = shop.floor?._id; if (!grouped[fid]) grouped[fid] = []; grouped[fid].push(shop); });
-
-        // Flash Sale takes priority — a product already shown there shouldn't
-        // repeat further down the page in another section.
-        const flashSaleProducts = flashRes.data.products;
-        const flashSaleIds = new Set(flashSaleProducts.map((p) => p._id));
-        const excludeFlashSale = (list) => list.filter((p) => !flashSaleIds.has(p._id));
-
-        // One entry per admin-managed homepage section, in admin-set order.
-        // A section with no matching products right now just doesn't render
-        // — same as badges always did, now true for shop/category sections too.
-        const homeSectionsResult = sectionConfigs
-          .map((s, i) => ({ ...s, products: excludeFlashSale(sectionResults[i].data.products || []) }))
-          .filter((s) => s.products.length > 0);
-
-        const bundle = {
-          floors: floorsRes.data,
-          shopsByFloor: grouped,
-          flashSale: flashSaleProducts,
-          heroSlides: heroRes.data || [],
-          homepageContent: contentRes.data || HOME_CONTENT_FALLBACK,
-          homeSections: homeSectionsResult,
-        };
-
-        applyData(bundle);
-        setHomeCache(bundle);
+      const grouped = {};
+      shopsRes.data.forEach((shop) => {
+        const floorId = shop.floor?._id;
+        if (!grouped[floorId]) grouped[floorId] = [];
+        grouped[floorId].push(shop);
       });
+
+      const sectionConfigs = (sectionsRes.data || []).filter((section) =>
+        (section.type === "badge" && section.badge) ||
+        (section.type === "featured-shop" && section.shop && section.shop.isActive !== false) ||
+        (section.type === "featured-category" && section.category)
+      );
+      const flashSaleProducts = flashRes.data.products || [];
+      const coreBundle = {
+        floors: floorsRes.data,
+        shopsByFloor: grouped,
+        flashSale: flashSaleProducts,
+        heroSlides: heroRes.data || [],
+        homepageContent: contentRes.data || HOME_CONTENT_FALLBACK,
+        homeSections: cached?.homeSections || [],
+      };
+
+      applyData(coreBundle);
+      setHomeCache({ ...coreBundle, sectionsPending: true });
+      setLoadError(false);
+
+      const sectionResults = await Promise.all(sectionConfigs.map((section) => {
+        const request = section.type === "badge"
+          ? api.get("/products", { params: { badge: section.badge?.slug, limit: 12 }, timeout: HOME_REQUEST_TIMEOUT_MS })
+          : section.type === "featured-shop"
+            ? api.get("/products", { params: { shop: section.shop?._id, limit: 12 }, timeout: HOME_REQUEST_TIMEOUT_MS })
+            : api.get("/products", { params: { category: section.category, limit: 12 }, timeout: HOME_REQUEST_TIMEOUT_MS });
+        return request.catch(() => ({ data: { products: [] } }));
+      }));
+
+      if (!active) return;
+      const homeSectionsResult = sectionConfigs
+        .map((section, index) => ({ ...section, products: sectionResults[index].data.products || [] }))
+        .filter((section) => section.products.length > 0);
+      const bundle = { ...coreBundle, homeSections: homeSectionsResult };
+      setHomeSections(organizeHomepageSections(homeSectionsResult, flashSaleProducts));
+      setHomeCache(bundle);
     }).catch(() => {
-      setLoadError(true);
-    }).finally(() => setLoading(false));
-  }, []);
+      if (active) setLoadError(true);
+    });
+
+    return () => { active = false; };
+  }, [refreshAttempt]);
 
   const activeFloorCount = floors.filter((f) => (shopsByFloor[f._id] || []).some((shop) => shop.status !== "closed")).length;
   const si = SECTION_PADDING;
   const currentHeroSlide = activeHeroSlide || heroSlides[0] || getHeroFallback(homepageContent);
   const fallbackHeroSlide = useMemo(() => getHeroFallback(homepageContent), [homepageContent]);
-  const hasResponsiveBrandBanner = currentHeroSlide.mediaType === "image" && /(?:^|\/)azard-stores-banner\.png(?:[?#]|$)/i.test(currentHeroSlide.mediaUrl || "");
+  const hasResponsiveBrandBanner = currentHeroSlide.mediaType === "image" && /^\/pics\/azard-stores-banner\.(?:png|webp)(?:[?#]|$)/i.test(currentHeroSlide.mediaUrl || "");
+  const heroImageUrl = hasResponsiveBrandBanner ? "/pics/azard-stores-banner.webp" : currentHeroSlide.mediaUrl;
   const heroFrameClass = "aspect-[4/5] sm:aspect-video lg:aspect-[5/2]";
-
-  // Wait for everything together instead of letting the Hero render
-  // immediately while product sections pop in piecemeal underneath it —
-  // one clean loading state, then the whole page appears fully populated.
-  if (loading) {
-    return (
-      <div className="bg-mall-900 min-h-screen flex items-center justify-center">
-        <img
-          src="/pics/azard-stores.png"
-          alt="Azard Stores"
-          className="w-40 sm:w-56 object-contain animate-pulse"
-        />
-      </div>
-    );
-  }
-
-  if (loadError) {
-    return (
-      <div className="bg-mall-900 min-h-screen flex items-center justify-center px-4">
-        <div className="flex flex-col items-center text-center gap-3">
-          <p className="text-cream/60 text-sm">Something went wrong loading the mall.</p>
-          <button
-            onClick={() => window.location.reload()}
-            className="text-mall-accent text-sm font-medium hover:text-mall-accentDark transition"
-          >
-            Try again
-          </button>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="bg-mall-900 min-h-screen">
+      {loadError && (
+        <div role="alert" className="flex items-center justify-center gap-3 bg-amber-300/10 px-4 py-2 text-center text-xs text-amber-100">
+          Some homepage content could not be refreshed.
+          <button type="button" onClick={() => setRefreshAttempt((attempt) => attempt + 1)} className="underline">Retry</button>
+        </div>
+      )}
 
       {/* ══════════════════════════════════════════════════════════════
           ZONE 1 — THE ARRIVAL
@@ -762,13 +747,13 @@ export default function Home() {
       ══════════════════════════════════════════════════════════════ */}
       <section ref={heroContainerRef} className={`relative isolate flex items-center overflow-hidden bg-mall-900 ${heroFrameClass}`}>
         <ZoneBg
-          src={currentHeroSlide.mediaUrl}
+          src={heroImageUrl}
           type={currentHeroSlide.mediaType}
           poster={currentHeroSlide.posterUrl}
           alt={currentHeroSlide.altText || currentHeroSlide.headline}
           overlay={currentHeroSlide.mediaType === "video" ? "bg-mall-900/10 sm:bg-mall-900/20" : "bg-transparent"}
-          mobileSrc={hasResponsiveBrandBanner ? "/pics/azard-stores-banner-mobile.png" : ""}
-          mediumSrc={hasResponsiveBrandBanner ? "/pics/azard-stores-banner-md.png" : ""}
+          mobileSrc={hasResponsiveBrandBanner ? "/pics/azard-stores-banner-mobile.webp" : ""}
+          mediumSrc={hasResponsiveBrandBanner ? "/pics/azard-stores-banner-md.webp" : ""}
         />
         {currentHeroSlide.mediaType === "video" && <div className="pointer-events-none absolute inset-0 z-0 bg-gradient-to-t from-mall-900/95 via-mall-900/30 to-transparent" />}
 
@@ -778,7 +763,7 @@ export default function Home() {
 
       <div className="relative bg-mall-900">
         {/* Flash Sale */}
-        {!loading && flashSale.length > 0 && (
+        {flashSale.length > 0 && (
           <section className="relative z-10 overflow-hidden border-b border-cream/5 py-6 sm:py-8">
             <div className={`${si} mb-4 sm:mb-5`}>
               <SectionHeading
@@ -809,12 +794,12 @@ export default function Home() {
           </div>
         </section>}
 
-        {!loading && trendingSection?.products?.length > 0 && (
+        {trendingSection?.products?.length > 0 && (
           <HomeSectionBlock section={trendingSection} homepageContent={homepageContent} />
         )}
 
         {/* Explore Floors */}
-        {!loading && activeFloorCount > 0 && (
+        {activeFloorCount > 0 && (
           <section className="relative z-10 pt-5 pb-6 sm:pt-7 sm:pb-8">
             <div className={si}>
               <div className="mb-3 flex items-center gap-3 font-mono-tag text-[9px] uppercase tracking-[0.18em] text-cream/45 sm:mb-4">
@@ -842,7 +827,7 @@ export default function Home() {
           admin-set order; Trending Now is placed earlier in the home flow.
       ══════════════════════════════════════════════════════════════ */}
       <div className="relative">
-        {!loading && homeSections.filter((section) => section !== trendingSection).map((section) => (
+        {homeSections.filter((section) => section !== trendingSection).map((section) => (
           <HomeSectionBlock key={section._id} section={section} homepageContent={homepageContent} />
         ))}
       </div>

@@ -34,3 +34,21 @@ test("homepage product rails preserve products without IDs and ignore empty entr
     [anonymousProduct],
   ]);
 });
+
+test("flash-sale products can appear in each matching badge section as additional placements", () => {
+  const sharedProduct = { _id: "shared", name: "Popular mug" };
+  const flashProduct = { _id: "flash", name: "Flash item", badges: ["trending", "best-seller", "new-arrival"] };
+  const sections = organizeHomepageSections([
+    { type: "badge", badge: { slug: "trending" }, products: [sharedProduct, flashProduct] },
+    { type: "badge", badge: { slug: "best-seller" }, products: [sharedProduct, flashProduct] },
+    { type: "badge", badge: { slug: "new-arrival" }, products: [flashProduct] },
+    { type: "featured-category", products: [sharedProduct, flashProduct, { _id: "category", name: "Category item" }] },
+  ], [flashProduct]);
+
+  assert.deepEqual(sections.map((section) => section.products.map((product) => product._id)), [
+    ["shared", "flash"],
+    ["shared", "flash"],
+    ["flash"],
+    ["category"],
+  ]);
+});

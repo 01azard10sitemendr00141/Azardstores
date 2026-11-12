@@ -1,6 +1,7 @@
 const mongoose = require("mongoose");
 const { makeSlug } = require("../utils/slug");
 const { createInitialInventoryHistory } = require("../utils/inventoryHistory");
+const { MAX_PRODUCT_BADGES } = require("../utils/productBadges");
 const { Schema } = mongoose;
 
 const productSchema = new Schema(
@@ -77,7 +78,20 @@ const productSchema = new Schema(
       select: false,
     },
     stockReservations: [{ orderId: { type: Schema.Types.ObjectId, required: true }, itemIndex: { type: Number, required: true }, quantity: { type: Number, required: true, min: 1 } }],
+    // `badge` remains the first-badge alias for older clients and CSVs.
     badge: { type: String, default: "" },
+    badges: {
+      type: [String],
+      default: [],
+      validate: {
+        validator(badges) {
+          if (!Array.isArray(badges)) return false;
+          const assigned = new Set([...badges, this.badge].filter(Boolean));
+          return assigned.size <= MAX_PRODUCT_BADGES;
+        },
+        message: `A product can have up to ${MAX_PRODUCT_BADGES} badges.`,
+      },
+    },
     isFlashSale: { type: Boolean, default: false },
     // Optional simple variants (e.g. "Red / Large") — each is independently
     // priced and stocked. Fully wired end-to-end: the Product page lets a

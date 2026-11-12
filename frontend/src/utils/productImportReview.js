@@ -1,3 +1,5 @@
+import { MAX_PRODUCT_BADGES } from "./productBadges.js";
+
 export const IMPORT_PURPOSES = ["work", "gaming", "travel", "home", "fitness"];
 
 export function prepareImportProduct(product = {}) {
@@ -5,6 +7,8 @@ export function prepareImportProduct(product = {}) {
   const localDate = date && !Number.isNaN(date.getTime())
     ? new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16)
     : "";
+  const badgeValues = [...(Array.isArray(product.badges) ? product.badges : []), product.badge];
+  const badges = [...new Set(badgeValues.filter((badge) => typeof badge === "string").map((badge) => badge.trim()).filter(Boolean))];
   return {
     name: product.name || "",
     sku: product.sku || "",
@@ -16,7 +20,8 @@ export function prepareImportProduct(product = {}) {
     brandId: product.brandId || "",
     brand: product.brand || "",
     returnEligibility: product.returnEligibility || "standard",
-    badge: product.badge || "",
+    badge: badges[0] || "",
+    badges,
     isFlashSale: Boolean(product.isFlashSale),
     purposeTags: Array.isArray(product.purposeTags) ? product.purposeTags : [],
     flashSaleEndsAt: localDate,
@@ -79,7 +84,8 @@ export function validateImportItem(item, items, categories, shops = [], brands =
   if (product.brand.length > 160) issues.push("Brand must be 160 characters or fewer.");
   if (product.brandId && !brands.some((brand) => String(brand._id) === String(product.brandId))) issues.push("Choose an existing managed brand.");
   if (product.brand && !product.brandId) issues.push("Map this brand to a managed brand or clear the brand value.");
-  if (product.badge.length > 80) issues.push("Badge must be 80 characters or fewer.");
+  if (!Array.isArray(product.badges) || product.badges.length > MAX_PRODUCT_BADGES) issues.push(`Choose up to ${MAX_PRODUCT_BADGES} badges.`);
+  else if (product.badges.some((badge) => typeof badge !== "string" || badge.length > 100)) issues.push("Each badge must be 100 characters or fewer.");
   if (!item.floorId) issues.push("Choose a floor.");
   if (!item.shopId) issues.push("Choose a shop.");
   if (item.placementIssue) issues.push(item.placementIssue);

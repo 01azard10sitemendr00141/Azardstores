@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, Check, CheckCircle2, ChevronDown, ChevronUp, FileSpreadsheet, Plus, Search, Trash2, Upload, X } from "lucide-react";
+import { Link } from "react-router-dom";
 import api from "../../api/client";
 import { useBadges } from "../../context/BadgesContext";
 import { buildImportSkuIndex, getImportCounts, getImportReviewStatus, prepareImportProduct, validateImportItem } from "../../utils/productImportReview";
+import { MAX_PRODUCT_BADGES } from "../../utils/productBadges";
 
 const FIELD_CLASS = "w-full min-h-11 bg-mall-800 border border-cream/10 rounded-xl px-3 py-2.5 text-cream text-sm placeholder-cream/25 outline-none focus:border-mall-accent transition disabled:opacity-50";
 const LABEL_CLASS = "mb-1.5 block font-mono-tag text-[9px] uppercase tracking-widest text-cream/45";
@@ -56,7 +58,7 @@ function ReviewBadge({ children, tone = "neutral" }) {
 }
 
 export default function ProductImportPanel({ floors = [], shops, categories, brands = [], onDone, onCancel }) {
-  const { badges } = useBadges();
+  const { badges, loading: badgesLoading, error: badgesError, retry: retryBadges } = useBadges();
   const [file, setFile] = useState(null);
   const [items, setItems] = useState([]);
   const [previewHash, setPreviewHash] = useState("");
@@ -593,7 +595,20 @@ export default function ProductImportPanel({ floors = [], shops, categories, bra
                 <label><span className={LABEL_CLASS}>Stock quantity</span><input type="number" min="0" step="1" value={product.stock} onChange={(event) => updateProduct(item.index, { stock: event.target.value })} {...fieldAttributes("stock")} placeholder="Leave blank if unconfirmed" />{fieldMessage("stock")}</label>
                 {!product.variants.length && <label><span className={LABEL_CLASS}>Reorder at or below <span className="text-cream/35">(blank = default 5)</span></span><input type="number" min="0" max="1000000" step="1" value={product.reorderLevel} onChange={(event) => updateProduct(item.index, { reorderLevel: event.target.value })} className={FIELD_CLASS} /></label>}
                 <label><span className={LABEL_CLASS}>Return eligibility</span><select value={product.returnEligibility} onChange={(event) => updateProduct(item.index, { returnEligibility: event.target.value })} className={FIELD_CLASS}><option value="standard">Standard</option><option value="final_sale">Final sale</option><option value="perishable">Perishable</option><option value="digital_product">Digital product</option></select></label>
-                <label><span className={LABEL_CLASS}>Badge</span><select value={product.badge} onChange={(event) => updateProduct(item.index, { badge: event.target.value })} className={FIELD_CLASS}><option value="">No badge</option>{badges.map((badge) => <option key={badge._id} value={badge.slug}>{badge.chipLabel}</option>)}</select></label>
+                <fieldset className="sm:col-span-2"><legend className={LABEL_CLASS}>Badges · up to {MAX_PRODUCT_BADGES}</legend><div className="grid gap-2 rounded-xl border border-cream/10 p-3 sm:grid-cols-2 lg:grid-cols-3">
+                  {badgesLoading && <p className="text-xs text-cream/45">Loading badges…</p>}
+                  {!badgesLoading && badgesError && <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-red-200">
+                    <span>{badgesError}</span>
+                    <button type="button" onClick={retryBadges} className="min-h-8 rounded-md border border-red-200/20 px-2 text-red-100 hover:bg-red-200/5">Retry</button>
+                  </div>}
+                  {!badgesLoading && !badgesError && badges.map((badge) => <label key={badge._id} className="flex min-h-9 items-center gap-2 text-xs text-cream/70"><input type="checkbox" checked={(product.badges || []).includes(badge.slug)} disabled={!(product.badges || []).includes(badge.slug) && (product.badges || []).length >= MAX_PRODUCT_BADGES} onChange={() => {
+                  const currentBadges = product.badges || [];
+                  if (!currentBadges.includes(badge.slug) && currentBadges.length >= MAX_PRODUCT_BADGES) return;
+                  const nextBadges = currentBadges.includes(badge.slug) ? currentBadges.filter((value) => value !== badge.slug) : [...currentBadges, badge.slug];
+                  updateProduct(item.index, { badges: nextBadges, badge: nextBadges[0] || "" });
+                }} className="h-4 w-4 accent-mall-accent disabled:opacity-40" /><span>{badge.chipLabel}</span></label>)}
+                  {!badgesLoading && !badgesError && !badges.length && <p className="text-xs text-cream/55">No badges yet. <Link to="/admin/badges" className="text-mall-accent underline underline-offset-2">Create one in Badge management</Link>.</p>}
+                </div><p className="mt-1 text-[10px] text-cream/40">Selected: {(product.badges || []).length}/{MAX_PRODUCT_BADGES}. Flash Sale is managed separately.</p></fieldset>
                 <label><span className={LABEL_CLASS}>Save as</span><select value={item.status} onChange={(event) => updateItem(item.index, { status: event.target.value })} className={FIELD_CLASS}><option value="draft">Draft</option><option value="published">Published</option></select></label>
                 <label><span className={LABEL_CLASS}>Flash sale ends</span><input type="datetime-local" value={product.flashSaleEndsAt} onChange={(event) => updateProduct(item.index, { flashSaleEndsAt: event.target.value })} className={FIELD_CLASS} /></label>
               </div>

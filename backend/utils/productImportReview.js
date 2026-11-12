@@ -1,4 +1,5 @@
 const { isValidProductImageUrl } = require("./productLifecycle");
+const { MAX_PRODUCT_BADGES } = require("./productBadges");
 
 const PRODUCT_FIELDS = [
   "name",
@@ -12,6 +13,7 @@ const PRODUCT_FIELDS = [
   "brand",
   "returnEligibility",
   "badge",
+  "badges",
   "isFlashSale",
   "purposeTags",
   "flashSaleEndsAt",
@@ -65,7 +67,10 @@ function normalizeReviewedProduct(value) {
     return { product: null, issues: ["Reviewed product details are missing. Analyze the CSV again and review each product."] };
   }
 
-  const missing = PRODUCT_FIELDS.filter((field) => field !== "reorderLevel" && !Object.prototype.hasOwnProperty.call(value, field));
+  const missing = PRODUCT_FIELDS.filter((field) => !["reorderLevel", "badge", "badges"].includes(field) && !Object.prototype.hasOwnProperty.call(value, field));
+  if (!Object.prototype.hasOwnProperty.call(value, "badge") && !Object.prototype.hasOwnProperty.call(value, "badges")) {
+    missing.push("badges");
+  }
   const unexpected = Object.keys(value).filter((field) => !PRODUCT_FIELDS.includes(field));
   if (missing.length) issues.push("Reviewed product details are incomplete. Analyze the CSV again and review each product.");
   if (unexpected.length) issues.push(`Unsupported product fields: ${unexpected.join(", ")}.`);
@@ -81,7 +86,8 @@ function normalizeReviewedProduct(value) {
     brandId: readText(value.brandId, "Managed brand ID", issues, 24),
     brand: readText(value.brand, "Brand", issues, 160),
     returnEligibility: value.returnEligibility,
-    badge: readText(value.badge, "Badge", issues, 80),
+    badge: "",
+    badges: [],
     isFlashSale: value.isFlashSale,
     purposeTags: [],
     flashSaleEndsAt: null,
@@ -89,6 +95,15 @@ function normalizeReviewedProduct(value) {
     reorderLevel: readNumber(value.reorderLevel ?? 5, "Reorder level", issues, { integer: true }),
     variants: [],
   };
+  const rawBadges = value.badges === undefined
+    ? (value.badge ? [value.badge] : [])
+    : value.badges;
+  if (!Array.isArray(rawBadges) || rawBadges.length > MAX_PRODUCT_BADGES) {
+    issues.push(`Badges must be a list of up to ${MAX_PRODUCT_BADGES} values.`);
+  } else {
+    product.badges = [...new Set(rawBadges.map((badge, index) => readText(badge, `Badge ${index + 1}`, issues, 100)).filter(Boolean))];
+    product.badge = product.badges[0] || "";
+  }
   if (product.reorderLevel > 1000000) issues.push("Reorder level must be 1,000,000 or less.");
 
   if (!Array.isArray(value.images) || value.images.length > 12) {
