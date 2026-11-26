@@ -19,16 +19,9 @@ const DEFAULT_BADGES = [
 ];
 
 async function seedDefaultBadgesIfEmpty() {
-  try {
-    const count = await Badge.countDocuments();
-    if (count > 0) return;
-    await Badge.insertMany(DEFAULT_BADGES);
-    console.log("✅ Seeded default badges (first run after the badges migration)");
-  } catch (err) {
-    // Never block server startup over this — worst case, an admin adds
-    // badges manually via Admin → Badges.
-    console.error("⚠️  Could not seed default badges:", err.message);
-  }
+  if (await Badge.exists({})) return;
+  await Badge.insertMany(DEFAULT_BADGES);
+  console.log("✅ Seeded default badges");
 }
 
 module.exports = { seedDefaultBadgesIfEmpty };

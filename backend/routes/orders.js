@@ -5,6 +5,7 @@ const Product = require("../models/Product");
 const Shop = require("../models/Shop");
 const User = require("../models/User");
 const Settings = require("../models/Settings");
+const StockRequest = require("../models/StockRequest");
 const { protect, requireRole, optionalAuth } = require("../middleware/auth");
 const { sendOrderConfirmationEmail, sendOrderUpdateEmail } = require("../utils/email");
 const { isEmailVerificationLive, isPhoneVerificationLive } = require("../config/verification");
@@ -20,6 +21,8 @@ const { parseListQuery, queryText, escapeRegex } = require("../utils/listQuery")
 const { customerOrderView } = require("../utils/customerOrderView");
 const { normalizeReturnInspectionLines, applyReturnInspection } = require("../utils/returnInventory");
 const { allocateStock, shopStockEntries } = require("../utils/productInventory");
+const { cancelLinkedStockRequest, expireLinkedStockOrder, stockRequestBelongsToUser } = require("../utils/stockRequest");
+const { loadingQueueFilter, incompleteLoadingItems, validateLoadedQuantity } = require("../utils/loadingQueue");
 
 const router = express.Router();
 
@@ -118,7 +121,7 @@ function orderReviewFlags(order) {
   if (order.status === "expired" && order.paymentStatus === "paid") {
     flags.push(order.storeBalanceCreditedAt ? "Late payment was returned to store balance; do not dispatch" : "Payment arrived after order expiry; issue its value to store balance and do not dispatch");
   }
-  if (["cancelled", "expired", "unavailable"].includes(order.status) && order.stockReservedAt && !order.stockRestoredAt && !hasCommittedInventory(order)) {
+  if (!order.stockRequest && ["cancelled", "expired", "unavailable"].includes(order.status) && order.stockReservedAt && !order.stockRestoredAt && !hasCommittedInventory(order)) {
     flags.push("Order has ended but reserved stock is not recorded as restored");
   }
   const pendingAdditionalPayments = (order.additionalPaymentRefunds || []).filter((payment) => payment.status === "refund_pending").length;
@@ -131,7 +134,8 @@ function orderReviewFlags(order) {
   if ((order.deliveryIssueRequests || []).some((request) => ["open", "investigating"].includes(request.status))) {
     flags.push("Customer delivery report needs a response");
   }
-  if (!(order.deliveryCorrection?.address || order.deliveryAddress) || !(order.deliveryCorrection?.county || order.deliveryCounty) || !(order.deliveryCorrection?.town || order.deliveryTown)) {
+  if ((!order.stockRequest || order.checkoutDetailsCompletedAt)
+    && (!(order.deliveryCorrection?.address || order.deliveryAddress) || !(order.deliveryCorrection?.county || order.deliveryCounty) || !(order.deliveryCorrection?.town || order.deliveryTown))) {
     flags.push("Delivery destination details are incomplete");
   }
   return flags;
@@ -155,6 +159,7 @@ router.post(
     body("items.*.variantId").optional().isMongoId().withMessage("An item option is invalid"),
     body("items.*.quantity").isInt({ min: 1, max: 99 }).toInt().withMessage("Item quantities must be between 1 and 99"),
     body("items.*.expectedPrice").optional().isFloat({ min: 0 }).toFloat().withMessage("An item price is invalid"),
+    body("stockRequestId").optional({ checkFalsy: true }).isMongoId().withMessage("A stock request ID is invalid"),
     body("channel").isIn(["cart", "whatsapp"]).withMessage("Invalid order channel"),
     body("paymentMethod").optional().isIn(["cod", "mpesa", "paystack", "store_balance"]).withMessage("Invalid payment method"),
     body("storeBalanceAmount").optional().isFloat({ min: 0 }).toFloat().withMessage("Store balance amount is invalid"),
@@ -204,6 +209,11 @@ router.post(
       // live — otherwise a customer could be asked to verify something
       // they have no way to ever receive.
       if (req.user) {
+        if (req.user.accountSetupStage !== "complete") {
+          const err = new Error("Complete your account setup before completing checkout.");
+          err.statusCode = 403;
+          throw err;
+        }
         if (isEmailVerificationLive() && !req.user.isEmailVerified) {
           const err = new Error("Please verify your email before placing an order");
           err.statusCode = 403;
@@ -220,6 +230,47 @@ router.post(
       const normalizedGuestInfo = guestInfo && guestInfo.phone
         ? { ...guestInfo, email: guestInfo.email?.trim().toLowerCase(), phone: normalizePhone(guestInfo.phone) }
         : guestInfo;
+      let stockRequest = null;
+      let linkedStockOrder = null;
+      if (req.body.stockRequestId) {
+        stockRequest = await StockRequest.findById(req.body.stockRequestId);
+        if (!stockRequest) {
+          const err = new Error("Stock request not found"); err.statusCode = 404; throw err;
+        }
+        if (stockRequest.status !== "quoted") {
+          const err = new Error("This stock quote is no longer active"); err.statusCode = 409; throw err;
+        }
+        if (!stockRequest.quoteExpiresAt || stockRequest.quoteExpiresAt <= new Date()) {
+          stockRequest.status = "expired";
+          stockRequest.events.push({ type: "quote_expired", label: "Quote expired", note: "The customer submitted after the 12-hour quote window ended." });
+          await stockRequest.save();
+          await expireLinkedStockOrder(stockRequest, "The quote expired before checkout. Held stock remains unavailable until staff confirms its release.", req.app.get("io"));
+          const err = new Error("This stock quote expired. Ask Azard Stores to recheck and issue a new quote."); err.statusCode = 409; throw err;
+        }
+        if (req.user) {
+          if (!stockRequestBelongsToUser(stockRequest, req.user)) {
+            const err = new Error("Stock request not found"); err.statusCode = 404; throw err;
+          }
+          linkedStockOrder = await Order.findOne({ stockRequest: stockRequest._id });
+          const linkedOrderEmail = String(linkedStockOrder?.billingSnapshot?.email || linkedStockOrder?.guestInfo?.email || "").trim().toLowerCase();
+          const currentUserEmail = String(req.user.email || "").trim().toLowerCase();
+          if (linkedStockOrder && String(linkedStockOrder.user || "") !== String(req.user._id)
+            && (!linkedOrderEmail || linkedOrderEmail !== currentUserEmail)) {
+            const err = new Error("Stock request not found"); err.statusCode = 404; throw err;
+          }
+        } else {
+          const contactPhone = normalizePhone(normalizedGuestInfo?.phone || "");
+          const contactEmail = String(normalizedGuestInfo?.email || "").trim().toLowerCase();
+          const phoneMatches = normalizedGuestInfo?.phone && normalizePhone(stockRequest.guestInfo?.phone || "") === contactPhone;
+          const emailMatches = normalizedGuestInfo?.email && String(stockRequest.guestInfo?.email || "").trim().toLowerCase() === contactEmail;
+          if (!phoneMatches && !emailMatches) {
+            const err = new Error("Stock request not found"); err.statusCode = 404; throw err;
+          }
+        }
+        if (items.length !== stockRequest.items.length) {
+          const err = new Error("The cart changed after the stock quote was issued. Request a new quote."); err.statusCode = 409; throw err;
+        }
+      }
       const selectedPaymentMethod = paymentMethod || "cod";
       if (selectedPaymentMethod === "mpesa" && !isPaystackMpesaConfigured()) {
         const err = new Error("M-Pesa via Paystack is not enabled for checkout. Confirm that M-Pesa is active on the Paystack account and set PAYSTACK_MPESA_ENABLED=true.");
@@ -299,6 +350,52 @@ router.post(
           });
         }
 
+        let quoteItem = null;
+        if (stockRequest) {
+          quoteItem = stockRequest.items.find((line) =>
+            String(line.product) === String(product._id)
+            && ((line.variantId ? String(line.variantId) : null) === (variant ? String(variant._id) : null))
+          );
+          if (!quoteItem || Number(quoteItem.quantity) !== Number(item.quantity)
+            || quoteItem.confirmedQuantity !== quoteItem.quantity
+            || quoteItem.confirmedCustomerPrice == null) {
+            return res.status(409).json({
+              message: "The cart changed after the stock quote was issued. Request a new quote.",
+            });
+          }
+        }
+
+        const currentPrice = stockRequest
+          ? Number(quoteItem.confirmedCustomerPrice)
+          : (variant?.price ?? product.price);
+        const lineImage = variant?.image || product.images[0] || "";
+        if (item.expectedPrice !== undefined && Number(item.expectedPrice) !== Number(currentPrice)) {
+          priceChanges.push({
+            productId: product._id.toString(),
+            variantId: variant?._id?.toString() || null,
+            name: product.name,
+            price: currentPrice,
+            image: lineImage,
+          });
+        }
+        if (linkedStockOrder) {
+          const shop = activeShopsById.get(String(product.shop));
+          orderItems.push({
+            product: product._id,
+            shopId: shop?._id || null,
+            productShopId: product.shop || null,
+            shopName: shop?.name || "",
+            shopNumber: shop?.shopNumber ?? null,
+            name: product.name,
+            variantId: variant?._id || null,
+            variantName: variant?.name || "",
+            returnEligibility: product.returnEligibility || "standard",
+            price: currentPrice,
+            quantity: item.quantity,
+            image: lineImage,
+          });
+          continue;
+        }
         const stockKey = `${product._id}:${variant?._id || "base"}`;
         if (!allocatedStock.has(stockKey)) allocatedStock.set(stockKey, new Map());
         const allocations = allocateStock(product, variant?._id || null, item.quantity, activeShops, allocatedStock.get(stockKey));
@@ -314,18 +411,6 @@ router.post(
               : `Only ${knownAvailable} of "${product.name}"${variant ? ` (${variant.name})` : ""} are currently available across active shops. Adjust the quantity and try again.`,
             stockChanged: true,
             item: { productId: product._id.toString(), variantId: variant?._id?.toString() || null, availableStock: hasUnconfirmedStock ? null : knownAvailable },
-          });
-        }
-
-        const currentPrice = variant?.price ?? product.price;
-        const lineImage = variant?.image || product.images[0] || "";
-        if (item.expectedPrice !== undefined && Number(item.expectedPrice) !== Number(currentPrice)) {
-          priceChanges.push({
-            productId: product._id.toString(),
-            variantId: variant?._id?.toString() || null,
-            name: product.name,
-            price: currentPrice,
-            image: lineImage,
           });
         }
         for (const allocation of allocations) {
@@ -387,8 +472,64 @@ router.post(
         const err = new Error("Cash on delivery is available only for Nairobi CBD orders"); err.statusCode = 400; throw err;
       }
 
-      const order = new Order({
+      let order;
+      let stockRequestConverted = false;
+      if (linkedStockOrder) {
+        const converted = await StockRequest.findOneAndUpdate(
+          { _id: stockRequest._id, status: "quoted", quoteExpiresAt: { $gt: new Date() } },
+          {
+            $set: { status: "converted", user: req.user._id },
+            $push: { events: { type: "stock_quote_converted", label: "Quote converted to order", note: `Order ${linkedStockOrder._id} completed from confirmed stock quote.`, createdAt: new Date() } },
+          },
+          { new: true }
+        );
+        if (!converted) {
+          const err = new Error("This stock quote changed before checkout completed. Ask Azard Stores to recheck it.");
+          err.statusCode = 409;
+          throw err;
+        }
+        stockRequestConverted = true;
+        order = linkedStockOrder;
+        order.user = req.user._id;
+        order.items = orderItems;
+        order.totalAmount = totalAmount;
+        order.storeBalanceApplied = balanceAmount;
+        order.storeBalanceStatus = balanceAmount > 0 ? "reserved" : "none";
+        order.deliveryFee = deliveryFee;
+        order.deliveryAddress = selectedDeliveryRoute?.serviceType === "parcel" ? selectedDeliveryRoute.officeAddress : deliveryAddress;
+        order.deliveryInstructions = selectedDeliveryRoute?.serviceType === "parcel" ? String(req.body.deliveryInstructions || "").trim() : "";
+        order.deliveryCounty = req.body.deliveryCounty.trim();
+        order.deliveryTown = req.body.deliveryTown.trim();
+        order.deliveryArea = req.body.deliveryArea;
+        order.deliveryRoute = selectedDeliveryRoute ? {
+          serviceType: selectedDeliveryRoute.serviceType || "parcel",
+          carrier: selectedDeliveryRoute.carrier,
+          officeName: selectedDeliveryRoute.officeName,
+          officeAddress: selectedDeliveryRoute.officeAddress,
+          estimatedDays: selectedDeliveryRoute.estimatedDays,
+        } : undefined;
+        order.cbdDeliveryConfirmed = req.body.cbdDeliveryConfirmed === true;
+        order.channel = channel;
+        order.paymentMethod = selectedPaymentMethod;
+        order.status = "confirmed";
+        order.stockNeedsReservation = false;
+        order.loadingCheckpointRequired = true;
+        order.availabilityConfirmedAt = new Date();
+        order.stockReservedAt = new Date();
+        order.stockReservedUntil = selectedPaymentMethod === "cod" ? null : new Date(Date.now() + 5 * 24 * 60 * 60 * 1000);
+        order.checkoutDetailsCompletedAt = new Date();
+        order.invoiceNumber = order.invoiceNumber || `AS-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+        order.invoiceIssuedAt = new Date();
+        order.events.push({
+          type: "checkout_details_submitted",
+          label: "Delivery and payment details submitted",
+          note: "The confirmed stock quote was accepted. This order is ready for payment and fulfillment.",
+        });
+        order.events.push({ type: "status_confirmed", label: "Availability confirmed" });
+      } else {
+        order = new Order({
           user: req.user ? req.user._id : null,
+          stockRequest: stockRequest?._id || null,
           guestInfo: req.user ? undefined : normalizedGuestInfo,
           billingSnapshot: req.user
             ? { name: req.user.name, email: req.user.email, phone: req.user.phone }
@@ -414,23 +555,44 @@ router.post(
         channel,
         paymentMethod: selectedPaymentMethod,
         stockNeedsReservation: true,
+        loadingCheckpointRequired: true,
         invoiceNumber: `AS-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
         events: [{ type: "order_placed", label: "Order received", note: "Awaiting Azard Stores availability confirmation; stock is not reserved yet." }],
         });
-
-      if (balanceAmount > 0) {
-        await changeBalance(req.user._id, { amount: balanceAmount, type: "reserve", reference: `order:${order._id}:reserve`, orderId: order._id, description: "Reserved for checkout" });
       }
+
       try {
+        if (balanceAmount > 0) {
+          await changeBalance(req.user._id, { amount: balanceAmount, type: "reserve", reference: `order:${order._id}:reserve`, orderId: order._id, description: "Reserved for checkout" });
+        }
         await order.save();
       } catch (saveError) {
         if (balanceAmount > 0) await changeBalance(req.user._id, { amount: balanceAmount, type: "release", reference: `order:${order._id}:save-failure-release`, orderId: order._id, description: "Checkout could not be completed" });
+        if (stockRequestConverted) {
+          await StockRequest.updateOne({ _id: stockRequest._id, status: "converted" }, { $set: { status: "quoted" }, $pull: { events: { type: "stock_quote_converted" } } });
+        }
         throw saveError;
+      }
+      if (stockRequest && !linkedStockOrder) {
+        const converted = await StockRequest.findOneAndUpdate(
+          { _id: stockRequest._id, status: "quoted" },
+          {
+            $set: { status: "converted" },
+            $push: { events: { type: "stock_quote_converted", label: "Quote converted to order", note: `Order ${order._id} created from confirmed stock quote.`, createdAt: new Date() } },
+          },
+          { new: true }
+        );
+        if (!converted) {
+          await Order.findByIdAndDelete(order._id);
+          if (balanceAmount > 0 && req.user) await changeBalance(req.user._id, { amount: balanceAmount, type: "release", reference: `order:${order._id}:conversion-release`, orderId: order._id, description: "Quote changed before order creation" });
+          const err = new Error("This stock quote changed before checkout completed. Request a new quote."); err.statusCode = 409; throw err;
+        }
       }
 
       // Notify any connected admin dashboards in real time
       const io = req.app.get("io");
-      emitOrderCreatedEvent(io, order);
+      if (linkedStockOrder) emitOrderEvent(io, "order-status-updated", order);
+      else emitOrderCreatedEvent(io, order);
 
       // Send a confirmation email if we have an address to send it to
       const recipientEmail = req.user ? req.user.email : normalizedGuestInfo?.email;
@@ -555,7 +717,22 @@ router.get("/review", protect, requireRole("admin"), async (req, res, next) => {
 
 router.get("/my", protect, async (req, res, next) => {
   try {
-    const orders = await Order.find({ user: req.user._id }).populate("replacementOrder", "status totalAmount replacementPriceDifference").sort({ createdAt: -1 });
+    const email = new RegExp(`^${escapeRegex(String(req.user.email || "").trim())}$`, "i");
+    const orders = await Order.find({
+      $or: [
+        { user: req.user._id },
+        {
+          stockRequest: { $ne: null },
+          $or: [
+            { "billingSnapshot.email": email },
+            { "guestInfo.email": email },
+          ],
+        },
+      ],
+    })
+      .populate("replacementOrder", "status totalAmount replacementPriceDifference")
+      .populate("stockRequest", "status quoteExpiresAt items.name items.variantName items.quantity items.confirmedQuantity items.confirmedCustomerPrice")
+      .sort({ createdAt: -1 });
     await Promise.all(orders.map(normalizeUnconfirmedPaystackSettlement));
     res.json(orders.map(customerOrderView));
   } catch (err) {
@@ -601,7 +778,8 @@ router.get("/", protect, requireRole("admin"), async (req, res, next) => {
     const { search, page, limit } = parseListQuery(req.query);
     const status = typeof rawStatus === "string" ? rawStatus : "";
     const filter = {};
-    if (status) filter.status = status;
+    if (status === "loading") Object.assign(filter, loadingQueueFilter());
+    else if (status) filter.status = status;
     if (search) {
       const trimmed = search;
       // Guest orders store the name directly; registered-customer orders
@@ -620,7 +798,7 @@ router.get("/", protect, requireRole("admin"), async (req, res, next) => {
 
     const skip = (page - 1) * limit;
     const [orders, total] = await Promise.all([
-      Order.find(filter).populate("user", "name email phone storeBalance").populate("replacementOrder", "status totalAmount paymentStatus replacementPriceDifference storeBalanceApplied storeBalanceStatus").sort({ createdAt: -1 }).skip(skip).limit(limit),
+      Order.find(filter).populate("user", "name email phone storeBalance").populate("items.loadedBy", "name").populate("replacementOrder", "status totalAmount paymentStatus replacementPriceDifference storeBalanceApplied storeBalanceStatus").sort(status === "loading" ? { receiptIssuedAt: 1, createdAt: 1 } : { createdAt: -1 }).skip(skip).limit(limit),
       Order.countDocuments(filter),
     ]);
 
@@ -819,6 +997,74 @@ router.put("/:id/additional-payment-refunds/:reference", protect, requireRole("a
 });
 
 // PUT /api/orders/:id/status - admin only
+router.post("/:id/loading-items", protect, requireRole("admin"), async (req, res, next) => {
+  try {
+    if (!isRequestObject(req.body)) return res.status(400).json({ message: "Invalid loading confirmation." });
+    const itemIndex = Number(req.body.itemIndex);
+    const quantity = Number(req.body.quantity);
+    if (!Number.isInteger(itemIndex) || itemIndex < 0) return res.status(400).json({ message: "Choose a valid order item." });
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ message: "Order not found." });
+    if (!order.loadingCheckpointRequired) return res.status(409).json({ message: "This order does not require the new loading checkpoint." });
+    if (order.status !== "confirmed") return res.status(409).json({ message: "Only confirmed orders can be prepared for loading." });
+    if (order.cancellationRequests?.some((request) => request.status === "pending")) {
+      return res.status(409).json({ message: "Resolve the customer's cancellation request before loading items." });
+    }
+    const codOrder = isCodOrder(order);
+    if (!codOrder && order.paymentStatus !== "paid") {
+      return res.status(409).json({ message: "Confirm payment before loading this order." });
+    }
+    if (!codOrder && order.stockReservedUntil && order.stockReservedUntil <= new Date()) {
+      return res.status(409).json({ message: "The stock reservation has expired. Resolve the order before loading or dispatching it." });
+    }
+    const item = order.items[itemIndex];
+    if (!item) return res.status(404).json({ message: "Order item not found." });
+    validateLoadedQuantity(item, quantity);
+    if (item.loadedAt && Number(item.loadedQuantity) === Number(item.quantity)) return res.json(order);
+
+    const loadedAt = new Date();
+    const loadingEvent = {
+      type: "item_loaded",
+      label: "Item loaded",
+      note: `Physically checked ${quantity} × ${item.name}${item.variantName ? ` · ${item.variantName}` : ""}.`,
+      actor: req.user._id,
+      createdAt: loadedAt,
+    };
+    const loadingFilter = {
+      _id: order._id,
+      status: "confirmed",
+      loadingCheckpointRequired: true,
+      cancellationRequests: { $not: { $elemMatch: { status: "pending" } } },
+      [`items.${itemIndex}.quantity`]: quantity,
+      [`items.${itemIndex}.loadedAt`]: null,
+    };
+    if (!codOrder) {
+      loadingFilter.paymentStatus = "paid";
+      loadingFilter.$or = [{ stockReservedUntil: null }, { stockReservedUntil: { $gt: loadedAt } }];
+    }
+    let updated = await Order.findOneAndUpdate(
+      loadingFilter,
+      {
+        $set: {
+          [`items.${itemIndex}.loadedQuantity`]: quantity,
+          [`items.${itemIndex}.loadedAt`]: loadedAt,
+          [`items.${itemIndex}.loadedBy`]: req.user._id,
+        },
+        $push: { events: loadingEvent },
+      },
+      { new: true }
+    );
+    if (!updated) {
+      updated = await Order.findById(order._id);
+      const currentItem = updated?.items[itemIndex];
+      if (currentItem?.loadedAt && Number(currentItem.loadedQuantity) === Number(currentItem.quantity)) return res.json(updated);
+      return res.status(409).json({ message: "The order changed while you were confirming this item. Refresh and try again." });
+    }
+    emitOrderEvent(req.app.get("io"), "order-details-updated", updated);
+    res.json(updated);
+  } catch (error) { next(error); }
+});
+
 router.put("/:id/status", protect, requireRole("admin"), async (req, res, next) => {
   try {
     if (!isRequestObject(req.body)) return res.status(400).json({ message: "Invalid order update" });
@@ -835,6 +1081,9 @@ router.put("/:id/status", protect, requireRole("admin"), async (req, res, next) 
     if (!allowedStatuses.includes(status)) return res.status(400).json({ message: "Invalid order status" });
     const existing = await Order.findById(req.params.id);
     if (!existing) return res.status(404).json({ message: "Order not found" });
+    if (existing.stockRequest && !existing.checkoutDetailsCompletedAt) {
+      return res.status(409).json({ message: "Complete this order's stock check in Stock Requests before moving it into fulfillment." });
+    }
     await normalizeUnconfirmedPaystackSettlement(existing);
     if (existing.paymentTestMode && status !== existing.status) {
       return res.status(409).json({ message: "Payment confirmation is required before this order can be moved into fulfillment." });
@@ -877,6 +1126,14 @@ router.put("/:id/status", protect, requireRole("admin"), async (req, res, next) 
     }
 
     const codOrder = isCodOrder(existing);
+    if (existing.loadingCheckpointRequired && ["shipped", "ready_for_collection", "collected", "delivered"].includes(status)) {
+      const incompleteItems = incompleteLoadingItems(existing);
+      if (incompleteItems.length) {
+        return res.status(409).json({
+          message: `Confirm the exact loaded quantity for every item before fulfillment. Still unchecked: ${incompleteItems.map((item) => item.name).join(", ")}.`,
+        });
+      }
+    }
     if (["shipped", "ready_for_collection", "collected", "delivered"].includes(status) && !codOrder && existing.paymentStatus !== "paid") {
       return res.status(409).json({ message: "Confirm payment before processing or dispatching an online order" });
     }
@@ -1075,6 +1332,7 @@ router.put("/:id/status", protect, requireRole("admin"), async (req, res, next) 
       actor: req.user._id,
     });
     let order = await existing.save();
+    if (status === "cancelled") await cancelLinkedStockRequest(order, "Staff cancelled the linked order.");
 
     if (["shipped", "delivered", "collected"].includes(status)) {
       await commitOrderStockReservations(order);
@@ -1424,6 +1682,7 @@ router.post("/:id/replacement-order", protect, requireRole("admin"), async (req,
       storeBalanceApplied: balanceAmount,
       storeBalanceStatus: balanceAmount > 0 ? "reserved" : "none",
       stockNeedsReservation: true,
+      loadingCheckpointRequired: true,
       replacementFor: original._id,
       replacementRoot: replacementRootId,
       replacementPriceDifference: totalAmount - original.totalAmount,
@@ -1548,6 +1807,7 @@ router.post("/:id/cancel-request", customerOrderActionLimiter, optionalAuth, asy
     order.cancellationReason = reason;
     order.events.push({ type: "status_cancelled", label: "Order cancelled", note: order.cancellationReason });
     await order.save();
+    await cancelLinkedStockRequest(order, "Customer cancelled the linked order.");
     await releaseOrderBalance(order);
     await order.save();
     let settledOrder = await Order.findById(order._id);
@@ -1618,6 +1878,7 @@ router.put("/:id/cancellation-requests/:requestId", protect, requireRole("admin"
       order.status = "cancelled";
       order.cancellationReason = request.reason;
       await order.save();
+      await cancelLinkedStockRequest(order, "Staff approved cancellation of the linked order.");
       await creditPaidOrderToStoreBalance(order, "Customer cancellation approved");
       await order.save();
       await restoreOrderStockOnce(order);

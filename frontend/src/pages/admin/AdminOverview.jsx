@@ -6,7 +6,16 @@ import { connectRealtime } from "../../api/realtime";
 import AdminLoadError from "../../components/AdminLoadError";
 
 export default function AdminOverview() {
-  const [stats, setStats] = useState(null);
+  const [stats, setStats] = useState(() => {
+    try {
+      const cached = JSON.parse(sessionStorage.getItem("admin-overview-stats") || "null");
+      return cached && ["floors", "shops", "products", "orders"].every((key) => Number.isFinite(cached[key]))
+        ? cached
+        : null;
+    } catch {
+      return null;
+    }
+  });
   const [recentOrders, setRecentOrders] = useState([]);
   const [liveNotice, setLiveNotice] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -41,21 +50,22 @@ export default function AdminOverview() {
   useEffect(() => {
     setLoading(true);
     setLoadError("");
-    Promise.all([
-      api.get("/floors"),
-      api.get("/shops"),
-      api.get("/products", { params: { limit: 1 } }),
-      api.get("/orders", { params: { limit: 5 } }),
-    ]).then(([floors, shops, products, orders]) => {
-      setStats({
-        floors: floors.data.length,
-        shops: shops.data.length,
-        products: products.data.total,
-        orders: orders.data.total,
+    let active = true;
+    api.get("/analytics/summary", { timeout: 10000 })
+      .then((response) => {
+        if (!active) return;
+        setStats(response.data.totals);
+        try { sessionStorage.setItem("admin-overview-stats", JSON.stringify(response.data.totals)); } catch {}
+        setRecentOrders(response.data.recentOrders || []);
+      })
+      .catch(() => {
+        if (active) setLoadError("Overview data could not be loaded.");
+      })
+      .finally(() => {
+        if (active) setLoading(false);
       });
-      setRecentOrders(orders.data.orders.slice(0, 5));
-    }).catch(() => setLoadError("Overview data could not be loaded."))
-      .finally(() => setLoading(false));
+
+    return () => { active = false; };
 
   }, [loadAttempt]);
 
@@ -144,7 +154,7 @@ export default function AdminOverview() {
       )}
 
       {/* Stats grid */}
-      {!loadError && (loading ? (
+      {loading && !stats ? (
         <div className="mb-10 grid grid-cols-2 gap-3 sm:gap-4 md:grid-cols-4" role="status" aria-label="Loading overview statistics">
           <span className="sr-only">Loading overview statistics…</span>
           {STATS.map(({ label }) => (
@@ -169,13 +179,13 @@ export default function AdminOverview() {
                   <Icon size={16} className="text-mall-accent" />
                   <ArrowRight size={12} className="text-cream/20 transition group-hover:text-mall-accent" />
                 </div>
-                <p className="mb-1 font-display text-3xl text-cream">{stats[s.key]}</p>
+                <p className="mb-1 font-display text-3xl text-cream">{stats[s.key] ?? "…"}</p>
                 <p className="font-mono-tag text-[10px] uppercase tracking-widest text-cream/40">{s.label}</p>
               </Link>
             );
           })}
         </div>
-      ))}
+      )}
 
       {/* Recent orders */}
       {!loadError && <div>

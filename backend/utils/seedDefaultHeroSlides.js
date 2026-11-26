@@ -1,8 +1,7 @@
 const HeroSlide = require("../models/HeroSlide");
 
 async function seedDefaultHeroSlidesIfEmpty() {
-  const count = await HeroSlide.countDocuments();
-  if (count) return;
+  if (await HeroSlide.exists({})) return;
   await HeroSlide.insertMany([
     {
       headline: "One cart. Every brand you want.",

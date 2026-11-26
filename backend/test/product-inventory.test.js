@@ -1,6 +1,13 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { allocateStock, getTotalStock, shopStockEntries, serializeAvailableInventory } = require("../utils/productInventory");
+const Product = require("../models/Product");
+const {
+  PUBLIC_PRODUCT_INVENTORY_SELECTION,
+  allocateStock,
+  getTotalStock,
+  shopStockEntries,
+  serializeAvailableInventory,
+} = require("../utils/productInventory");
 
 const activeShops = [
   { _id: "shop-primary", name: "Primary" },
@@ -65,4 +72,15 @@ test("storefront inventory serialization aggregates active locations without exp
   assert.equal(serialized.stock, 5);
   assert.equal(serialized.variants[0].stock, 5);
   assert.equal(serialized.inventoryLocations, undefined);
+});
+
+test("public product queries exclude stock-reservation data while retaining inventory locations", () => {
+  const query = Product.find().select(PUBLIC_PRODUCT_INVENTORY_SELECTION);
+  query._applyPaths();
+
+  assert.equal(query._fields.inventoryLocations, undefined);
+  assert.equal(query._fields["inventoryLocations.stockReservations"], 0);
+  assert.equal(query._fields["inventoryLocations.variants.stockReservations"], 0);
+  assert.equal(query._fields.stockReservations, 0);
+  assert.equal(query._fields["variants.stockReservations"], 0);
 });

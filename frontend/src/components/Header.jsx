@@ -7,6 +7,7 @@ import { useAuth } from "../context/AuthContext";
 export default function Header() {
   const { totalItems } = useCart();
   const { user, logout } = useAuth();
+  const isAdmin = user?.role === "admin";
   const navigate = useNavigate();
   const location = useLocation();
   const [profileOpen, setProfileOpen] = useState(false);
@@ -55,23 +56,18 @@ export default function Header() {
               onClick={() => setProfileOpen((v) => !v)}
               aria-expanded={profileOpen}
               aria-controls="account-menu-panel"
-              aria-label="Account menu"
+              aria-label={isAdmin ? "Admin account menu" : "Account menu"}
               className={`relative w-9 h-9 rounded-full flex items-center justify-center transition ${
                 profileOpen ? "bg-mall-accent text-mall-900" : "bg-mall-800 text-cream hover:bg-mall-700"
               }`}
             >
               <User size={18} />
-              {user?.role === "admin" && (
-                <span
-                  aria-hidden="true"
-                  className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-mall-accent ring-2 ring-mall-900"
-                />
-              )}
             </button>
+            {isAdmin && <span className="ml-1 rounded-full bg-mall-accent/15 px-2 py-1 font-mono-tag text-[9px] uppercase tracking-wider text-mall-accent">Admin</span>}
           </div>
 
           {/* Cart */}
-          <Link
+          {!isAdmin && <Link
             to="/cart"
             aria-label={`Cart, ${totalItems} item${totalItems === 1 ? "" : "s"}`}
             className="relative w-9 h-9 rounded-full bg-mall-800 text-cream hover:bg-mall-700 transition flex items-center justify-center"
@@ -82,7 +78,7 @@ export default function Header() {
                 {totalItems}
               </span>
             )}
-          </Link>
+          </Link>}
         </div>
       </div>
 
@@ -97,11 +93,11 @@ export default function Header() {
           {user ? (
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
               <div>
-                <p className="font-display text-xl">Hi, {user.name?.split(" ")[0] || "there"}</p>
+                <p className="font-display text-xl">{isAdmin ? "Admin workspace" : `Hi, ${user.name?.split(" ")[0] || "there"}`}</p>
                 <p className="text-cream/50 text-sm">{user.email}</p>
               </div>
               <nav className="flex flex-col sm:flex-row gap-1 sm:gap-2">
-                {user.role === "admin" && (
+                {isAdmin && (
                   <Link
                     to="/admin"
                     onClick={() => setProfileOpen(false)}
@@ -110,14 +106,22 @@ export default function Header() {
                     <LayoutDashboard size={16} /> Admin Dashboard
                   </Link>
                 )}
-                <Link
+                {!isAdmin && <Link
                   to="/dashboard"
                   onClick={() => setProfileOpen(false)}
                   className="flex items-center gap-2 px-3 py-2 rounded-md text-sm hover:bg-mall-800 transition"
                 >
                   <Package size={16} /> My Orders
-                </Link>
-                {user.role !== "admin" && (
+                </Link>}
+                {isAdmin ? (
+                  <Link
+                    to="/directory"
+                    onClick={() => setProfileOpen(false)}
+                    className="flex items-center gap-2 px-3 py-2 rounded-md text-sm hover:bg-mall-800 transition"
+                  >
+                    <ShoppingBag size={16} /> View storefront
+                  </Link>
+                ) : (
                   <>
                     <Link
                       to="/wishlist"

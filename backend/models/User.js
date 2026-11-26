@@ -32,6 +32,7 @@ const userSchema = new Schema(
     // products can be viewed; this list contains no private product data.
     wishlistSlugs: { type: [String], default: [], select: false },
     role: { type: String, enum: ["admin", "customer"], default: "customer" },
+    accountSetupStage: { type: String, enum: ["complete", "password_required", "email_verification_required"], default: "complete" },
     lastLoginAt: { type: Date, default: null },
     tokenVersion: { type: Number, default: 0, select: false },
     resetPasswordToken: { type: String, select: false },

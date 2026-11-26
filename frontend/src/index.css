@@ -50,3 +50,84 @@ textarea:focus-visible {
 .hero-copy-enter {
   animation: hero-copy-enter 360ms ease-out both;
 }
+
+.checkout-panel .checkout-summary {
+  color: #f7f4ec;
+  background-color: #162338;
+  border-color: rgb(247 244 236 / 16%);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 18%);
+}
+
+.checkout-panel .checkout-form > section[aria-labelledby] {
+  margin: 0;
+  padding: clamp(0.9rem, 2.5vw, 1.4rem);
+  border: 1px solid rgb(247 244 236 / 14%);
+  border-radius: 1rem;
+  background-color: #142238;
+}
+
+.checkout-panel input:not([type="checkbox"]),
+.checkout-panel select,
+.checkout-panel textarea {
+  min-height: 2.75rem;
+  max-width: 100%;
+  border: 1px solid rgb(247 244 236 / 25%);
+  border-radius: 0.65rem;
+  background-color: #1f3050;
+  padding: 0.625rem 0.75rem;
+  color: #f7f4ec;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.checkout-panel textarea {
+  min-height: 5.5rem;
+}
+
+.checkout-panel input::placeholder,
+.checkout-panel textarea::placeholder {
+  color: #bdc9d8;
+  opacity: 1;
+}
+
+.checkout-panel input:not([type="checkbox"]):focus-visible,
+.checkout-panel select:focus-visible,
+.checkout-panel textarea:focus-visible {
+  border-color: #ff6900;
+  box-shadow: 0 0 0 2px #ff6900 !important;
+}
+
+.checkout-panel input[type="checkbox"]:focus-visible {
+  outline: 2px solid #ff6900 !important;
+  outline-offset: 2px;
+  box-shadow: none !important;
+}
+
+.checkout-summary-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.checkout-summary-content {
+  display: none;
+}
+
+.checkout-summary-details[open] .checkout-summary-content {
+  display: block;
+}
+
+.checkout-summary-details[open] .checkout-summary-toggle::after {
+  content: " −";
+}
+
+.checkout-summary-toggle::after {
+  content: " +";
+}
+
+@media (min-width: 1024px) {
+  .checkout-summary-content {
+    display: block;
+  }
+
+  .checkout-summary-toggle {
+    display: none;
+  }
+}

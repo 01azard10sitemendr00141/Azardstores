@@ -56,6 +56,7 @@ const publicPageMetadata = {
 const nonIndexableRoutes = {
   "/search": ["Search Products", "Search products across Azard Stores."],
   "/cart": ["Your Cart", "Review products in your Azard Stores shopping cart."],
+  "/checkout": ["Checkout", "Choose delivery details and submit your Azard Stores order for an availability check."],
   "/dashboard": ["My Account", "Manage your Azard Stores account and orders."],
   "/order-success": ["Order Status", "View your Azard Stores order confirmation."],
   "/payment/callback": ["Payment Status", "Check the status of your Azard Stores payment."],
@@ -417,6 +418,7 @@ const robots = [
   "Disallow: /admin",
   "Disallow: /dashboard",
   "Disallow: /cart",
+  "Disallow: /checkout",
   "Disallow: /payment/",
   "Disallow: /order-success",
 ];

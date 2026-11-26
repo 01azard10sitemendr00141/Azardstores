@@ -1,3 +1,11 @@
+const PUBLIC_PRODUCT_INVENTORY_SELECTION = [
+  "+inventoryLocations",
+  "-inventoryLocations.stockReservations",
+  "-inventoryLocations.variants.stockReservations",
+  "-stockReservations",
+  "-variants.stockReservations",
+].join(" ");
+
 function shopStockEntries(product, variantId = null, activeShopIds = null) {
   const active = activeShopIds ? new Set([...activeShopIds].map(String)) : null;
   const getStock = (location) => {
@@ -55,4 +63,10 @@ function serializeAvailableInventory(product, activeShopIds) {
   return serialized;
 }
 
-module.exports = { shopStockEntries, getTotalStock, allocateStock, serializeAvailableInventory };
+module.exports = {
+  PUBLIC_PRODUCT_INVENTORY_SELECTION,
+  shopStockEntries,
+  getTotalStock,
+  allocateStock,
+  serializeAvailableInventory,
+};

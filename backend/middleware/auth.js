@@ -27,6 +27,12 @@ function setAuthCookie(res, token) {
   });
 }
 
+function signAuthToken(user) {
+  return jwt.sign({ id: user._id, role: user.role, tokenVersion: Number(user.tokenVersion || 0) }, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRES_IN || "7d",
+  });
+}
+
 function clearAuthCookie(res) {
   res.clearCookie(AUTH_COOKIE, { httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "lax", path: "/" });
 }
@@ -48,6 +54,25 @@ async function protect(req, res, next) {
     }
     if (Number(decoded.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
       return res.status(401).json({ message: "Your session has ended. Please sign in again." });
+    }
+
+    if (user.accountSetupStage !== "complete") {
+      const path = `${req.baseUrl}${req.path}`.replace(/\/+$/, "");
+      const setupAllowed = new Set([
+        "/api/auth/me",
+        "/api/auth/logout",
+        "/api/auth/set-checkout-password",
+        "/api/auth/send-checkout-email-otp",
+        "/api/auth/verify-checkout-email-otp",
+        "/api/orders/my",
+        "/api/stock-requests/mine",
+      ]);
+      if (!setupAllowed.has(path)) {
+        return res.status(403).json({
+          message: "Complete your account setup before using this feature.",
+          accountSetupRequired: true,
+        });
+      }
     }
 
     req.user = user;
@@ -83,4 +108,4 @@ async function optionalAuth(req, res, next) {
   }
 }
 
-module.exports = { AUTH_COOKIE, protect, requireRole, optionalAuth, setAuthCookie, clearAuthCookie, getAuthToken };
+module.exports = { AUTH_COOKIE, protect, requireRole, optionalAuth, setAuthCookie, clearAuthCookie, getAuthToken, signAuthToken };

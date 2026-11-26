@@ -666,35 +666,88 @@ export default function Home() {
 
     let active = true;
     setLoadError(false);
-    const corePromise = Promise.all([
-      api.get("/floors", { timeout: HOME_REQUEST_TIMEOUT_MS }),
-      api.get("/shops", { params: { includeCounts: false }, timeout: HOME_REQUEST_TIMEOUT_MS }),
-      api.get("/products", { params: { flashSale: true, limit: 12, includeTotal: false }, timeout: HOME_REQUEST_TIMEOUT_MS }),
-      api.get("/hero-slides", { timeout: HOME_REQUEST_TIMEOUT_MS }).catch(() => ({ data: [] })),
-      api.get("/homepage-content", { timeout: HOME_REQUEST_TIMEOUT_MS }).catch(() => ({ data: null })),
-    ]).then(([floorsRes, shopsRes, flashRes, heroRes, contentRes]) => {
-      if (!active) return;
-
-      const grouped = {};
-      shopsRes.data.forEach((shop) => {
-        const floorId = shop.floor?._id;
-        if (!grouped[floorId]) grouped[floorId] = [];
-        grouped[floorId].push(shop);
+    const coreData = {
+      floors: cached?.floors || [],
+      shopsByFloor: cached?.shopsByFloor || {},
+      flashSale: cached?.flashSale || [],
+      heroSlides: cached?.heroSlides || [],
+      homepageContent: cached?.homepageContent || HOME_CONTENT_FALLBACK,
+    };
+    const floorsPromise = api.get("/floors", { timeout: HOME_REQUEST_TIMEOUT_MS })
+      .then((response) => {
+        coreData.floors = response.data;
+        if (active) setFloors(response.data);
+        return response.data;
+      })
+      .catch(() => {
+        if (active) setLoadError(true);
+        return coreData.floors;
       });
-
-      const flashSaleProducts = flashRes.data.products || [];
+    const shopsPromise = api.get("/shops", { params: { includeCounts: false }, timeout: HOME_REQUEST_TIMEOUT_MS })
+      .then((response) => {
+        const grouped = {};
+        response.data.forEach((shop) => {
+          const floorId = shop.floor?._id;
+          if (!grouped[floorId]) grouped[floorId] = [];
+          grouped[floorId].push(shop);
+        });
+        coreData.shopsByFloor = grouped;
+        if (active) setShopsByFloor(grouped);
+        return grouped;
+      })
+      .catch(() => {
+        if (active) setLoadError(true);
+        return coreData.shopsByFloor;
+      });
+    const flashSalePromise = api.get("/products", { params: { flashSale: true, limit: 12, includeTotal: false }, timeout: HOME_REQUEST_TIMEOUT_MS })
+      .then((response) => {
+        const products = response.data.products || [];
+        coreData.flashSale = products;
+        if (active) {
+          setFlashSale(products);
+          setFlashSaleLoading(false);
+          setHomeSections((current) => organizeHomepageSections(current, products));
+        }
+        return products;
+      })
+      .catch(() => {
+        if (active) {
+          setFlashSaleLoading(false);
+          setLoadError(true);
+        }
+        return coreData.flashSale;
+      });
+    const heroSlidesPromise = api.get("/hero-slides", { timeout: HOME_REQUEST_TIMEOUT_MS })
+      .then((response) => {
+        coreData.heroSlides = response.data || [];
+        if (active) setHeroSlides(coreData.heroSlides);
+        return coreData.heroSlides;
+      })
+      .catch(() => coreData.heroSlides);
+    const homepageContentPromise = api.get("/homepage-content", { timeout: HOME_REQUEST_TIMEOUT_MS })
+      .then((response) => {
+        coreData.homepageContent = response.data || HOME_CONTENT_FALLBACK;
+        if (active) setHomepageContent(normalizeHomepageContent(coreData.homepageContent));
+        return coreData.homepageContent;
+      })
+      .catch(() => coreData.homepageContent);
+    const corePromise = Promise.all([
+      floorsPromise,
+      shopsPromise,
+      flashSalePromise,
+      heroSlidesPromise,
+      homepageContentPromise,
+    ]).then(([floors, shopsByFloor, flashSaleProducts, loadedHeroSlides, loadedContent]) => {
       const coreBundle = {
-        floors: floorsRes.data,
-        shopsByFloor: grouped,
+        floors,
+        shopsByFloor,
         flashSale: flashSaleProducts,
-        heroSlides: heroRes.data || [],
-        homepageContent: contentRes.data || HOME_CONTENT_FALLBACK,
+        heroSlides: loadedHeroSlides,
+        homepageContent: loadedContent,
       };
-
-      applyData(coreBundle);
-      setFlashSaleLoading(false);
-      setHomeCache({ ...coreBundle, homeSections: cached?.homeSections || [], sectionsPending: true });
-      setLoadError(false);
+      if (active) {
+        setHomeCache({ ...coreBundle, homeSections: cached?.homeSections || [], sectionsPending: true });
+      }
       return coreBundle;
     });
 

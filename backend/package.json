@@ -8,6 +8,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "seed": "node utils/seed.js",
+    "initialize:defaults": "node utils/initializeDefaultData.js",
     "migrate:catalog-taxonomy": "node utils/migrateCatalogTaxonomy.js",
     "migrate:product-brands": "node utils/migrateProductBrands.js",
     "backfill:inventory-history": "node utils/backfillInventoryHistory.js",

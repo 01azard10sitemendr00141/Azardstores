@@ -45,6 +45,7 @@ function customerOrderView(order) {
     });
   }
 
+  for (const item of view.items || []) withoutKeys(item, ["loadedBy"]);
   withoutKeys(view.deliveryCorrection, ["reason", "actor"]);
   withoutKeys(view.deliveryConfirmation, ["confirmedBy"]);
   withoutKeys(view.availabilityIssue, ["resolvedBy"]);

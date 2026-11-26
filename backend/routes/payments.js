@@ -11,6 +11,7 @@ const { restoreOrderStockOnce } = require("../utils/orderStock");
 const { emitOrderEvent } = require("../utils/orderRealtime");
 const { paymentLimiter, paymentStatusLimiter } = require("../middleware/rateLimits");
 const { customerOrderView } = require("../utils/customerOrderView");
+const { cancelLinkedStockRequest } = require("../utils/stockRequest");
 
 const router = express.Router();
 
@@ -315,6 +316,7 @@ router.put("/unmatched/:id/reconcile", protect, requireRole("admin"), async (req
         || (order.status === "confirmed" && order.stockReservedUntil && order.stockReservedUntil <= new Date());
       if (latePayment && order.status === "confirmed") {
         order.status = "expired";
+        await cancelLinkedStockRequest(order, "The payment arrived after the order expired; staff must release the supplier hold.");
       }
       order.paymentStatus = "paid";
       order.paymentReference = unmatched.reference;
@@ -514,7 +516,10 @@ async function confirmOrderPayment(order, reference, { sendEmail = true } = {}) 
         $push: { events: { type: "late_payment_after_expiry", label: "Late payment received", note: "Payment added to store balance; do not dispatch.", createdAt: receivedAt } },
       }
     );
-    if (expiry.modifiedCount) persistedOrder = await Order.findById(order._id);
+    if (expiry.modifiedCount) {
+      persistedOrder = await Order.findById(order._id);
+      await cancelLinkedStockRequest(persistedOrder, "The payment arrived after the supplier stock hold expired.");
+    }
   }
 
   const orderEnded = ["cancelled", "expired", "unavailable"].includes(persistedOrder.status);

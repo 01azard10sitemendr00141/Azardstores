@@ -16,7 +16,11 @@ const { buildAdminProductQuery, isValidExpectedProductCount, matchesExpectedProd
 const { normalizeReviewedProduct, validateImportPlan, validatePlannedSkuUniqueness } = require("../utils/productImportReview");
 const { suggestUniqueProductSku } = require("../utils/productSku");
 const { normalizeProductBadges } = require("../utils/productBadges");
-const { serializeAvailableInventory } = require("../utils/productInventory");
+const {
+  PUBLIC_PRODUCT_INVENTORY_SELECTION,
+  serializeAvailableInventory,
+} = require("../utils/productInventory");
+const { getActiveShopIds } = require("../utils/activeShopIds");
 const { createOperationConflict, runInventoryOperation } = require("../utils/inventoryOperation");
 const {
   INVENTORY_HISTORY_LIMIT,
@@ -289,7 +293,7 @@ router.get("/", async (req, res, next) => {
     const order = queryText(req.query.order, 10);
     const includeTotal = queryText(req.query.includeTotal, 5) !== "false";
     const { search, page: pageNumber, limit: pageSize } = parseListQuery(req.query);
-    const allActiveShopIds = await Shop.find({ isActive: true }).distinct("_id");
+    const allActiveShopIds = await getActiveShopIds();
     let availableShopIds = allActiveShopIds.slice();
     if (floor) {
       const floorDoc = /^[0-9a-fA-F]{24}$/.test(String(floor))
@@ -335,7 +339,7 @@ router.get("/", async (req, res, next) => {
     const sortObj = { [sortField]: sortDirection };
 
     const productsQuery = Product.find(filter)
-      .select("+inventoryLocations")
+      .select(PUBLIC_PRODUCT_INVENTORY_SELECTION)
       .populate({ path: "shop", select: "name shopNumber slug floor", populate: { path: "floor", select: "name floorNumber slug" } })
       .skip(skip)
       .limit(pageSize)

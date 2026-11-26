@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-test("homepage cache restores a session snapshot and marks stale data for refresh", async () => {
-  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage");
+test("homepage cache restores a persistent snapshot and marks stale data for refresh", async () => {
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
   const values = new Map();
-  Object.defineProperty(globalThis, "sessionStorage", {
+  Object.defineProperty(globalThis, "localStorage", {
     configurable: true,
     value: {
       getItem: (key) => values.get(key) || null,
@@ -30,10 +30,18 @@ test("homepage cache restores a session snapshot and marks stale data for refres
     const reloadedCache = await import(`../src/utils/homeCache.js?read=${Date.now()}`);
     assert.deepEqual(reloadedCache.getHomeCache(), bundle);
     assert.equal(reloadedCache.isHomeCacheFresh(), false);
+
+    stored.cachedAt = Date.now() - 2 * 60 * 60 * 1000;
+    values.set(storageKey, JSON.stringify(stored));
+    const oldSnapshotCache = await import(`../src/utils/homeCache.js?stale=${Date.now()}`);
+    assert.deepEqual(oldSnapshotCache.getHomeCache(), bundle);
+    assert.equal(oldSnapshotCache.isHomeCacheFresh(), false);
+    assert.equal(values.has(storageKey), true);
+
     reloadedCache.clearHomeCache();
     assert.equal(values.has(storageKey), false);
   } finally {
-    if (previousStorage) Object.defineProperty(globalThis, "sessionStorage", previousStorage);
-    else delete globalThis.sessionStorage;
+    if (previousStorage) Object.defineProperty(globalThis, "localStorage", previousStorage);
+    else delete globalThis.localStorage;
   }
 });

@@ -17,6 +17,7 @@ import DeliveryIssuePanel from "../components/DeliveryIssuePanel";
 import PaymentFailurePanel from "../components/PaymentFailurePanel";
 import ReturnRequestForm from "../components/ReturnRequestForm";
 import CustomerCancellationForm from "../components/CustomerCancellationForm";
+import AccountSetupPanel from "../components/AccountSetupPanel";
 import { customerOrderEvents, customerRequestStatus, getCustomerOrderMessage, getCustomerPaymentSummary, getCustomerReturnMessage, orderEventLabel, orderEventNote, storeBalanceCreditAmount } from "../utils/orderEventDisplay";
 import { isReturnWindowOpen } from "../utils/returnWindow";
 import { getAvailableReturnQuantities } from "../utils/returnQuantities";
@@ -226,10 +227,11 @@ function BillingTab({ user }) {
 
   if (loading) return <div className="py-16 text-center text-cream/40 text-sm">Loading billing history...</div>;
   if (error && orders.length === 0) return <div className="py-12 text-center"><p role="alert" className="text-red-300 text-sm mb-3">{error}</p><button onClick={() => setAttempt((value) => value + 1)} className="rounded-lg border border-cream/15 px-4 py-2 text-xs text-cream/70 hover:border-cream/30">Try again</button></div>;
-  if (!orders.length) return <div><PaymentMethodsInfo/><div className="py-16 text-center"><Receipt size={34} className="text-cream/20 mx-auto mb-3"/><p className="text-cream/40 text-sm">Invoices and receipts will appear here after you place an order.</p></div></div>;
+  const billableOrders = orders.filter((order) => !(order.stockRequest && !order.checkoutDetailsCompletedAt));
+  if (!billableOrders.length) return <div><PaymentMethodsInfo/><div className="py-16 text-center"><Receipt size={34} className="text-cream/20 mx-auto mb-3"/><p className="text-cream/40 text-sm">Invoices and receipts will appear here after you complete delivery and payment details.</p></div></div>;
 
-  const extraPayments = orders.flatMap((order) => (order.additionalPaymentRefunds || []).map((payment) => ({ order, payment })));
-  const extraCredits = orders.flatMap((order) => (order.additionalPaymentCredits || []).map((payment) => ({ order, payment })));
+  const extraPayments = billableOrders.flatMap((order) => (order.additionalPaymentRefunds || []).map((payment) => ({ order, payment })));
+  const extraCredits = billableOrders.flatMap((order) => (order.additionalPaymentCredits || []).map((payment) => ({ order, payment })));
   return (
     <div>
       {error && <p role="status" className="mb-3 rounded-lg border border-amber-300/15 bg-amber-300/5 px-3 py-2 text-xs text-amber-100">Billing could not refresh. Showing the last loaded records. <button type="button" onClick={() => setAttempt((value) => value + 1)} className="ml-1 underline">Retry</button></p>}
@@ -249,7 +251,7 @@ function BillingTab({ user }) {
           <p className="text-cream/80">Order #{order._id.slice(-6).toUpperCase()} · KSh {Number(payment.amount).toLocaleString()} · {payment.status === 'crediting' ? 'Being added to Store Balance' : payment.status === 'claim_pending' ? 'Waiting for verified account claim' : 'Added to Store Balance'}</p>
         </article>)}</div>
       </section>}
-      <div className="divide-y divide-cream/8">{orders.map((order) => {
+      <div className="divide-y divide-cream/8">{billableOrders.map((order) => {
         const paymentSummary = getCustomerPaymentSummary(order);
         const paymentState = order.paymentStatus === 'paid' && order.storeBalanceCreditedAt
           ? 'Paid | value returned to Store Balance'
@@ -273,9 +275,81 @@ function BillingTab({ user }) {
     </div>
   );
 }
+
+function StockRequestsPanel({ requests, loading, error, onRetry }) {
+  if (!loading && !error && requests.length === 0) return null;
+
+  const statusConfig = {
+    checking: { label: "I'm checking availability", tone: "text-mall-accent border-mall-accent/25 bg-mall-accent/10", step: 1 },
+    partial: { label: "I'm confirming the remaining items", tone: "text-amber-200 border-amber-300/25 bg-amber-300/10", step: 1 },
+    quoted: { label: "Quote ready to review", tone: "text-emerald-200 border-emerald-300/25 bg-emerald-300/10", step: 2 },
+    expired: { label: "Quote expired", tone: "text-amber-200/75 border-amber-200/15 bg-amber-200/5", terminal: true },
+    released: { label: "Stock hold released", tone: "text-cream/55 border-cream/10 bg-cream/[0.03]", terminal: true },
+    cancelled: { label: "Request cancelled", tone: "text-red-200/75 border-red-300/15 bg-red-300/5", terminal: true },
+  };
+  const progressSteps = ["Submitted", "Checking availability", "Quote ready"];
+
+  return (
+    <section aria-labelledby="submitted-orders-heading" className="mb-6 rounded-2xl border border-cream/10 bg-mall-900/55 p-4 shadow-[0_16px_45px_rgba(0,0,0,0.12)] sm:p-6">
+      <div className="flex flex-col gap-2 border-b border-cream/10 pb-4 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <p className="font-mono-tag text-[9px] uppercase tracking-[0.2em] text-mall-accent/75">Availability desk</p>
+          <h3 id="submitted-orders-heading" className="mt-1 font-display text-xl text-cream sm:text-2xl">Your submitted orders</h3>
+        </div>
+        <p className="max-w-sm text-xs leading-relaxed text-cream/45 sm:text-right">Availability and price are confirmed before checkout or payment.</p>
+      </div>
+      {loading && <p className="mt-3 text-xs text-cream/45">Loading your requests…</p>}
+      {error && <div role="alert" className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-300/20 bg-amber-300/5 px-3 py-3 text-xs text-amber-100"><span>{error}</span><button type="button" onClick={onRetry} className="min-h-10 rounded-lg border border-cream/15 px-3 text-cream/75 transition hover:border-cream/30 hover:bg-cream/5 focus:outline-none focus:ring-2 focus:ring-mall-accent/60">Try again</button></div>}
+      {requests.length > 0 && (
+        <div className="mt-5 grid gap-3">
+          {requests.map((request) => {
+            const config = statusConfig[request.status] || { label: "Request in progress", tone: "text-cream/70 border-cream/15 bg-cream/5", step: 1 };
+            const items = Array.isArray(request.items) ? request.items : [];
+            return <article key={request._id} className="rounded-xl border border-cream/10 bg-mall-800/70 p-4 transition hover:border-cream/20 sm:p-5">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="min-w-0">
+                  <p className="font-mono-tag text-[9px] uppercase tracking-[0.16em] text-cream/35">Submitted request</p>
+                  <h4 className="mt-1 text-sm font-medium text-cream">Order #{String(request._id).slice(-6).toUpperCase()}</h4>
+                  <p className="mt-1 text-[11px] text-cream/40">{new Date(request.createdAt).toLocaleDateString("en-KE", { day: "numeric", month: "short", year: "numeric" })} <span className="px-1 text-cream/20">·</span> {items.length} item{items.length === 1 ? "" : "s"}</p>
+                </div>
+                <span role="status" className={`inline-flex w-fit items-center rounded-full border px-2.5 py-1.5 font-mono-tag text-[9px] uppercase tracking-[0.08em] ${config.tone}`}>{config.label}</span>
+              </div>
+              {!config.terminal && <div className="mt-5 rounded-lg border border-cream/8 bg-mall-900/45 px-3 py-3">
+                <div className="flex items-start">
+                  {progressSteps.map((step, index) => <div key={step} className="flex min-w-0 flex-1 items-start">
+                    <div className="flex min-w-0 flex-col items-center gap-1.5">
+                      <span className={`flex h-6 w-6 items-center justify-center rounded-full border text-[10px] ${index <= config.step ? "border-mall-accent bg-mall-accent text-mall-900" : "border-cream/20 text-cream/35"}`}>{index < config.step ? "✓" : index + 1}</span>
+                      <span className={`text-center text-[9px] leading-tight ${index <= config.step ? "text-cream/70" : "text-cream/35"}`}>{step}</span>
+                    </div>
+                    {index < progressSteps.length - 1 && <span className={`mt-3 h-px flex-1 ${index < config.step ? "bg-mall-accent/70" : "bg-cream/15"}`} />}
+                  </div>)}
+                </div>
+              </div>}
+              <div className="mt-4 flex flex-col gap-4 border-t border-cream/8 pt-4 sm:flex-row sm:items-end sm:justify-between">
+                <ul className="min-w-0 space-y-1.5" aria-label="Requested items">
+                  {items.slice(0, 3).map((item, index) => <li key={item._id || `${item.name}-${index}`} className="truncate text-xs text-cream/60">{item.name}{item.variantName ? ` · ${item.variantName}` : ""} <span className="text-cream/30">× {item.quantity}</span></li>)}
+                  {items.length > 3 && <li className="text-xs text-cream/35">+ {items.length - 3} more item{items.length - 3 === 1 ? "" : "s"}</li>}
+                </ul>
+                <Link to={`/stock-request/${request._id}`} className={`inline-flex min-h-10 shrink-0 items-center justify-center gap-1 rounded-lg px-3 py-2 text-xs font-medium transition focus:outline-none focus:ring-2 focus:ring-mall-accent/60 ${request.status === "quoted" ? "bg-mall-accent text-mall-900 hover:bg-mall-accent/90" : "border border-cream/15 text-cream/75 hover:border-mall-accent/50 hover:text-cream"}`}>View request status <ChevronRight size={14} /></Link>
+              </div>
+            </article>;
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function OrdersTab() {
   const { user } = useAuth();
+  const location = useLocation();
+  const submittedStockRequest = location.state?.submittedStockRequest;
+  const accountSetupRequired = user?.accountSetupStage && user.accountSetupStage !== "complete";
   const [orders, setOrders] = useState([]);
+  const [stockRequests, setStockRequests] = useState(() => submittedStockRequest ? [submittedStockRequest] : []);
+  const [stockRequestsLoading, setStockRequestsLoading] = useState(true);
+  const [stockRequestsError, setStockRequestsError] = useState("");
+  const [stockRequestsLoadAttempt, setStockRequestsLoadAttempt] = useState(0);
   const ordersRef = useRef(orders);
   ordersRef.current = orders;
   const [loading, setLoading] = useState(true);
@@ -311,6 +385,41 @@ function OrdersTab() {
   }, [ordersLoadAttempt]);
   useEffect(() => {
     let active = true;
+    const loadStockRequests = () => {
+      api.get("/stock-requests/mine")
+        .then((res) => {
+          if (!active) return;
+          const requests = Array.isArray(res.data.requests) ? res.data.requests : [];
+          if (submittedStockRequest && !requests.some((request) => String(request._id) === String(submittedStockRequest._id))) {
+            requests.unshift(submittedStockRequest);
+          }
+          setStockRequests(requests);
+          setStockRequestsError("");
+        })
+        .catch(() => {
+          if (active) setStockRequestsError("Availability requests could not be refreshed. Try again shortly.");
+        })
+        .finally(() => {
+          if (active) setStockRequestsLoading(false);
+        });
+    };
+    setStockRequestsLoading(true);
+    loadStockRequests();
+    const timer = setInterval(() => {
+      if (!document.hidden) loadStockRequests();
+    }, 15000);
+    const onVisibilityChange = () => {
+      if (!document.hidden) loadStockRequests();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      active = false;
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [stockRequestsLoadAttempt, user?.id]);
+  useEffect(() => {
+    let active = true;
     const refreshOrders = (event = null) => {
       if (document.hidden) return;
       const eventOrderId = event?.id ? String(event.id) : "";
@@ -344,7 +453,8 @@ function OrdersTab() {
     // Keep polling quiet while Socket.IO is healthy. If it disconnects, use
     // a short fallback interval until the connection returns.
     const timer = setInterval(() => {
-      if (!socket.connected) refreshOrders();
+      const awaitingStockCheck = ordersRef.current.some((order) => order.stockRequest && !order.checkoutDetailsCompletedAt);
+      if (!socket.connected || awaitingStockCheck) refreshOrders();
     }, 15000);
     return () => {
       active = false;
@@ -353,6 +463,17 @@ function OrdersTab() {
       socket.disconnect();
     };
   }, [hasActiveOrders, user?.id]);
+
+  const stockRequestOrderIds = new Set(stockRequests.map((request) => String(request._id)));
+  const visibleOrders = orders.filter((order) =>
+    order.checkoutDetailsCompletedAt || !stockRequestOrderIds.has(String(order._id))
+  );
+  const availabilityRequests = <StockRequestsPanel
+    requests={stockRequests}
+    loading={stockRequestsLoading}
+    error={stockRequestsError}
+    onRetry={() => setStockRequestsLoadAttempt((attempt) => attempt + 1)}
+  />;
 
   function cancelOrder(order) {
     setActionMessage("");
@@ -460,36 +581,59 @@ function OrdersTab() {
   }
 
   if (loading) return (
-    <div className="flex items-center justify-center py-20">
-      <div className="w-6 h-6 border-2 border-mall-accent/30 border-t-mall-accent rounded-full animate-spin" />
-    </div>
+    <>
+      {availabilityRequests}
+      <div className="flex items-center justify-center py-20">
+        <div className="w-6 h-6 border-2 border-mall-accent/30 border-t-mall-accent rounded-full animate-spin" />
+      </div>
+    </>
   );
 
-  if (ordersLoadError) return <div role="alert" className="mx-auto max-w-lg rounded-2xl border border-red-300/15 bg-red-300/5 px-5 py-8 text-center"><p className="font-display text-lg text-cream">Orders unavailable</p><p className="mt-2 text-sm text-cream/50">{ordersLoadError}</p><button type="button" onClick={() => setOrdersLoadAttempt((attempt) => attempt + 1)} className="mt-5 rounded-xl border border-cream/15 px-4 py-2.5 text-xs text-cream/75 hover:border-cream/30">Try again</button></div>;
-
-  if (orders.length === 0) return (
-    <div className="py-20 text-center">
-      <Package size={40} className="text-cream/15 mx-auto mb-3" />
-      <p className="font-display text-xl text-cream/30 mb-2">No orders yet</p>
-      <p className="text-cream/20 text-sm mb-6">Start shopping to see your orders here.</p>
-      <Link to="/directory" className="inline-flex items-center gap-2 text-mall-accent hover:underline text-sm">
-        Browse the mall <ChevronRight size={13} />
-      </Link>
-    </div>
+  if (ordersLoadError) return (
+    <>
+      {availabilityRequests}
+      <div role="alert" className="mx-auto max-w-lg rounded-2xl border border-red-300/15 bg-red-300/5 px-5 py-8 text-center"><p className="font-display text-lg text-cream">Orders unavailable</p><p className="mt-2 text-sm text-cream/50">{ordersLoadError}</p><button type="button" onClick={() => setOrdersLoadAttempt((attempt) => attempt + 1)} className="mt-5 rounded-xl border border-cream/15 px-4 py-2.5 text-xs text-cream/75 hover:border-cream/30">Try again</button></div>
+    </>
   );
+
+  if (visibleOrders.length === 0) {
+    if (stockRequests.length || stockRequestsLoading || stockRequestsError) return availabilityRequests;
+    return (
+      <div className="py-20 text-center">
+        <Package size={40} className="text-cream/15 mx-auto mb-3" />
+        <p className="font-display text-xl text-cream/30 mb-2">No orders yet</p>
+        <p className="text-cream/20 text-sm mb-6">Your orders and availability requests will appear here after you submit them.</p>
+        <Link to="/directory" className="inline-flex items-center gap-2 text-mall-accent hover:underline text-sm">
+          Browse the mall <ChevronRight size={13} />
+        </Link>
+      </div>
+    );
+  }
 
   return (
     <div>
+    {availabilityRequests}
     {ordersRefreshWarning && <p role="status" className="mb-3 rounded-lg border border-amber-300/15 bg-amber-300/5 px-3 py-2 text-xs text-amber-100">{ordersRefreshWarning}</p>}
     {actionMessage && <p role="status" className="text-xs text-cream/70 bg-mall-800 rounded-lg p-3 mb-3">{actionMessage}</p>}
     <div className="space-y-0 divide-y divide-cream/8">
-      {orders.map((order) => {
+      {visibleOrders.map((order) => {
         const status = STATUS[order.status] || STATUS.pending;
         const StatusIcon = status.icon;
         const isOpen = expanded === order._id;
         const customerMessage = getCustomerOrderMessage(order);
         const paymentSummary = getCustomerPaymentSummary(order);
         const customerEvents = customerOrderEvents(order.events);
+        const requestStatusLabels = {
+          checking: "I'm checking availability",
+          partial: "I'm confirming the remaining items",
+          quoted: "Confirmed quote ready",
+          expired: "Quote expired · recheck needed",
+          released: "Stock hold released",
+          cancelled: "Stock check cancelled",
+          converted: "Checkout completed",
+        };
+        const requestStatus = order.stockRequest && typeof order.stockRequest === "object" ? order.stockRequest.status : "";
+        const isStockCheckOrder = Boolean(order.stockRequest && !order.checkoutDetailsCompletedAt);
         const paymentAttemptPending = (order.paymentAttempts || []).some((attempt) => attempt.provider === "paystack" && attempt.status === "pending");
         const paymentAttemptNeedsReview = (order.paymentAttempts || []).some((attempt) => attempt.status === "review");
 
@@ -508,16 +652,18 @@ function OrdersTab() {
                   </span>
                   <span className={`inline-flex items-center gap-1 font-mono-tag text-[9px] uppercase px-2 py-0.5 rounded-full ${status.bg} ${status.color}`}>
                     <StatusIcon size={9} />
-                    {status.label}
+                    {isStockCheckOrder ? requestStatusLabels[requestStatus] || status.label : status.label}
                   </span>
                 </div>
                 <p className="text-cream/40 text-xs">
                   {new Date(order.createdAt).toLocaleDateString("en-KE", { day: "numeric", month: "short", year: "numeric" })}
                   {" · "}{order.items.length} item{order.items.length !== 1 ? "s" : ""}
+                  {order.stockRequest && !order.checkoutDetailsCompletedAt && " · Stock check in progress"}
                 </p>
               </div>
               <div className="text-right shrink-0">
-                <p className="font-display text-lg text-cream">KSh {order.totalAmount.toLocaleString()}</p>
+                <p className="font-display text-lg text-cream">{order.checkoutDetailsCompletedAt ? `KSh ${Number(order.totalAmount || 0).toLocaleString()}` : `Est. KSh ${Number(order.totalAmount || 0).toLocaleString()}`}</p>
+                {order.stockRequest && !order.checkoutDetailsCompletedAt && <p className="text-[10px] text-cream/35">Delivery not included</p>}
                 {order.storeBalanceCreditedAt ? <p className="text-[10px] text-emerald-300">KSh {storeBalanceCreditAmount(order).toLocaleString()} returned to Store Balance</p> : Number(order.storeBalanceApplied) > 0 && <p className="text-[10px] text-mall-accent">KSh {Number(order.storeBalanceApplied).toLocaleString()} {order.storeBalanceStatus === "reserved" ? "Store Balance reserved" : order.storeBalanceStatus === "released" ? "Store Balance returned" : "Store Balance applied"}</p>}
                 <ChevronRight size={14} className={`text-cream/30 ml-auto mt-1 transition ${isOpen ? "rotate-90" : ""}`} />
               </div>
@@ -527,8 +673,9 @@ function OrdersTab() {
             {isOpen && (
               <div className="mt-4 pt-4 border-t border-cream/8 space-y-3">
                 <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs text-cream/45">
-                  <span>Payment: {paymentSummary.status}</span>
-                  <span>Method: {paymentSummary.method}</span>
+                  {isStockCheckOrder
+                    ? <span>Payment: not due while I check availability</span>
+                    : <><span>Payment: {paymentSummary.status}</span><span>Method: {paymentSummary.method}</span></>}
                   {order.storeBalanceCreditedAt && <span>Returned to Store Balance: KSh {storeBalanceCreditAmount(order).toLocaleString()}</span>}
                   {!order.storeBalanceCreditedAt && Number(order.storeBalanceApplied) > 0 && <span>Store Balance {order.storeBalanceStatus === "reserved" ? "reserved" : order.storeBalanceStatus === "released" ? "returned" : "applied"}: KSh {Number(order.storeBalanceApplied).toLocaleString()}</span>}
                   {!order.storeBalanceCreditedAt && order.storeBalanceStatus !== "released" && order.paymentStatus !== "paid" && Number(order.storeBalanceApplied) > 0 && <span>{order.status === "pending" ? "Remaining after availability" : "Remaining to pay"}: KSh {Math.max(0, Number(order.totalAmount) - Number(order.storeBalanceApplied)).toLocaleString()}</span>}
@@ -537,15 +684,24 @@ function OrdersTab() {
                 </div>
                 {order.replacementFor && <p className="text-xs text-mall-accent/80">Replacement for order #{String(order.replacementFor).slice(-6).toUpperCase()} · {Number(order.replacementPriceDifference) > 0 ? "+" : ""}KSh {Number(order.replacementPriceDifference || 0).toLocaleString()} compared with its original total</p>}
                 <OrderStatusTracker status={order.status} deliveryArea={order.deliveryArea} paymentMethod={order.paymentMethod} paymentStatus={order.paymentStatus} storeBalanceApplied={order.storeBalanceApplied} totalAmount={order.totalAmount} />
-                <AvailabilityIssueActions order={order} onUpdate={(updated) => setOrders((prev) => prev.map((item) => item._id === updated._id ? updated : item))} />
-                <DeliveryIssuePanel order={order} onUpdate={(updated) => setOrders((prev) => prev.map((item) => item._id === updated._id ? updated : item))} />
+                {!accountSetupRequired && <AvailabilityIssueActions order={order} onUpdate={(updated) => setOrders((prev) => prev.map((item) => item._id === updated._id ? updated : item))} />}
+                {!accountSetupRequired && <DeliveryIssuePanel order={order} onUpdate={(updated) => setOrders((prev) => prev.map((item) => item._id === updated._id ? updated : item))} />}
                 <div className="rounded-xl border border-cream/8 bg-mall-800/60 px-4 py-3">
-                  <p className="text-sm font-medium text-cream">{customerMessage.title}</p>
-                  <p className="mt-1 text-xs leading-relaxed text-cream/50">{customerMessage.body}</p>
+                  <p className="text-sm font-medium text-cream">{isStockCheckOrder ? requestStatusLabels[requestStatus] || "I'm checking availability" : customerMessage.title}</p>
+                  <p className="mt-1 text-xs leading-relaxed text-cream/50">{isStockCheckOrder ? requestStatus === "quoted" ? "I confirmed the items and reserved them in your quote. Review the quote, delivery fee, and payment details to complete this order." : "Your order is recorded. I'm confirming each item and the current prices; no payment is due while this is in progress." : customerMessage.body}</p>
                 </div>
+                {isStockCheckOrder && order.stockRequest?.items?.length > 0 && <div className="space-y-2 rounded-xl border border-cream/8 bg-mall-800/40 p-3">
+                  {order.stockRequest.items.map((item) => <div key={item._id} className="flex flex-wrap justify-between gap-2 text-xs">
+                    <span className="text-cream/70">{item.name}{item.variantName ? ` · ${item.variantName}` : ""} · Qty {item.quantity}</span>
+                    {item.confirmedQuantity === item.quantity && item.confirmedCustomerPrice != null
+                      ? <span className="text-emerald-200">Confirmed · KSh {Number(item.confirmedCustomerPrice).toLocaleString()} each</span>
+                      : <span className="text-cream/40">Checking availability and price</span>}
+                  </div>)}
+                </div>}
+                {isStockCheckOrder && requestStatus === "quoted" && <Link to={`/stock-request/${order.stockRequest._id}`} className="inline-flex min-h-11 items-center rounded-lg bg-mall-accent px-4 text-xs font-semibold text-mall-900">Review quote, delivery and payment</Link>}
                 {order.storeBalanceClaimStatus === "pending" && order.status !== "unavailable" && <p className="rounded-lg border border-mall-accent/20 bg-mall-accent/5 px-3 py-2 text-xs text-cream/65">A Store Balance from this order is waiting to be claimed. Sign in or create an account with {order.guestInfo?.email || order.billingSnapshot?.email} and verify that email. <Link to="/dashboard#billing" className="text-mall-accent underline">View Billing</Link></p>}
-                {order.paymentStatus === "failed" && order.status === "confirmed" && <PaymentFailurePanel order={order} retrying={payingOrderId === order._id} onRetry={() => retryPayment(order)} />}
-                {!paymentAttemptNeedsReview && !order.paymentTestMode && ["mpesa", "paystack"].includes(order.paymentMethod) && ((order.status === "confirmed" && order.paymentStatus !== "paid" && order.paymentStatus !== "failed") || (order.status === "expired" && paymentAttemptPending && order.paymentStatus !== "paid")) && <button disabled={payingOrderId === order._id} onClick={() => paymentAttemptPending ? checkPaymentStatus(order) : retryPayment(order)} className="rounded-lg bg-mall-accent px-3 py-2 text-xs font-semibold text-mall-900 disabled:opacity-50">{payingOrderId === order._id ? paymentAction === "starting" ? "Starting M-Pesa" : paymentAction === "waiting" ? "Waiting for M-Pesa" : paymentAction === "opening" ? "Opening secure checkout" : "Checking payment" : paymentAttemptPending ? "Check payment status" : "Continue payment"}</button>}
+                {!accountSetupRequired && order.paymentStatus === "failed" && order.status === "confirmed" && <PaymentFailurePanel order={order} retrying={payingOrderId === order._id} onRetry={() => retryPayment(order)} />}
+                {!accountSetupRequired && !paymentAttemptNeedsReview && !order.paymentTestMode && ["mpesa", "paystack"].includes(order.paymentMethod) && ((order.status === "confirmed" && order.paymentStatus !== "paid" && order.paymentStatus !== "failed") || (order.status === "expired" && paymentAttemptPending && order.paymentStatus !== "paid")) && <button disabled={payingOrderId === order._id} onClick={() => paymentAttemptPending ? checkPaymentStatus(order) : retryPayment(order)} className="rounded-lg bg-mall-accent px-3 py-2 text-xs font-semibold text-mall-900 disabled:opacity-50">{payingOrderId === order._id ? paymentAction === "starting" ? "Starting M-Pesa" : paymentAction === "waiting" ? "Waiting for M-Pesa" : paymentAction === "opening" ? "Opening secure checkout" : "Checking payment" : paymentAttemptPending ? "Check payment status" : "Continue payment"}</button>}
                 {order.returnRequests?.map((request) => { const summary = getCustomerReturnMessage(request, order); return <div key={request._id} className="rounded-lg border border-cream/8 bg-mall-900/40 px-3 py-2 text-xs"><p className="font-medium text-cream/75">{request.type === "return" ? "Return" : "Exchange"} · {summary.label}</p><p className="mt-1 text-cream/45">{summary.body}</p></div>; })}
                 {order.cancellationRequests?.map((request) => <p key={request._id} className="text-xs text-amber-200">Cancellation request: {customerRequestStatus(request.status)}{request.status === "pending" ? " · Azard Stores is reviewing it" : ""}{request.decisionNote ? ` · ${request.decisionNote}` : ""}</p>)}
                 {customerEvents.length > 0 && <div className="space-y-3"><p className="font-mono-tag text-[9px] uppercase tracking-widest text-cream/30">Order updates</p><div className="border-l border-cream/15 pl-3 space-y-3">{customerEvents.map((event, index) => <div key={`${event.type}-${event.createdAt}-${index}`}><p className="text-xs text-cream/70">{orderEventLabel(event)}</p>{orderEventNote(event) && <p className="text-[11px] text-cream/40">{orderEventNote(event)}</p>}<p className="text-[10px] text-cream/25">{new Date(event.createdAt).toLocaleString("en-KE")}</p></div>)}</div></div>}
@@ -585,8 +741,8 @@ function OrdersTab() {
                     {order.deliveryRoute?.serviceType === "parcel" && order.deliveryRoute?.carrier && <p className="text-cream/40 text-xs mt-1">{order.deliveryRoute.carrier} · {order.deliveryRoute.officeName}{order.deliveryRoute.officeAddress ? ` · ${order.deliveryRoute.officeAddress}` : ""}</p>}
                   </div>
                 )}
-                {(["pending", "confirmed"].includes(order.status) && !order.cancellationRequests?.some((request) => request.status === "pending")) && <button onClick={() => cancelOrder(order)} className="inline-flex min-h-11 items-center rounded-lg px-3 text-xs text-red-300 hover:text-red-200 sm:min-h-0">{order.paymentStatus === "paid" ? "Request cancellation" : "Cancel order"}</button>}
-                {isReturnWindowOpen(order) && getAvailableReturnQuantities(order).some((quantity) => quantity > 0) && <button onClick={() => requestReturn(order)} className="inline-flex min-h-11 items-center rounded-lg px-3 text-xs text-mall-accent hover:underline sm:min-h-0">Request return or exchange</button>}
+                {!accountSetupRequired && (["pending", "confirmed"].includes(order.status) && !order.cancellationRequests?.some((request) => request.status === "pending")) && <button onClick={() => cancelOrder(order)} className="inline-flex min-h-11 items-center rounded-lg px-3 text-xs text-red-300 hover:text-red-200 sm:min-h-0">{order.paymentStatus === "paid" ? "Request cancellation" : "Cancel order"}</button>}
+                {!accountSetupRequired && isReturnWindowOpen(order) && getAvailableReturnQuantities(order).some((quantity) => quantity > 0) && <button onClick={() => requestReturn(order)} className="inline-flex min-h-11 items-center rounded-lg px-3 text-xs text-mall-accent hover:underline sm:min-h-0">Request return or exchange</button>}
               </div>
             )}
           </div>
@@ -1017,6 +1173,23 @@ export default function Dashboard() {
   );
 
   if (!user) return <Navigate to="/login" state={{ from: location }} replace />;
+
+  if (user.accountSetupStage && user.accountSetupStage !== "complete") return (
+    <div className="min-h-screen bg-mall-900">
+      <div className="mx-auto max-w-4xl px-4 py-8 sm:px-6 sm:py-12">
+        <header className="mb-6 border-b border-cream/10 pb-5">
+          <p className="font-mono-tag text-[10px] uppercase tracking-widest text-mall-orange">Order received</p>
+          <h1 className="mt-1 font-display text-3xl text-cream">Your order is in progress</h1>
+          <p className="mt-2 text-sm text-cream/50">I’ve saved your order and I’m checking item availability. Finish securing your account to continue when the confirmed quote is ready.</p>
+        </header>
+        <section className="rounded-2xl border border-cream/10 bg-mall-800/40 px-4 sm:px-6">
+          <h2 className="pt-4 font-display text-xl text-cream">My Orders</h2>
+          <OrdersTab />
+        </section>
+        <AccountSetupPanel />
+      </div>
+    </div>
+  );
 
   const ActiveIcon = TABS.find((t) => t.id === activeTab)?.icon || ShoppingBag;
 

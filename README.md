@@ -1,3 +1,16 @@
+# Backend startup and default homepage data
+
+The API no longer checks or seeds default homepage data during every start. Before serving traffic from a new database (and once when deploying this change to an existing environment), run the idempotent initializer from the backend directory:
+
+```powershell
+cd backend
+npm run initialize:defaults
+```
+
+On normal startup, the API connects to MongoDB while loading route modules, then listens only after both are ready. Background workers are loaded after the API begins listening.
+
+Run this as a one-off deployment/release task with the same `MONGO_URI` as the API. For Docker, use the backend image and its configured environment to run `npm run initialize:defaults` as a one-off container before starting the API container. Do not add the initializer to the API's recurring start command. It only creates defaults for empty collections and can be safely rerun; it does not overwrite existing homepage data. The existing `npm run seed` command is destructive and is not part of this setup.
+
 Configure the real domain, HTTPS, API URL, Socket.IO URL, and production environment variables.
 Deploy the frontend and backend.
 Connect MongoDB production database.

@@ -1,5 +1,8 @@
 const express = require("express");
 const Order = require("../models/Order");
+const Floor = require("../models/Floor");
+const Shop = require("../models/Shop");
+const Product = require("../models/Product");
 const { protect, requireRole } = require("../middleware/auth");
 const { buildTopShopsPipeline, buildUnattributedShopRevenuePipeline } = require("../utils/shopAnalytics");
 
@@ -9,6 +12,33 @@ const paidOrderMatch = {
   status: { $nin: ["cancelled", "unavailable", "expired"] },
   storeBalanceCreditedAt: null,
 };
+
+// GET /api/analytics/summary - lightweight admin overview totals.
+router.get("/summary", protect, requireRole("admin"), async (req, res, next) => {
+  try {
+    const [floors, shops, products, orders, recentOrders] = await Promise.all([
+      Floor.countDocuments({ isActive: true }),
+      Shop.countDocuments({ isActive: true }),
+      Product.countDocuments({
+        isActive: true,
+        $or: [{ status: "published" }, { status: { $exists: false } }],
+      }),
+      Order.countDocuments(),
+      Order.find()
+        .populate("user", "name email")
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .lean(),
+    ]);
+
+    res.json({
+      totals: { floors, shops, products, orders },
+      recentOrders,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // GET /api/analytics/overview - admin only. Paid order value and top sellers
 // are scoped to the last 30 days and exclude unpaid or fully credited orders.

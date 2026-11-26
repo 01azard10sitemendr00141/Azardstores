@@ -1,3 +1,4 @@
+const processStartedAt = Date.now();
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -8,28 +9,10 @@ const User = require("./models/User");
 const { getAuthToken } = require("./middleware/auth");
 
 const { connectDB } = require("./config/db");
-const { seedDefaultBadgesIfEmpty } = require("./utils/seedDefaultBadges");
-const { seedDefaultHomeSectionsIfEmpty } = require("./utils/seedDefaultHomeSections");
-const { seedDefaultHeroSlidesIfEmpty } = require("./utils/seedDefaultHeroSlides");
-const { seedHomepageContentIfEmpty } = require("./utils/seedHomepageContent");
 const { notFound, errorHandler } = require("./middleware/errorHandler");
-const { startPaymentReminderWorker } = require("./utils/paymentReminderWorker");
-const { startEmailOutboxWorker } = require("./utils/emailOutboxWorker");
 const { getPort } = require("./config/runtime");
 const { getVerificationCapabilities } = require("./config/verification");
 const { isPaystackConfigured, isPaystackMpesaConfigured } = require("./utils/paystack");
-
-const authRoutes = require("./routes/auth");
-const floorRoutes = require("./routes/floors");
-const shopRoutes = require("./routes/shops");
-const productRoutes = require("./routes/products");
-const orderRoutes = require("./routes/orders");
-const webhookRoutes = require("./routes/webhooks");
-const contactRoutes = require("./routes/contact");
-const categoriesRoutes = require("./routes/categories");
-const brandRoutes = require("./routes/brands");
-const settingsRoutes = require("./routes/settings");
-const analyticsRoutes = require("./routes/analytics");
 
 const app = express();
 const server = http.createServer(app);
@@ -107,25 +90,6 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-app.use("/api/auth", authRoutes);
-app.use("/api/floors", floorRoutes);
-app.use("/api/shops", shopRoutes);
-app.use("/api/products", productRoutes);
-app.use("/api/orders", orderRoutes);
-app.use("/api/purchase-orders", require("./routes/purchaseOrders"));
-app.use("/api/webhooks", webhookRoutes);
-app.use("/api/contact", contactRoutes);
-app.use("/api/categories", categoriesRoutes);
-app.use("/api/brands", brandRoutes);
-app.use("/api/badges", require("./routes/badges"));
-app.use("/api/home-sections", require("./routes/homeSections"));
-app.use("/api/hero-slides", require("./routes/heroSlides"));
-app.use("/api/homepage-content", require("./routes/homepageContent"));
-app.use("/api/settings", settingsRoutes);
-app.use("/api/analytics", analyticsRoutes);
-app.use("/api/notifications", require("./routes/notifications"));
-app.use("/api/payments", require("./routes/payments"));
-
 io.on("connection", (socket) => {
   if (socket.data.userId) socket.join(`user:${socket.data.userId}`);
   if (socket.data.role === "admin") socket.join("admins");
@@ -133,12 +97,47 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => console.log("Client disconnected:", socket.id));
 });
 
-app.use(notFound);
-app.use(errorHandler);
-
 const PORT = getPort(process.env.PORT);
 const workerIntervals = [];
 let shutdownPromise;
+
+async function runStartupStep(label, operation) {
+  const startedAt = Date.now();
+  console.log(`Startup: ${label} started`);
+  try {
+    const result = await operation();
+    console.log(`Startup: ${label} completed in ${Date.now() - startedAt}ms`);
+    return result;
+  } catch (error) {
+    console.error(`Startup: ${label} failed after ${Date.now() - startedAt}ms`);
+    throw error;
+  }
+}
+
+function registerRoutes() {
+  app.use("/api/auth", require("./routes/auth"));
+  app.use("/api/floors", require("./routes/floors"));
+  app.use("/api/shops", require("./routes/shops"));
+  app.use("/api/products", require("./routes/products"));
+  app.use("/api/orders", require("./routes/orders"));
+  app.use("/api/purchase-orders", require("./routes/purchaseOrders"));
+  app.use("/api/suppliers", require("./routes/suppliers"));
+  app.use("/api/stock-requests", require("./routes/stockRequests"));
+  app.use("/api/webhooks", require("./routes/webhooks"));
+  app.use("/api/contact", require("./routes/contact"));
+  app.use("/api/categories", require("./routes/categories"));
+  app.use("/api/brands", require("./routes/brands"));
+  app.use("/api/badges", require("./routes/badges"));
+  app.use("/api/home-sections", require("./routes/homeSections"));
+  app.use("/api/hero-slides", require("./routes/heroSlides"));
+  app.use("/api/homepage-content", require("./routes/homepageContent"));
+  app.use("/api/settings", require("./routes/settings"));
+  app.use("/api/analytics", require("./routes/analytics"));
+  app.use("/api/notifications", require("./routes/notifications"));
+  app.use("/api/payments", require("./routes/payments"));
+  app.use(notFound);
+  app.use(errorHandler);
+}
 
 async function shutdown(signal) {
   if (shutdownPromise) return shutdownPromise;
@@ -189,11 +188,15 @@ async function startServer() {
         throw new Error("CLIENT_URL must be the exact HTTPS storefront origin, without a trailing slash, path, or credentials in production");
       }
     }
-    await connectDB();
-    await seedDefaultBadgesIfEmpty();
-    await seedDefaultHomeSectionsIfEmpty();
-    await seedDefaultHeroSlidesIfEmpty();
-    await seedHomepageContentIfEmpty();
+    const databaseConnection = runStartupStep("MongoDB connection", connectDB);
+    try {
+      registerRoutes();
+    } catch (routeError) {
+      await databaseConnection.catch(() => {});
+      throw routeError;
+    }
+    console.log(`Startup: application modules loaded in ${Date.now() - processStartedAt}ms`);
+    await databaseConnection;
     await new Promise((resolve, reject) => {
       const onError = (error) => reject(error);
       server.once("error", onError);
@@ -203,9 +206,21 @@ async function startServer() {
       });
     });
     console.log(`Azard Stores API running on port ${PORT}`);
-    try { workerIntervals.push(startPaymentReminderWorker(io)); }
+    console.log(`Startup: API is listening ${Date.now() - processStartedAt}ms after process start`);
+    try {
+      const { startPaymentReminderWorker } = require("./utils/paymentReminderWorker");
+      workerIntervals.push(startPaymentReminderWorker(io));
+    }
     catch (workerError) { console.error("Payment reminder worker failed to start:", workerError.message); }
-    try { workerIntervals.push(startEmailOutboxWorker()); }
+    try {
+      const { startStockRequestWorker } = require("./utils/stockRequestWorker");
+      workerIntervals.push(startStockRequestWorker(io));
+    }
+    catch (workerError) { console.error("Stock request worker failed to start:", workerError.message); }
+    try {
+      const { startEmailOutboxWorker } = require("./utils/emailOutboxWorker");
+      workerIntervals.push(startEmailOutboxWorker());
+    }
     catch (workerError) { console.error("Email outbox worker failed to start:", workerError.message); }
   } catch (err) {
     console.error("Backend startup failed:", err.message);

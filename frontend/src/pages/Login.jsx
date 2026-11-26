@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { Eye, EyeOff, ArrowRight, ShoppingBag } from "lucide-react";
+import axios from "axios";
 import { useAuth } from "../context/AuthContext";
 import AuthLayout from "../components/AuthLayout";
 import AuthInput from "../components/AuthInput";
@@ -30,7 +31,16 @@ export default function Login() {
       } else if (user?.role === "admin") navigate("/admin");
       else navigate("/dashboard");
     } catch (err) {
-      setError(err.response?.data?.message || "Invalid email or password");
+      const message = err.response?.data?.message;
+      if (typeof message === "string") {
+        setError(message);
+      } else if (err.response?.status === 401) {
+        setError("Invalid email or password");
+      } else if (axios.isAxiosError(err) && !err.response) {
+        setError("Can't reach the login service. Check that the backend is running and try again.");
+      } else {
+        setError("The login service is temporarily unavailable. Please try again.");
+      }
     } finally {
       setLoading(false);
     }
@@ -67,7 +77,7 @@ export default function Login() {
             Forgot password?
           </Link>
         </div>
-        {error && <p className="text-red-400 text-xs mb-4">{error}</p>}
+        {error && <p role="alert" className="text-red-400 text-xs mb-4">{error}</p>}
         <button type="submit" disabled={loading}
           className="w-full flex items-center justify-center gap-2 bg-mall-accent text-mall-900 font-semibold py-3.5 rounded-xl hover:bg-mall-accentDark transition disabled:opacity-50 text-sm mb-5">
           {loading ? "Logging in..." : "Log In"}

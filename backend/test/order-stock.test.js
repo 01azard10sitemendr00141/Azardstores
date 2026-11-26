@@ -8,4 +8,5 @@ test("cancellation restores a held reservation once but never returns committed 
   assert.equal(shouldRestoreOrderStock({ stockReservedAt: new Date(), stockReservationCommittedAt: new Date() }), false);
   assert.equal(shouldRestoreOrderStock({ stockReservedAt: new Date(), events: [{ type: "status_shipped" }] }), false);
   assert.equal(shouldRestoreOrderStock({ stockNeedsReservation: true }), false);
+  assert.equal(shouldRestoreOrderStock({ stockReservedAt: new Date(), stockRequest: "supplier-request" }), false);
 });

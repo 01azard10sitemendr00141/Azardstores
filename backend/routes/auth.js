@@ -1,6 +1,5 @@
 const express = require("express");
 const crypto = require("crypto");
-const jwt = require("jsonwebtoken");
 const { body, validationResult } = require("express-validator");
 const { parseListQuery, escapeRegex } = require("../utils/listQuery");
 const rateLimit = require("express-rate-limit");
@@ -8,7 +7,7 @@ const bcrypt = require("bcryptjs");
 const User = require("../models/User");
 const Order = require("../models/Order");
 const StoreBalanceTransaction = require("../models/StoreBalanceTransaction");
-const { protect, requireRole, setAuthCookie, clearAuthCookie } = require("../middleware/auth");
+const { protect, requireRole, setAuthCookie, clearAuthCookie, signAuthToken } = require("../middleware/auth");
 const { sendPasswordResetEmail, sendVerificationEmail, sendCheckoutEmailCode } = require("../utils/email");
 const { sendSms } = require("../utils/sms");
 const { normalizePhone } = require("../utils/normalizePhone");
@@ -24,12 +23,6 @@ function isValidPassword(password) {
   return typeof password === "string" && Array.from(password).length >= 12 && Buffer.byteLength(password, "utf8") <= 72;
 }
 
-function signToken(user) {
-  return jwt.sign({ id: user._id, role: user.role, tokenVersion: Number(user.tokenVersion || 0) }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRES_IN || "7d",
-  });
-}
-
 function sanitizeUser(user) {
   return {
     id: user._id,
@@ -39,6 +32,7 @@ function sanitizeUser(user) {
     storeBalance: Number(user.storeBalance || 0),
     savedDeliveryAddress: user.savedDeliveryAddress || { county: "", town: "", address: "", routeId: "" },
     role: user.role,
+    accountSetupStage: user.accountSetupStage || "complete",
     isEmailVerified: user.isEmailVerified,
     isPhoneVerified: user.isPhoneVerified,
     createdAt: user.createdAt,
@@ -130,7 +124,7 @@ router.post(
         console.error("Failed to send verification email:", err.message)
       );
 
-      const token = signToken(user);
+      const token = signAuthToken(user);
       setAuthCookie(res, token);
       res.status(201).json({ token, user: sanitizeUser(user) });
     } catch (err) {
@@ -164,16 +158,26 @@ router.post(
       if (!user || !(await user.comparePassword(password))) {
         return res.status(401).json({ message: "Invalid email or password" });
       }
+      if (user.accountSetupStage && user.accountSetupStage !== "complete") {
+        return res.status(403).json({ message: "Finish setting up this account from the order page before signing in." });
+      }
 
       user.lastLoginAt = new Date();
-      await user.save();
-      await linkVerifiedGuestOrders(user, req.app.get("io"));
-
-      // Guest orders are linked only by the explicit verified-email claim flow.
-
-      const token = signToken(user);
+      const token = signAuthToken(user);
       setAuthCookie(res, token);
       res.json({ token, user: sanitizeUser(user) });
+
+      // Authentication should finish immediately. Last-login tracking and
+      // verified guest-order reconciliation can continue after the response
+      // has been sent instead of making every login wait for database work.
+      Promise.resolve()
+        .then(async () => {
+          await user.save();
+          await linkVerifiedGuestOrders(user, req.app.get("io"));
+        })
+        .catch((backgroundError) => {
+          console.error("Post-login account reconciliation failed:", backgroundError.message);
+        });
     } catch (err) {
       next(err);
     }
@@ -190,6 +194,28 @@ router.post("/logout", (req, res) => {
 router.get("/me", protect, async (req, res) => {
   res.json({ user: sanitizeUser(req.user) });
 });
+
+router.post(
+  "/set-checkout-password",
+  protect,
+  authLimiter,
+  [body("password").custom(isValidPassword).withMessage(PASSWORD_POLICY_MESSAGE)],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ message: errors.array()[0].msg });
+      if (req.user.accountSetupStage !== "password_required") {
+        return res.status(409).json({ message: "This account is not waiting for a password setup." });
+      }
+      req.user.password = req.body.password;
+      req.user.accountSetupStage = "email_verification_required";
+      await req.user.save();
+      res.json({ message: "Password saved. Verify your email to unlock your account.", user: sanitizeUser(req.user) });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 // GET /api/auth/wishlist - account-owned customer wishlist.
 router.get("/wishlist", protect, async (req, res, next) => {
@@ -369,7 +395,7 @@ router.put(
       user.tokenVersion = Number(user.tokenVersion || 0) + 1;
       await user.save();
 
-      const token = signToken(user);
+      const token = signAuthToken(user);
       setAuthCookie(res, token);
       res.json({ message: "Password updated successfully", token });
     } catch (err) {
@@ -395,6 +421,7 @@ router.get("/verify-email", async (req, res, next) => {
     }
 
     user.isEmailVerified = true;
+    if (user.accountSetupStage === "email_verification_required") user.accountSetupStage = "complete";
     user.emailVerificationToken = undefined;
     user.emailVerificationExpires = undefined;
     await user.save();
@@ -508,6 +535,7 @@ router.post(
       }
 
       user.isEmailVerified = true;
+      if (user.accountSetupStage === "email_verification_required") user.accountSetupStage = "complete";
       user.checkoutEmailOtpHash = undefined;
       user.checkoutEmailOtpExpires = undefined;
       user.checkoutEmailOtpAttempts = 0;

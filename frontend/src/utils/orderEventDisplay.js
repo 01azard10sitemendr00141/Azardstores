@@ -11,6 +11,7 @@ const EVENT_LABELS = {
   order_placed: "Order received",
   order_created: "Order received",
   availability_confirmed: "Availability confirmed",
+  item_loaded: "Item prepared",
   order_confirmed: "Availability confirmed",
   payment_received: "Payment confirmed",
   order_shipped: "Dispatched",

@@ -5,6 +5,7 @@ const { restoreOrderStockOnce, recoverAbandonedStockReservations } = require("./
 const crypto = require("crypto");
 const { releaseOrderBalance, creditPaidOrderToStoreBalance, customerStoreBalanceMessage } = require("./storeBalance");
 const { emitOrderEvent } = require("./orderRealtime");
+const { cancelLinkedStockRequest } = require("./stockRequest");
 
 const REMINDER_OFFSETS_MINUTES = [15, 240, 720, 1440, 2880];
 let running = false;
@@ -35,6 +36,7 @@ async function expireUnpaidParcelOrders(now, orderIds = null, io = null) {
     );
     if (!expired) continue;
 
+    await cancelLinkedStockRequest(expired, "The order expired after the payment window; staff must release the supplier hold.");
     await releaseOrderBalance(expired);
     await expired.save();
     await restoreOrderStockOnce(expired);

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { ShoppingBag, ChevronRight, Clock, CheckCircle, Truck, XCircle, Package, Download } from "lucide-react";
 import api from "../../api/client";
 import { connectRealtime } from "../../api/realtime";
@@ -62,6 +62,7 @@ export default function AdminOrders() {
   const [reviewMode, setReviewMode] = useState(false);
   const [search, setSearch] = useState(() => searchParams.get("search") || "");
   const [updating, setUpdating] = useState(null);
+  const [loadedQuantities, setLoadedQuantities] = useState({});
   const [loadError, setLoadError] = useState("");
   const [actionError, setActionError] = useState("");
   const [loadAttempt, setLoadAttempt] = useState(0);
@@ -211,6 +212,30 @@ export default function AdminOrders() {
       setActionError(err.response?.data?.message || (err.response
         ? `The server returned HTTP ${err.response.status} without an error message. Refresh the orders list and try again.`
         : `Could not reach the backend (${err.message || "network error"}). Check that the backend is running, then try again.`));
+    } finally {
+      setUpdating(null);
+    }
+  }
+
+  async function confirmLoadingItem(order, itemIndex) {
+    const key = `${order._id}:${itemIndex}`;
+    const quantity = Number(loadedQuantities[key]);
+    if (!Number.isInteger(quantity) || quantity !== Number(order.items[itemIndex]?.quantity)) {
+      setActionError(`Enter and verify the full ordered quantity for ${order.items[itemIndex]?.name || "this item"}.`);
+      return;
+    }
+    setUpdating(order._id);
+    setActionError("");
+    try {
+      const response = await api.post(`/orders/${order._id}/loading-items`, { itemIndex, quantity });
+      setOrders((prev) => prev.map((item) => item._id === order._id ? response.data : item));
+      setLoadedQuantities((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+    } catch (error) {
+      setActionError(error.response?.data?.message || "The item loading confirmation could not be saved.");
     } finally {
       setUpdating(null);
     }
@@ -496,6 +521,14 @@ export default function AdminOrders() {
         >
           All
         </button>
+        <button
+          onClick={() => setStatusFilter("loading")}
+          className={`min-h-11 shrink-0 font-mono-tag text-[9px] uppercase px-3 py-1.5 rounded-full border transition sm:min-h-0 ${
+            filterStatus === "loading" ? "bg-mall-accent/10 text-mall-accent border-current" : "border-cream/15 text-cream/50 hover:text-cream"
+          }`}
+        >
+          Loading zone
+        </button>
         {STATUSES.map((s) => {
           const cfg = STATUS_CONFIG[s];
           return (
@@ -510,6 +543,7 @@ export default function AdminOrders() {
           );
         })}
       </div>
+      {filterStatus === "loading" && <p className="mb-4 rounded-xl border border-mall-accent/15 bg-mall-accent/5 px-3 py-2 text-xs leading-relaxed text-cream/60">Orders enter this queue automatically when payment is confirmed and the reservation is still active. Cash-on-delivery orders stay in the regular order list because payment is collected at handover.</p>}
 
       {loading ? (
         <div role="status" aria-label="Loading orders" className="flex items-center justify-center gap-3 py-16 text-sm text-cream/45">
@@ -521,7 +555,7 @@ export default function AdminOrders() {
       ) : filtered.length === 0 ? (
         <div className="py-16 text-center">
           <ShoppingBag size={32} className="text-cream/15 mx-auto mb-3" />
-          <p className="text-cream/30 text-sm">{reviewMode ? "No flagged orders found." : "No orders found."}</p>
+          <p className="text-cream/30 text-sm">{reviewMode ? "No flagged orders found." : filterStatus === "loading" ? "No paid orders are waiting in the Loading zone." : "No orders found."}</p>
         </div>
       ) : (
         <div className="divide-y divide-cream/8">
@@ -534,7 +568,13 @@ export default function AdminOrders() {
             const customerEmail = order.user?.email || order.guestInfo?.email || "";
             const customerPhone = order.user?.phone || order.guestInfo?.phone || "";
             const invalidCustomerDetails = !/\p{L}/u.test(customerName) || !customerEmail || Boolean(customerPhone && !/^(?:254|0)?[17]\d{8}$/.test(customerPhone.replace(/\D/g, "")));
+            const awaitingStockQuote = Boolean(order.stockRequest && !order.checkoutDetailsCompletedAt);
+            const loadingComplete = !order.loadingCheckpointRequired || (order.items || []).every((item) =>
+              item.loadedAt && Number(item.loadedQuantity || 0) === Number(item.quantity || 0)
+            );
             const nextStatuses = (NEXT_STATUSES[order.status] || []).filter((status) => {
+              if (awaitingStockQuote) return false;
+              if (!loadingComplete && ["shipped", "ready_for_collection", "collected", "delivered"].includes(status)) return false;
               if (order.cancellationRequests?.some((request) => request.status === "pending")) return false;
               if (isCod && ["shipped", "ready_for_collection"].includes(status)) return false;
               if (["shipped", "ready_for_collection", "collected"].includes(status) && order.deliveryArea !== "other") return false;
@@ -562,7 +602,7 @@ export default function AdminOrders() {
                           #{order._id.slice(-6).toUpperCase()}
                         </span>
                         <span className={`inline-flex items-center gap-1 font-mono-tag text-[9px] uppercase px-2 py-0.5 rounded-full ${cfg.bg} ${cfg.color}`}>
-                          <StatusIcon size={9} /> {cfg.label}
+                          <StatusIcon size={9} /> {filterStatus === "loading" ? "Loading zone" : cfg.label}
                         </span>
                         <span className="font-mono-tag text-[9px] uppercase text-cream/25">{order.channel}</span>
                         <span className={`font-mono-tag text-[9px] uppercase px-2 py-0.5 rounded-full ${
@@ -570,7 +610,7 @@ export default function AdminOrders() {
                           : order.paymentStatus === "failed" ? "bg-red-500/10 text-red-400"
                           : "bg-cream/5 text-cream/40"
                         }`}>
-                          {order.paymentMethod === "mpesa" ? "M-Pesa" : order.paymentMethod === "paystack" ? "Card" : order.paymentMethod === "store_balance" ? "Store balance" : "COD"} · {order.paymentStatus}
+                          {order.paymentMethod === "pending" ? "Payment pending quote" : order.paymentMethod === "mpesa" ? "M-Pesa" : order.paymentMethod === "paystack" ? "Card" : order.paymentMethod === "store_balance" ? "Store balance" : "COD"} · {order.paymentStatus}
                         </span>
                       </div>
                       <p className="text-cream text-sm font-medium">
@@ -607,6 +647,7 @@ export default function AdminOrders() {
                 {inconsistentCodParcel && <p role="alert" className="mt-3 rounded-lg border border-amber-300/20 bg-amber-300/5 px-3 py-2 text-xs text-amber-200">Review required: COD is for direct Nairobi CBD delivery, but this order has a parcel status. Only cancellation is available until this record is corrected.</p>}
                 {inconsistentUnpaidFulfillment && <p role="alert" className="mt-3 rounded-lg border border-amber-300/20 bg-amber-300/5 px-3 py-2 text-xs text-amber-200">Review required: this online order is unpaid but has advanced into fulfillment. Do not dispatch or complete it until the payment is confirmed.</p>}
                 {invalidCustomerDetails && <p role="alert" className="mt-3 rounded-lg border border-amber-300/20 bg-amber-300/5 px-3 py-2 text-xs text-amber-200">Customer details need review: check the name, email, and Kenyan mobile number before contacting or dispatching.</p>}
+                {awaitingStockQuote && <p role="status" className="mt-3 rounded-lg border border-mall-accent/20 bg-mall-accent/5 px-3 py-2 text-xs text-cream/70">This order is waiting for its supplier availability check and confirmed quote. Do not collect payment or advance fulfillment here. <Link to="/admin/stock-requests" className="text-mall-accent underline">Open Stock Requests</Link>.</p>}
                 {order.status === "expired" && order.paymentStatus === "paid" && <p role="alert" className="mt-3 rounded-lg border border-amber-300/20 bg-amber-300/5 px-3 py-2 text-xs text-amber-200">{order.storeBalanceCreditedAt ? "Payment arrived after expiry and its value is in Store Balance. Do not dispatch." : "Payment arrived after expiry, but its Store Balance credit is still outstanding. Do not dispatch."}</p>}
                 {order.status === "cancelled" && order.paymentStatus === "paid" && <p role="alert" className="mt-3 rounded-lg border border-amber-300/20 bg-amber-300/5 px-3 py-2 text-xs text-amber-200">{order.storeBalanceCreditedAt ? "This paid order was cancelled. Its value is in Store Balance; cash refunds are not offered." : "This paid order was cancelled, but its Store Balance credit is still outstanding."}</p>}
                 {order.status === "unavailable" && <p role="alert" className="mt-3 rounded-lg border border-red-300/20 bg-red-300/5 px-3 py-2 text-xs text-red-100">{["replacement_arranged", "store_credit_arranged", "store_balance_issued"].includes(order.availabilityIssue?.resolutionStatus) ? `This order remains unavailable and must not be paid or dispatched.${linkedReplacement ? ` Continue with linked order #${linkedReplacement._id.slice(-6).toUpperCase()} (${linkedReplacement.status?.replace(/_/g, " ")}).` : ""}` : order.paymentStatus === "paid" && order.storeBalanceCreditedAt ? "The paid amount is in Store Balance. Do not dispatch this order." : order.paymentStatus === "paid" ? "The order is paid, but its Store Balance credit is not recorded. Resolve this in the Review queue before proceeding. Do not dispatch." : "Availability issue: do not collect payment or dispatch. Contact the customer to resolve their preference."}</p>}
@@ -689,7 +730,11 @@ export default function AdminOrders() {
                         {correction.changes?.map((change, index) => <p key={`${change.field}-${index}`} className="text-cream/35">{change.field}: “{change.before || "empty"}” → “{change.after}”</p>)}
                       </div>
                     ))}
-                    {order.items?.map((item, i) => (
+                    {order.items?.map((item, i) => {
+                      const loaded = Boolean(item.loadedAt) && Number(item.loadedQuantity || 0) === Number(item.quantity || 0);
+                      const quantityKey = `${order._id}:${i}`;
+                      const codCanLoad = isCod || order.paymentStatus === "paid";
+                      return (
                       <div key={i} className="flex items-center gap-3">
                         <div className="w-10 h-10 rounded-lg bg-mall-800 overflow-hidden shrink-0">
                           {item.image ? (
@@ -704,12 +749,43 @@ export default function AdminOrders() {
                           <p className="text-cream text-sm line-clamp-1">{item.name}</p>
                           {item.variantName && <p className="text-cream/30 text-[11px]">{item.variantName}</p>}
                           <p className="text-cream/40 text-xs">Qty: {item.quantity}</p>
+                          {order.loadingCheckpointRequired && order.status === "confirmed" && (
+                            loaded ? (
+                              <p className="mt-1 text-[11px] text-emerald-200">Loaded quantity verified: {item.loadedQuantity} · {item.loadedBy?.name || "Staff"} · {new Date(item.loadedAt).toLocaleString("en-KE")}</p>
+                            ) : (
+                              <div className="mt-2 flex flex-wrap items-end gap-2">
+                                {!codCanLoad && <p className="w-full text-[10px] text-amber-200/75">Confirm payment before recording loaded stock.</p>}
+                                <label className="text-[10px] text-cream/45">Physically checked quantity
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    max={item.quantity}
+                                    step="1"
+                                    inputMode="numeric"
+                                    value={loadedQuantities[quantityKey] ?? ""}
+                                    onChange={(event) => setLoadedQuantities((prev) => ({ ...prev, [quantityKey]: event.target.value }))}
+                                    disabled={!codCanLoad || updating === order._id}
+                                    className="mt-1 block min-h-9 w-28 rounded-lg border border-cream/10 bg-mall-800 px-2 text-xs text-cream disabled:opacity-40"
+                                  />
+                                </label>
+                                <button
+                                  type="button"
+                                  onClick={() => confirmLoadingItem(order, i)}
+                                  disabled={!codCanLoad || updating === order._id || Number(loadedQuantities[quantityKey]) !== Number(item.quantity)}
+                                  className="min-h-9 rounded-lg border border-mall-accent/20 px-3 text-[10px] text-mall-accent disabled:opacity-40"
+                                >
+                                  Confirm loaded
+                                </button>
+                                <p className="w-full text-[10px] text-cream/35">If fewer than {item.quantity} are available, do not confirm this line; use the Unavailable status instead.</p>
+                              </div>
+                            )
+                          )}
                         </div>
                         <p className="text-cream/70 text-sm shrink-0">
                           KSh {(item.price * item.quantity).toLocaleString()}
                         </p>
                       </div>
-                    ))}
+                    );})}
                     {(order.deliveryAddress || order.deliveryCorrection?.address) && (
                       <div className="pt-3 border-t border-cream/8">
                         <p className="font-mono-tag text-[9px] uppercase text-cream/30 tracking-widest mb-1">{order.deliveryArea === "nairobi-cbd" ? "Nairobi CBD · direct delivery" : order.deliveryArea === "nairobi-direct" ? "Nairobi County · direct delivery" : "County route · parcel collection"}</p>

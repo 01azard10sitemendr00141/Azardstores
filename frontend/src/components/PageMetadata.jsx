@@ -6,6 +6,7 @@ const ROUTE_TITLES = {
   "/directory": "Mall Directory",
   "/search": "Search Products",
   "/cart": "Your Cart",
+  "/checkout": "Checkout",
   "/dashboard": "My Account",
   "/faq": "Frequently Asked Questions",
   "/contact": "Contact Us",
@@ -22,6 +23,7 @@ const ROUTE_DESCRIPTIONS = {
   "/": "Browse shops and products at Azard Stores, Kenya's digital mall.",
   "/directory": "Explore floors and shops in the Azard Stores digital mall.",
   "/search": "Search products across Azard Stores shops.",
+  "/checkout": "Choose your delivery details and submit your Azard Stores order for an availability check.",
   "/delivery": "Review delivery areas, available services, and delivery guidance from Azard Stores.",
   "/returns": "Review return eligibility, time limits, and how to request help with an order.",
   "/faq": "Find answers about ordering, payment, delivery, returns, and customer accounts.",
@@ -74,7 +76,7 @@ export default function PageMetadata() {
     document.querySelector('meta[name="description"]')?.setAttribute("content", description);
     document.querySelector('meta[property="og:description"]')?.setAttribute("content", description);
     document.querySelector('meta[name="twitter:description"]')?.setAttribute("content", description);
-    const noIndex = /^\/(search|cart|dashboard|order-success|payment\/callback|track-order|login|signup|forgot-password|reset-password|verify-email|admin)(\/|$)/.test(pathname);
+    const noIndex = /^\/(search|cart|checkout|dashboard|order-success|payment\/callback|track-order|login|signup|forgot-password|reset-password|verify-email|admin)(\/|$)/.test(pathname);
     let robots = document.querySelector('meta[name="robots"]');
     if (noIndex && !robots) {
       robots = document.createElement("meta");

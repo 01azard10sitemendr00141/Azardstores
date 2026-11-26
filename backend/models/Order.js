@@ -5,10 +5,10 @@ const orderItemSchema = new Schema(
   {
     product: { type: Schema.Types.ObjectId, ref: "Product" },
     name: { type: String, required: true },
-    shopId: { type: Schema.Types.ObjectId, ref: "Shop", default: null, immutable: true },
-    productShopId: { type: Schema.Types.ObjectId, ref: "Shop", default: null, immutable: true },
-    shopName: { type: String, default: "", immutable: true },
-    shopNumber: { type: Number, default: null, immutable: true },
+    shopId: { type: Schema.Types.ObjectId, ref: "Shop", default: null },
+    productShopId: { type: Schema.Types.ObjectId, ref: "Shop", default: null },
+    shopName: { type: String, default: "" },
+    shopNumber: { type: Number, default: null },
     // Set only when the ordered item was a specific variant — lets stock
     // decrement/restore target that variant instead of the base product.
     variantId: { type: Schema.Types.ObjectId, default: null },
@@ -16,6 +16,9 @@ const orderItemSchema = new Schema(
     returnEligibility: { type: String, enum: ["standard", "final_sale", "perishable", "digital_product"], default: "standard" },
     price: { type: Number, required: true },
     quantity: { type: Number, required: true, min: 1 },
+    loadedQuantity: { type: Number, default: 0, min: 0 },
+    loadedAt: { type: Date, default: null },
+    loadedBy: { type: Schema.Types.ObjectId, ref: "User", default: null },
     image: { type: String, default: "" },
   },
   { _id: false }
@@ -113,6 +116,7 @@ const deliveryIssueRequestSchema = new Schema(
 const orderSchema = new Schema(
   {
     user: { type: Schema.Types.ObjectId, ref: "User", default: null, index: true },
+    stockRequest: { type: Schema.Types.ObjectId, ref: "StockRequest", default: null, index: true },
     guestInfo: {
       name: String,
       phone: String,
@@ -123,32 +127,32 @@ const orderSchema = new Schema(
       email: { type: String, default: "", immutable: true },
       phone: { type: String, default: "", immutable: true },
     },
-    items: { type: [orderItemSchema], immutable: true },
+    items: { type: [orderItemSchema], default: [] },
     // totalAmount is the grand total (items subtotal + deliveryFee). Kept as
     // a single required field since every existing read site (Dashboard,
     // AdminOrders, OrderSuccess, CSV export) already displays it as "the
     // total" — deliveryFee is stored alongside it just for the breakdown.
-    totalAmount: { type: Number, required: true, min: 0, immutable: true },
-    storeBalanceApplied: { type: Number, default: 0, min: 0, immutable: true },
+    totalAmount: { type: Number, required: true, min: 0 },
+    storeBalanceApplied: { type: Number, default: 0, min: 0 },
     storeBalanceStatus: { type: String, enum: ["none", "reserved", "applied", "releasing", "crediting", "released", "credited"], default: "none" },
     storeBalanceCreditedAt: { type: Date, default: null },
     storeBalanceCreditedAmount: { type: Number, default: null, min: 0 },
     storeBalanceClaimStatus: { type: String, enum: ["not_required", "pending", "claimed"], default: "not_required" },
     storeBalanceRefundTo: { type: String, enum: ["account", "claim"], default: "account" },
-    deliveryFee: { type: Number, default: 0, min: 0, immutable: true },
-    deliveryAddress: { type: String, default: "", immutable: true },
-    deliveryInstructions: { type: String, default: "", immutable: true },
-    deliveryCounty: { type: String, default: "", trim: true, maxlength: 100, immutable: true },
-    deliveryTown: { type: String, default: "", trim: true, maxlength: 100, immutable: true },
-    deliveryArea: { type: String, enum: ["nairobi-cbd", "nairobi-direct", "other"], default: "other", immutable: true },
+    deliveryFee: { type: Number, default: 0, min: 0 },
+    deliveryAddress: { type: String, default: "" },
+    deliveryInstructions: { type: String, default: "" },
+    deliveryCounty: { type: String, default: "", trim: true, maxlength: 100 },
+    deliveryTown: { type: String, default: "", trim: true, maxlength: 100 },
+    deliveryArea: { type: String, enum: ["nairobi-cbd", "nairobi-direct", "other"], default: "other" },
     deliveryRoute: {
-      serviceType: { type: String, enum: ["direct", "parcel"], default: "parcel", immutable: true },
-      carrier: { type: String, default: "", immutable: true },
-      officeName: { type: String, default: "", immutable: true },
-      officeAddress: { type: String, default: "", immutable: true },
-      estimatedDays: { type: Number, default: null, immutable: true },
+      serviceType: { type: String, enum: ["direct", "parcel"], default: "parcel" },
+      carrier: { type: String, default: "" },
+      officeName: { type: String, default: "" },
+      officeAddress: { type: String, default: "" },
+      estimatedDays: { type: Number, default: null },
     },
-    cbdDeliveryConfirmed: { type: Boolean, default: false, immutable: true },
+    cbdDeliveryConfirmed: { type: Boolean, default: false },
     deliveryCorrection: {
       address: { type: String, default: "" },
       county: { type: String, default: "" },
@@ -188,6 +192,8 @@ const orderSchema = new Schema(
     replacementOrder: { type: Schema.Types.ObjectId, ref: "Order", default: null },
     replacementPriceDifference: { type: Number, default: null },
     availabilityConfirmedAt: { type: Date, default: null },
+    checkoutDetailsCompletedAt: { type: Date, default: null },
+    loadingCheckpointRequired: { type: Boolean, default: false },
     stockReservedAt: { type: Date, default: null },
     stockReservedUntil: { type: Date, default: null },
     stockReservationTracked: { type: Boolean, default: false },
@@ -201,7 +207,7 @@ const orderSchema = new Schema(
     // "failed" once the provider's webhook confirms the result —
     // paymentReference holds that provider's own transaction id/receipt
     // number for reconciliation and support lookups.
-    paymentMethod: { type: String, enum: ["cod", "mpesa", "paystack", "store_balance"], default: "cod", immutable: true },
+    paymentMethod: { type: String, enum: ["pending", "cod", "mpesa", "paystack", "store_balance"], default: "cod" },
     paymentStatus: { type: String, enum: ["unpaid", "paid", "failed", "refund_pending", "refunded"], default: "unpaid" },
     paymentReference: { type: String, default: "" },
     paymentTestMode: { type: Boolean, default: false },
@@ -209,8 +215,8 @@ const orderSchema = new Schema(
     cancellationReason: { type: String, default: "" },
     stockRestoredAt: { type: Date, default: null },
     refundReference: { type: String, default: "" },
-    invoiceNumber: { type: String, default: "", immutable: true },
-    invoiceIssuedAt: { type: Date, default: Date.now, immutable: true },
+    invoiceNumber: { type: String, default: "" },
+    invoiceIssuedAt: { type: Date, default: Date.now },
     receiptNumber: { type: String, default: "" },
     receiptIssuedAt: { type: Date, default: null },
     paymentReminders: { type: [paymentReminderSchema], default: [] },

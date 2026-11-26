@@ -13,7 +13,7 @@ function hasCommittedInventory(order) {
 }
 
 function shouldRestoreOrderStock(order) {
-  return Boolean(order?.stockReservedAt && !order.stockRestoredAt && !hasCommittedInventory(order));
+  return Boolean(order?.stockReservedAt && !order.stockRestoredAt && !order.stockRequest && !hasCommittedInventory(order));
 }
 
 function isPrimaryOrderLocation(item) {

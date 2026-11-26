@@ -127,6 +127,7 @@ test("all-matching archive requires a positive exact count and detects stale con
 
 test("customer order responses omit internal references, claim tokens, and admin notes", () => {
   const view = customerOrderView({
+    items: [{ name: "Item", quantity: 1, loadedQuantity: 1, loadedAt: new Date(), loadedBy: "staff-id" }],
     paymentReminders: [{ claimToken: "secret" }],
     paymentInitiationAt: new Date(),
       paymentTestStatus: "succeeded",
@@ -144,6 +145,8 @@ test("customer order responses omit internal references, claim tokens, and admin
     assert.equal("refundReference" in view, false);
   assert.equal("paystackReference" in view, false);
   assert.equal("adminCorrections" in view, false);
+  assert.equal(view.items[0].loadedQuantity, 1);
+  assert.equal("loadedBy" in view.items[0], false);
   assert.equal(view.paymentAttempts[0].reference, "visible-for-retry");
   assert.equal("phone" in view.paymentAttempts[0], false);
   assert.equal("reference" in view.additionalPaymentRefunds[0], false);

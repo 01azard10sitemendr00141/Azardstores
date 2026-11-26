@@ -101,7 +101,7 @@ if (websiteSchema.potentialAction?.target !== `${siteUrl}/search?q={search_term_
   throw new Error("WebSite search action must target the canonical /search URL");
 }
 
-const privateRoutes = ["search", "cart", "dashboard", "order-success", "payment/callback", "track-order", "login", "signup", "forgot-password", "reset-password", "verify-email"];
+const privateRoutes = ["search", "cart", "checkout", "dashboard", "order-success", "payment/callback", "track-order", "login", "signup", "forgot-password", "reset-password", "verify-email"];
 for (const route of privateRoutes) {
   const file = resolve(distDir, ...route.split("/"), "index.html");
   const page = await readFile(file, "utf8").catch(() => {

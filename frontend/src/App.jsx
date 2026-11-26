@@ -12,6 +12,9 @@ const Shop = lazy(() => import("./pages/Shop"));
 const Product = lazy(() => import("./pages/Product"));
 const Search = lazy(() => import("./pages/Search"));
 const Cart = lazy(() => import("./pages/Cart"));
+const Checkout = lazy(() => import("./pages/Checkout"));
+const StockCheck = lazy(() => import("./pages/StockCheck"));
+const StockRequest = lazy(() => import("./pages/StockRequest"));
 const OrderSuccess = lazy(() => import("./pages/OrderSuccess"));
 const PaymentCallback = lazy(() => import("./pages/PaymentCallback"));
 const TrackOrder = lazy(() => import("./pages/TrackOrder"));
@@ -32,6 +35,7 @@ const Terms = lazy(() => import("./pages/Terms"));
 const Cookies = lazy(() => import("./pages/Cookies"));
 const NotFound = lazy(() => import("./pages/NotFound"));
 import AdminRoute from "./components/AdminRoute";
+import CustomerAccountRoute from "./components/CustomerAccountRoute";
 import AdminLayout from "./components/AdminLayout";
 const AdminOverview = lazy(() => import("./pages/admin/AdminOverview"));
 const AdminFloors = lazy(() => import("./pages/admin/AdminFloors"));
@@ -47,6 +51,8 @@ const AdminProducts = lazy(() => import("./pages/admin/AdminProducts"));
 const AdminStockOperations = lazy(() => import("./pages/admin/AdminStockOperations"));
 const AdminOrders = lazy(() => import("./pages/admin/AdminOrders"));
 const AdminPurchaseOrders = lazy(() => import("./pages/admin/AdminPurchaseOrders"));
+const AdminStockRequests = lazy(() => import("./pages/admin/AdminStockRequests"));
+const AdminSuppliers = lazy(() => import("./pages/admin/AdminSuppliers"));
 const AdminCustomers = lazy(() => import("./pages/admin/AdminCustomers"));
 const AdminSettings = lazy(() => import("./pages/admin/AdminSettings"));
 const AdminAnalytics = lazy(() => import("./pages/admin/AdminAnalytics"));
@@ -93,6 +99,9 @@ export default function App() {
         <Route path="/categories/:category/subcategories/:name" element={<AttributeProducts attribute="subcategory" parentAttribute="category" label="Subcategory" />} />
         <Route path="/collection/:name" element={<LegacyTaxonomyRoute toPrefix="/categories" />} />
         <Route path="/cart" element={<Cart />} />
+        <Route path="/stock-check" element={<StockCheck />} />
+        <Route path="/stock-request/:id" element={<StockRequest />} />
+        <Route path="/checkout" element={<Checkout />} />
         <Route path="/order-success" element={<OrderSuccess />} />
         <Route path="/payment/callback" element={<PaymentCallback />} />
         <Route path="/track-order" element={<TrackOrder />} />
@@ -102,7 +111,7 @@ export default function App() {
         <Route path="/signup" element={<Signup />} />
         <Route path="/forgot-password" element={<ForgotPassword />} />
         <Route path="/reset-password" element={<ResetPassword />} />
-        <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/dashboard" element={<CustomerAccountRoute><Dashboard /></CustomerAccountRoute>} />
         <Route path="/wishlist" element={<Navigate to="/dashboard#wishlist" replace />} />
         <Route path="/account" element={<Navigate to="/dashboard#settings" replace />} />
         <Route path="/how-it-works" element={<HowItWorks />} />
@@ -138,6 +147,8 @@ export default function App() {
           <Route path="stock-operations" element={<AdminStockOperations />} />
           <Route path="orders" element={<AdminOrders />} />
           <Route path="purchase-orders" element={<AdminPurchaseOrders />} />
+          <Route path="stock-requests" element={<AdminStockRequests />} />
+          <Route path="suppliers" element={<AdminSuppliers />} />
           <Route path="delivery" element={<AdminDelivery />} />
           <Route path="customers" element={<AdminCustomers />} />
           <Route path="settings" element={<AdminSettings />} />
